@@ -14,7 +14,43 @@ class CharacterInput(StrictModel):
     identity_description: str = Field(default="", max_length=8000)
     default_recipe_id: str | None = None
     default_model_profile: str = "photoreal_balanced"
+    hair: str = Field(default="", max_length=1000)
+    eyes: str = Field(default="", max_length=1000)
+    facial_features: str = Field(default="", max_length=2000)
+    distinguishing_features: str = Field(default="", max_length=2000)
+    style_notes: str = Field(default="", max_length=2000)
+    body_notes: str = Field(default="", max_length=2000)
+    default_negative_prompt: str = Field(default="", max_length=8000)
     reference_assets: list[str] = []
+
+
+class ReferenceImportInput(StrictModel):
+    source_path: str = Field(min_length=1, max_length=32767)
+    notes: str = Field(default="", max_length=2000)
+
+
+class ReferenceUpdateInput(StrictModel):
+    notes: str = Field(default="", max_length=2000)
+    position: int = Field(default=0, ge=0)
+    is_primary: bool = False
+
+
+class LoraImportInput(StrictModel):
+    source_path: str = Field(min_length=1, max_length=32767)
+    name: str = Field(min_length=1, max_length=120)
+    source_notes: str = Field(default="", max_length=2000)
+    license_notes: str = Field(default="", max_length=2000)
+    trigger_token: str = Field(default="", max_length=500)
+    default_strength: float = Field(default=1.0, ge=0, le=2)
+    default_clip_strength: float = Field(default=1.0, ge=0, le=2)
+
+
+class CharacterLoraInput(StrictModel):
+    lora_id: str = Field(min_length=1)
+    position: int = Field(default=0, ge=0)
+    strength: float = Field(default=1.0, ge=0, le=2)
+    clip_strength: float = Field(default=1.0, ge=0, le=2)
+    enabled: bool = True
 
 
 class PresetInput(StrictModel):
@@ -68,3 +104,4 @@ class GenerationInput(StrictModel):
     height: int = Field(default=1216, ge=512, le=1536, multiple_of=64)
     steps: int = Field(default=30, ge=1, le=60)
     guidance: float = Field(default=5.5, ge=1, le=15)
+    lora_ids: list[str] = Field(default_factory=list, max_length=8)

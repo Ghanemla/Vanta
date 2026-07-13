@@ -16,13 +16,23 @@ from starlette.types import ASGIApp
 from .config import Settings
 from .database import Database, utc_now
 from .engine import EngineService, GenerationService
-from .repositories import CharacterRepository, PresetRepository, RecipeRepository
+from .repositories import (
+    CharacterRepository,
+    LoraRepository,
+    PresetRepository,
+    RecipeRepository,
+    ReferenceRepository,
+)
 from .schemas import (
     CharacterInput,
+    CharacterLoraInput,
     GenerationInput,
+    LoraImportInput,
     ModelImportInput,
     PresetInput,
     RecipeInput,
+    ReferenceImportInput,
+    ReferenceUpdateInput,
     SettingInput,
 )
 
@@ -94,6 +104,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         PresetRepository(db),
         RecipeRepository(db),
     )
+    references = ReferenceRepository(db, settings.reference_root)
+    loras = LoraRepository(db, settings.lora_root)
     engine = EngineService(db, settings)
     generation_jobs = GenerationService(db, engine)
     generation_jobs.recover()
@@ -135,6 +147,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def create_character(payload: CharacterInput) -> dict:
         return characters.create(payload)
 
+    @app.get("/api/characters/{item_id}")
+    def get_character(item_id: str) -> dict:
+        try:
+            return characters.get(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
     @app.put("/api/characters/{item_id}")
     def update_character(item_id: str, payload: CharacterInput) -> dict:
         try:
@@ -148,6 +167,92 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             characters.archive(item_id)
         except KeyError as error:
             raise missing(error) from error
+
+    @app.post("/api/characters/{item_id}/restore")
+    def restore_character(item_id: str) -> dict:
+        try:
+            return characters.restore(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/characters/{item_id}/duplicate", status_code=201)
+    def duplicate_character(item_id: str) -> dict:
+        try:
+            return characters.duplicate(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.delete("/api/characters/{item_id}/permanently", status_code=204)
+    def delete_character_permanently(item_id: str) -> None:
+        try:
+            characters.delete_permanently(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/characters/{item_id}/references", status_code=201)
+    def import_reference(item_id: str, payload: ReferenceImportInput) -> dict:
+        try:
+            return references.import_image(item_id, payload.source_path, payload.notes)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.put("/api/references/{reference_id}")
+    def update_reference(reference_id: str, payload: ReferenceUpdateInput) -> dict:
+        try:
+            return references.update(
+                reference_id, payload.notes, payload.position, payload.is_primary
+            )
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.delete("/api/references/{reference_id}", status_code=204)
+    def delete_reference(reference_id: str) -> None:
+        try:
+            references.delete(reference_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/references/{reference_id}/{variant}")
+    def reference_image(reference_id: str, variant: str) -> FileResponse:
+        if variant not in {"image", "thumbnail", "crop"}:
+            raise HTTPException(status_code=404, detail="Reference image variant was not found")
+        try:
+            reference = references.get(reference_id)
+        except KeyError as error:
+            raise missing(error) from error
+        path = Path(reference[f"{variant}_path"])
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Reference image file was not found")
+        return FileResponse(path, media_type="image/jpeg")
+
+    @app.get("/api/loras")
+    def list_loras() -> list[dict]:
+        return loras.list()
+
+    @app.post("/api/loras/import", status_code=201)
+    def import_lora(payload: LoraImportInput) -> dict:
+        try:
+            return loras.import_lora(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.delete("/api/loras/{item_id}", status_code=204)
+    def remove_lora(item_id: str) -> None:
+        try:
+            loras.remove(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.put("/api/characters/{item_id}/loras")
+    def assign_lora(item_id: str, payload: CharacterLoraInput) -> dict:
+        try:
+            return loras.assign(item_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/api/presets")
     def list_presets() -> list[dict]:
@@ -332,7 +437,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "paths": {
                 "data": str(settings.data_dir.resolve()),
                 "database": str(settings.database_path.resolve()),
-                "models": str((settings.data_dir / "models").resolve()),
+                "models": str(settings.model_root.resolve()),
             },
         }
 

@@ -219,12 +219,7 @@ class ManagedComfyRuntime:
             if self.root.exists():
                 shutil.rmtree(self.root)
             shutil.move(str(wrapper), str(self.root))
-            (self.root / "ComfyUI" / "extra_model_paths.yaml").write_text(
-                "vanta:\n"
-                f"  base_path: {self.settings.engine_root.as_posix()}\n"
-                "  checkpoints: models/checkpoints\n",
-                encoding="utf-8",
-            )
+            self._write_extra_model_paths()
         finally:
             shutil.rmtree(staging, ignore_errors=True)
         self._set_state("verifying", "Starting and verifying the local image engine")
@@ -242,6 +237,18 @@ class ManagedComfyRuntime:
     def mark_repair_needed(self, message: str) -> None:
         self._set_state("repair_needed", message)
 
+    def _write_extra_model_paths(self) -> None:
+        config = self.root / "ComfyUI" / "extra_model_paths.yaml"
+        if not config.parent.is_dir():
+            return
+        config.write_text(
+            "vanta:\n"
+            f"  base_path: {self.settings.engine_root.as_posix()}\n"
+            "  checkpoints: models/checkpoints\n"
+            "  loras: models/loras\n",
+            encoding="utf-8",
+        )
+
     def start(self) -> None:
         with self._lock:
             self._refresh_process_state()
@@ -253,6 +260,7 @@ class ManagedComfyRuntime:
                 self._message = "Local Generation Engine has not been installed"
                 return
             main, python = layout
+            self._write_extra_model_paths()
             port = allocate_loopback_port()
             logs = self.settings.logs_dir or self.settings.data_dir / "logs"
             logs.mkdir(parents=True, exist_ok=True)

@@ -21,9 +21,14 @@ def test_migrations_create_all_required_tables(client):
         "generation_jobs",
         "generations",
         "app_settings",
+        "character_references",
+        "lora_packs",
+        "character_loras",
         "schema_migrations",
     }
     assert required.issubset(tables)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(generation_jobs)")}
     assert {"progress", "prompt_id", "started_at", "completed_at"}.issubset(columns)
+    character_columns = {row[1] for row in connection.execute("PRAGMA table_info(characters)")}
+    assert {"hair", "eyes", "style_notes", "default_negative_prompt"}.issubset(character_columns)
     connection.close()

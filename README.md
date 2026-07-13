@@ -2,7 +2,7 @@
 
 Vanta is a premium, local-only Windows desktop studio for original AI characters. The desktop renderer talks to one loopback FastAPI orchestrator, which owns SQLite data, safe engine manifests, model-pack selection, workflow compilation, and eventually the hidden ComfyUI lifecycle.
 
-Milestone 1 includes the complete application foundation and polished functional screens for Create, Characters, Presets, Gallery, Models & Engine, and Settings. Generation, downloads, and engine installation use deterministic local fixtures; no arbitrary remote code is executed.
+The current image-generation release includes real local SDXL generation: Vanta manages a pinned ComfyUI runtime, imports user-selected `.safetensors` checkpoints into managed storage, verifies them with a diagnostic workflow, persists real jobs and outputs, and keeps ComfyUI internal. No arbitrary remote code is executed.
 
 ## Prerequisites on Windows
 
@@ -84,7 +84,7 @@ Run `.\scripts\diagnose.ps1` to verify tool versions, loopback configuration, lo
 
 ## Local paths and recovery
 
-By default, development data is stored under `data/runtime/` and SQLite uses `data/runtime/vanta.db`. Model-pack targets resolve beneath `data/runtime/models/` in Milestone 1. Production packaging will move these into the per-user application data directory.
+By default, development data is stored under `data/runtime/` and SQLite uses `data/runtime/vanta.db`. Production packaging uses the per-user application data directory selected by Tauri. Its managed runtime is under `engine/comfyui`, imported checkpoints under `engine/models/checkpoints`, and generated media under `media/generations`.
 
 Back up the entire studio data directory to preserve user content. Database upgrades are applied through numbered, transactional migrations recorded in `schema_migrations`. Built-in presets seed idempotently and can be restored without overwriting user-owned copies. If the development database becomes unusable, stop Vanta, preserve it for diagnosis, rename `vanta.db`, and restart to create a clean database.
 

@@ -1,0 +1,20 @@
+# Vanta manual acceptance checklist
+
+Last updated: 2026-07-13
+
+These checks need native Windows interaction and must be run against the final NSIS installer. They are deliberately not represented as automated or simulated evidence.
+
+## Phase 0 installed-release checks
+
+- [ ] Install the current NSIS release on a clean user profile; no terminal window appears.
+- [ ] Launch Vanta from Start. Confirm the dark title bar supports drag, minimize, maximize/restore, close, keyboard navigation and screen-reader labels.
+- [ ] Complete first-run setup: inspect hardware, install/repair the managed local image engine, import a user-owned SDXL `.safetensors` model, and wait for diagnostic verification.
+- [ ] Create an original adult character and generate an image through the Create screen.
+- [ ] Cancel an active generation and confirm its truthful cancelled state.
+- [ ] Open the Gallery image, use Generate Similar, and confirm both images and metadata persist after a normal restart.
+- [ ] Close normally and confirm Vanta-owned sidecar/engine processes stop. Repeat after a forced desktop-process close and confirm the Job Object cleanup stops children.
+- [ ] Reinstall or upgrade without deleting `%LOCALAPPDATA%\\Vanta`; confirm database, model records, gallery media, presets and characters remain.
+
+## Later feature acceptance
+
+Add a checked, dated evidence line here only after the matching capability creates a real local artifact through the Vanta UI. Never substitute fixture output or a direct engine invocation for this checklist.

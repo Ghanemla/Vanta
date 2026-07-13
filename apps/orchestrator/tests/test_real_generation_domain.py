@@ -51,3 +51,23 @@ def test_safetensors_validation_and_archive_path_safety(tmp_path: Path):
     assert validate_safetensors(checkpoint)["__metadata__"]["format"] == "pt"
     with pytest.raises(RuntimeError, match="unsafe"):
         ensure_safe_archive_members(["ComfyUI/../escape.txt"])
+
+
+def test_sdxl_lora_workflow_is_inserted_without_exposing_nodes_to_the_ui():
+    request = {
+        "direction": "original adult editorial portrait",
+        "negative_prompt": "",
+        "seed": 7,
+        "width": 832,
+        "height": 1216,
+        "steps": 2,
+        "guidance": 5.5,
+    }
+    workflow = WorkflowCompiler().compile(
+        request,
+        "model.safetensors",
+        [{"filename": "local-style.safetensors", "strength": 0.7, "clip_strength": 0.8}],
+    )
+    assert workflow["8"]["class_type"] == "LoraLoader"
+    assert workflow["5"]["inputs"]["model"] == ["8", 0]
+    assert workflow["2"]["inputs"]["clip"] == ["8", 1]

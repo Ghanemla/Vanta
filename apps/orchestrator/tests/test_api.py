@@ -84,3 +84,44 @@ def test_engine_manifest_and_model_pack_services(client):
     assert balanced["installed"] is False
     assert balanced["verified"] is False
     assert balanced["is_default"] is False
+
+
+def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):
+    import json
+
+    from PIL import Image
+
+    character = client.post(
+        "/api/characters", json={"name": "Mara", "identity_description": "Original adult, age 29"}
+    ).json()
+    source_image = tmp_path / "owned-reference.png"
+    Image.new("RGB", (640, 800), "white").save(source_image)
+    reference = client.post(
+        f"/api/characters/{character['id']}/references",
+        json={"source_path": str(source_image), "notes": "owned reference"},
+    )
+    assert reference.status_code == 201
+    assert reference.json()["is_primary"] is True
+    assert client.get(f"/api/references/{reference.json()['id']}/crop").status_code == 200
+
+    source_lora = tmp_path / "owned-style.safetensors"
+    header = json.dumps({"__metadata__": {}, "lora_te1.sample": {}}).encode()
+    source_lora.write_bytes(len(header).to_bytes(8, "little") + header + b"payload")
+    lora = client.post(
+        "/api/loras/import",
+        json={
+            "source_path": str(source_lora),
+            "name": "Owned SDXL style",
+            "trigger_token": "ownedstyle",
+        },
+    )
+    assert lora.status_code == 201
+    assert lora.json()["model_family"] == "SDXL"
+    assignment = client.put(
+        f"/api/characters/{character['id']}/loras",
+        json={"lora_id": lora.json()["id"], "strength": 0.7, "clip_strength": 0.8},
+    )
+    assert assignment.status_code == 200
+    restored = client.get(f"/api/characters/{character['id']}").json()
+    assert restored["references"][0]["is_primary"] is True
+    assert restored["loras"][0]["name"] == "Owned SDXL style"

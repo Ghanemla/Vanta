@@ -6,6 +6,51 @@ export interface CharacterRecord {
   default_recipe_id: string | null;
   default_model_profile: string;
   reference_assets: string[];
+  hair: string;
+  eyes: string;
+  facial_features: string;
+  distinguishing_features: string;
+  style_notes: string;
+  body_notes: string;
+  default_negative_prompt: string;
+  references: CharacterReference[];
+  loras: CharacterLora[];
+}
+export interface CharacterReference {
+  id: string;
+  thumbnail_path: string;
+  crop_path: string;
+  sha256: string;
+  width: number;
+  height: number;
+  position: number;
+  is_primary: boolean;
+  notes: string;
+}
+export interface CharacterLora {
+  id: string;
+  name: string;
+  model_family: string;
+  trigger_token: string;
+  position: number;
+  strength: number;
+  clip_strength: number;
+  enabled: boolean;
+}
+export interface LoraRecord {
+  id: string;
+  name: string;
+  filename: string;
+  sha256: string;
+  file_size: number;
+  source_notes: string;
+  license_notes: string;
+  model_family: string;
+  trigger_token: string;
+  default_strength: number;
+  default_clip_strength: number;
+  enabled: boolean;
+  verification_state: string;
 }
 export interface PresetRecord {
   id: string;
@@ -73,6 +118,14 @@ export interface GenerationRecord {
     model_filename?: string;
     model_sha256?: string;
     workflow_version?: string;
+    loras?: {
+      id: string;
+      name: string;
+      filename: string;
+      sha256: string;
+      strength: number;
+      clip_strength: number;
+    }[];
     request?: Record<string, unknown>;
   };
   created_at: string;

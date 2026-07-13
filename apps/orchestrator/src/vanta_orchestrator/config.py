@@ -78,6 +78,14 @@ class Settings:
         return self.engine_root / "models" / "checkpoints"
 
     @property
+    def lora_root(self) -> Path:
+        return self.engine_root / "models" / "loras"
+
+    @property
+    def reference_root(self) -> Path:
+        return self.data_dir / "media" / "references"
+
+    @property
     def media_root(self) -> Path:
         return self.data_dir / "media" / "generations"
 
@@ -110,4 +118,6 @@ class Settings:
         (self.logs_dir or self.data_dir / "logs").mkdir(parents=True, exist_ok=True)
         self.engine_root.mkdir(parents=True, exist_ok=True)
         self.model_root.mkdir(parents=True, exist_ok=True)
+        self.lora_root.mkdir(parents=True, exist_ok=True)
+        self.reference_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)

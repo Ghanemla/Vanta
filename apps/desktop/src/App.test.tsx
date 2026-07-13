@@ -12,6 +12,7 @@ vi.stubGlobal(
       '/api/presets': [],
       '/api/gallery': [],
       '/api/engine/components': [],
+      '/api/loras': [],
       '/api/engine/model-packs': {
         hardware: { gpu_name: 'RTX 4070 Super', vram_gb: 12, ram_gb: 32, free_disk_gb: 100 },
         packs: [],
@@ -31,5 +32,7 @@ it('renders the local create workspace after loading', async () => {
   expect(screen.getByRole('button', { name: 'Maximize window' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Close window' })).toBeInTheDocument();
   expect(await screen.findByRole('heading', { name: 'Direct the scene.' })).toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: 'Prepare your private studio.' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Install local engine/i })).toBeInTheDocument();
   expect(screen.getByText('No cloud connection')).toBeInTheDocument();
 });

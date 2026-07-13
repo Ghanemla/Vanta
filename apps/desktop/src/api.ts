@@ -68,6 +68,15 @@ export async function chooseLocalModelFile(): Promise<string | null> {
   return invoke<string | null>('choose_local_model_file');
 }
 
+async function chooseLocalFile(command: string): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<string | null>(command);
+}
+
+export const chooseLocalImageFile = () => chooseLocalFile('choose_local_image_file');
+export const chooseLocalLoraFile = () => chooseLocalFile('choose_local_lora_file');
+
 export async function exportDiagnostics(): Promise<void> {
   const response = await fetch(`${apiBase}/api/diagnostics/export`, {
     headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
@@ -127,6 +136,14 @@ export const api = {
       headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
     });
     if (!response.ok) throw new ApiError('Vanta could not load this local image.', response.status);
+    return URL.createObjectURL(await response.blob());
+  },
+  referenceImageUrl: async (referenceId: string, variant: 'thumbnail' | 'crop' = 'thumbnail') => {
+    const response = await fetch(`${apiBase}/api/references/${referenceId}/${variant}`, {
+      headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
+    });
+    if (!response.ok)
+      throw new ApiError('Vanta could not load this local reference.', response.status);
     return URL.createObjectURL(await response.blob());
   },
 };

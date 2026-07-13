@@ -39,6 +39,8 @@ import {
 import { Button, Drawer, EmptyState, Panel, StatusPill } from '@vanta/ui';
 import {
   api,
+  chooseLocalImageFile,
+  chooseLocalLoraFile,
   chooseLocalModelFile,
   exportDiagnostics,
   getLocalServiceInfo,
@@ -52,6 +54,7 @@ import type {
   EngineComponent,
   GenerationJob,
   GenerationRecord,
+  LoraRecord,
   ModelPack,
   PresetRecord,
   SettingsRecord,
@@ -64,6 +67,7 @@ type AppData = {
   gallery: GenerationRecord[];
   components: EngineComponent[];
   packs: ModelPack[];
+  loras: LoraRecord[];
   hardware: { gpu_name: string; vram_gb: number; ram_gb: number; free_disk_gb: number };
   settings: SettingsRecord;
 };
@@ -255,16 +259,16 @@ export function App() {
     setLoading(true);
     setError('');
     try {
-      const [characters, presets, gallery, components, modelResponse, settings] = await Promise.all(
-        [
+      const [characters, presets, gallery, components, modelResponse, settings, loras] =
+        await Promise.all([
           api.get<CharacterRecord[]>('/characters'),
           api.get<PresetRecord[]>('/presets'),
           api.get<GenerationRecord[]>('/gallery'),
           api.get<EngineComponent[]>('/engine/components'),
           api.get<{ hardware: AppData['hardware']; packs: ModelPack[] }>('/engine/model-packs'),
           api.get<SettingsRecord>('/settings'),
-        ],
-      );
+          api.get<LoraRecord[]>('/loras'),
+        ]);
       setData({
         characters,
         presets,
@@ -273,6 +277,7 @@ export function App() {
         packs: modelResponse.packs,
         hardware: modelResponse.hardware,
         settings,
+        loras,
       });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The local studio could not start.');
@@ -448,6 +453,14 @@ export function App() {
           )}
           {!loading && data && (
             <>
+              {!engineReady && (
+                <SetupWizard
+                  data={data}
+                  refresh={load}
+                  notify={notify}
+                  goEngine={() => navigate('engine')}
+                />
+              )}
               {screen === 'create' && (
                 <CreateScreen
                   data={data}
@@ -459,7 +472,12 @@ export function App() {
                 />
               )}
               {screen === 'characters' && (
-                <CharactersScreen items={data.characters} refresh={load} notify={notify} />
+                <CharactersScreen
+                  items={data.characters}
+                  loras={data.loras}
+                  refresh={load}
+                  notify={notify}
+                />
               )}
               {screen === 'presets' && (
                 <PresetsScreen items={data.presets} refresh={load} notify={notify} />
@@ -490,6 +508,157 @@ export function App() {
         )}
       </div>
     </div>
+  );
+}
+
+function SetupWizard({
+  data,
+  refresh,
+  notify,
+  goEngine,
+}: {
+  data: AppData;
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+  goEngine: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const runtime = data.components.find((item) => item.id === 'workflow-runtime');
+  const model =
+    data.packs.find((item) => item.is_default) ??
+    data.packs.find((item) => item.alias === 'photoreal_balanced');
+  const engineReady = runtime?.state === 'ready';
+  const modelReady = Boolean(model?.installed && model.verified);
+  const installEngine = async () => {
+    if (!runtime) return;
+    setBusy(true);
+    setError('');
+    try {
+      const action =
+        runtime.state === 'repair_needed'
+          ? 'repair'
+          : runtime.state === 'stopped'
+            ? 'start'
+            : 'install';
+      await api.post(`/engine/components/${runtime.id}/${action}`);
+      await api.put('/settings/setup_step', { value: 'engine' });
+      notify(action === 'start' ? 'Starting the local image engine' : 'Local engine setup started');
+      await refresh();
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Vanta could not prepare the local image engine.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const importModel = async () => {
+    const sourcePath = await chooseLocalModelFile();
+    if (!sourcePath) return;
+    setBusy(true);
+    setError('');
+    try {
+      await api.post('/engine/models/import', {
+        source_path: sourcePath,
+        alias: 'photoreal_balanced',
+        license_notes: 'User-selected local checkpoint; review its license before redistribution.',
+      });
+      await api.put('/settings/setup_step', { value: 'model_verified' });
+      notify('Local model imported and verified');
+      await refresh();
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : 'Vanta could not verify this local model.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (engineReady && modelReady && data.settings.values.setup_completed !== 'true') {
+      void api.put('/settings/setup_completed', { value: 'true' });
+    }
+  }, [data.settings.values.setup_completed, engineReady, modelReady]);
+  const step = modelReady ? 4 : engineReady ? 3 : 2;
+  return (
+    <section className="setup-wizard" aria-labelledby="setup-title">
+      <div className="setup-wizard__intro">
+        <span className="eyebrow">First-run setup</span>
+        <h1 id="setup-title">Prepare your private studio.</h1>
+        <p>
+          Vanta stays on this device. Setup installs only the reviewed local engine and a model you
+          choose.
+        </p>
+      </div>
+      <ol className="setup-steps" aria-label="Local setup progress">
+        {[
+          ['Private by design', 'No account, telemetry, cloud inference, or public service.'],
+          [
+            'Check this device',
+            `${data.hardware.gpu_name} · ${data.hardware.vram_gb} GB VRAM · ${data.hardware.free_disk_gb} GB free`,
+          ],
+          ['Prepare local engine', runtime?.last_health_message ?? 'Checking engine status'],
+          [
+            'Import a model',
+            modelReady
+              ? 'Verified local SDXL model and diagnostic generation complete.'
+              : 'Choose a compatible SDXL .safetensors checkpoint.',
+          ],
+        ].map(([title, detail], index) => (
+          <li
+            className={index + 1 < step ? 'complete' : index + 1 === step ? 'current' : ''}
+            key={title}
+          >
+            <span>{index + 1 < step ? <Check /> : index + 1}</span>
+            <div>
+              <strong>{title}</strong>
+              <small>{detail}</small>
+            </div>
+          </li>
+        ))}
+      </ol>
+      {error && (
+        <p className="setup-wizard__error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="setup-wizard__actions">
+        {!engineReady ? (
+          <Button
+            variant="primary"
+            onClick={() => void installEngine()}
+            disabled={busy || runtime?.state === 'installing'}
+          >
+            <Download />
+            {runtime?.state === 'installing'
+              ? `Installing ${runtime.progress}%`
+              : runtime?.state === 'stopped'
+                ? 'Start local engine'
+                : runtime?.state === 'repair_needed'
+                  ? 'Repair local engine'
+                  : 'Install local engine'}
+          </Button>
+        ) : !modelReady ? (
+          <Button variant="primary" onClick={() => void importModel()} disabled={busy}>
+            <Upload /> {busy ? 'Verifying local model…' : 'Import local SDXL model'}
+          </Button>
+        ) : (
+          <Button variant="primary" onClick={goEngine}>
+            <Check /> Studio ready
+          </Button>
+        )}
+        <Button variant="ghost" onClick={goEngine}>
+          View technical details
+        </Button>
+      </div>
+      <p className="setup-wizard__note">
+        Storage: {data.settings.paths.data}. The engine requires about 2 GB; model size depends on
+        the file you import.
+      </p>
+    </section>
   );
 }
 
@@ -900,10 +1069,12 @@ function CreateScreen({
 
 function CharactersScreen({
   items,
+  loras,
   refresh,
   notify,
 }: {
   items: CharacterRecord[];
+  loras: LoraRecord[];
   refresh: () => Promise<void>;
   notify: (message: string) => void;
 }) {
@@ -917,6 +1088,13 @@ function CharactersScreen({
       name: String(form.get('name')),
       identity_description: String(form.get('identity')),
       default_model_profile: String(form.get('model')),
+      hair: String(form.get('hair')),
+      eyes: String(form.get('eyes')),
+      facial_features: String(form.get('facial_features')),
+      distinguishing_features: String(form.get('distinguishing_features')),
+      style_notes: String(form.get('style_notes')),
+      body_notes: String(form.get('body_notes')),
+      default_negative_prompt: String(form.get('default_negative_prompt')),
       reference_assets: editing === 'new' ? [] : (editing?.reference_assets ?? []),
     };
     try {
@@ -940,6 +1118,37 @@ function CharactersScreen({
     notify(`${item.name} archived`);
     await refresh();
   };
+  const importReference = async (item: CharacterRecord) => {
+    const sourcePath = await chooseLocalImageFile();
+    if (!sourcePath) return;
+    await api.post(`/characters/${item.id}/references`, { source_path: sourcePath });
+    notify(`Reference saved to ${item.name}'s local library`);
+    await refresh();
+  };
+  const importLora = async (item: CharacterRecord) => {
+    const sourcePath = await chooseLocalLoraFile();
+    if (!sourcePath) return;
+    const filename =
+      sourcePath
+        .split(/[\\/]/)
+        .pop()
+        ?.replace(/\.safetensors$/i, '') ?? 'Local LoRA';
+    const imported = await api.post<LoraRecord>('/loras/import', {
+      source_path: sourcePath,
+      name: filename,
+      source_notes: 'Imported from a user-selected local file',
+      license_notes: 'User-selected LoRA; redistribution license not reviewed by Vanta.',
+    });
+    await api.put(`/characters/${item.id}/loras`, {
+      lora_id: imported.id,
+      position: item.loras.length,
+      strength: imported.default_strength,
+      clip_strength: imported.default_clip_strength,
+      enabled: true,
+    });
+    notify(`Verified SDXL LoRA assigned to ${item.name}`);
+    await refresh();
+  };
   return (
     <div className="screen">
       <PageTitle
@@ -952,6 +1161,11 @@ function CharactersScreen({
           </Button>
         }
       />
+      <p className="helper character-library-status">
+        {loras.length
+          ? `${loras.length} verified local LoRA${loras.length === 1 ? '' : 's'} available in this studio.`
+          : 'Import a compatible local SDXL LoRA from a character card when you are ready.'}
+      </p>
       {items.length === 0 ? (
         <EmptyState
           title="No characters yet"
@@ -967,7 +1181,14 @@ function CharactersScreen({
           {items.map((item, index) => (
             <Panel className="character-card" key={item.id}>
               <div className={`character-portrait character-portrait--${index % 3}`}>
-                <div className="portrait-silhouette" />
+                {item.references[0] ? (
+                  <LocalReferenceImage
+                    referenceId={item.references[0].id}
+                    alt={`${item.name} reference`}
+                  />
+                ) : (
+                  <div className="portrait-silhouette" />
+                )}
                 <span>Original · Adult</span>
               </div>
               <div className="character-card__body">
@@ -977,15 +1198,15 @@ function CharactersScreen({
                 </div>
                 <p>{item.identity_description}</p>
                 <div className="asset-strip">
-                  {item.reference_assets.map((asset, assetIndex) => (
-                    <span key={asset}>
+                  {item.references.map((reference, assetIndex) => (
+                    <span key={reference.id}>
                       <span>{String(assetIndex + 1).padStart(2, '0')}</span>
-                      {asset}
+                      {reference.is_primary ? 'Primary reference' : `Reference ${assetIndex + 1}`}
                     </span>
                   ))}
-                  {!item.reference_assets.length && (
+                  {!item.references.length && (
                     <span className="asset-empty">
-                      <Plus /> Add reference assets
+                      <Plus /> No references yet
                     </span>
                   )}
                 </div>
@@ -994,13 +1215,32 @@ function CharactersScreen({
                     <Box /> {item.default_model_profile}
                   </span>
                   <span>
-                    <Image /> {item.reference_assets.length} references
+                    <Image /> {item.references.length} references
+                  </span>
+                  <span>
+                    <Zap /> {item.loras.length} LoRAs
                   </span>
                 </div>
                 <footer>
                   <Button onClick={() => setEditing(item)}>
                     <Edit3 /> Edit profile
                   </Button>
+                  <button
+                    className="icon-button"
+                    onClick={() => void importReference(item)}
+                    aria-label={`Add reference to ${item.name}`}
+                    title="Add local reference"
+                  >
+                    <Upload />
+                  </button>
+                  <button
+                    className="icon-button"
+                    onClick={() => void importLora(item)}
+                    aria-label={`Import LoRA for ${item.name}`}
+                    title="Import and assign a local SDXL LoRA"
+                  >
+                    <Zap />
+                  </button>
                   <button
                     className="icon-button"
                     onClick={() => void archive(item)}
@@ -1070,6 +1310,51 @@ function CharactersScreen({
                 <option value="preview_fast">Preview — Fast</option>
               </select>
             </label>
+            <div className="form-grid">
+              <label>
+                Hair
+                <input name="hair" defaultValue={editing === 'new' ? '' : editing.hair} />
+              </label>
+              <label>
+                Eyes
+                <input name="eyes" defaultValue={editing === 'new' ? '' : editing.eyes} />
+              </label>
+            </div>
+            <label>
+              Facial features
+              <textarea
+                name="facial_features"
+                defaultValue={editing === 'new' ? '' : editing.facial_features}
+              />
+            </label>
+            <label>
+              Distinguishing features
+              <textarea
+                name="distinguishing_features"
+                defaultValue={editing === 'new' ? '' : editing.distinguishing_features}
+              />
+            </label>
+            <label>
+              Style notes
+              <textarea
+                name="style_notes"
+                defaultValue={editing === 'new' ? '' : editing.style_notes}
+              />
+            </label>
+            <label>
+              Body & proportion notes
+              <textarea
+                name="body_notes"
+                defaultValue={editing === 'new' ? '' : editing.body_notes}
+              />
+            </label>
+            <label>
+              Default negative prompt
+              <textarea
+                name="default_negative_prompt"
+                defaultValue={editing === 'new' ? '' : editing.default_negative_prompt}
+              />
+            </label>
             <div className="reference-drop">
               <Upload />
               <strong>Reference assets</strong>
@@ -1087,6 +1372,27 @@ function CharactersScreen({
         </div>
       )}
     </div>
+  );
+}
+
+function LocalReferenceImage({ referenceId, alt }: { referenceId: string; alt: string }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api.referenceImageUrl(referenceId).then((next) => {
+      objectUrl = next;
+      if (active) setUrl(next);
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [referenceId]);
+  return url ? (
+    <img className="character-reference-image" src={url} alt={alt} />
+  ) : (
+    <div className="portrait-silhouette" />
   );
 }
 
@@ -1535,6 +1841,14 @@ function GalleryScreen({
                   <dt>Steps / guidance</dt>
                   <dd>
                     {selected.metadata.steps} / {selected.metadata.guidance}
+                  </dd>
+                </div>
+                <div>
+                  <dt>LoRA stack</dt>
+                  <dd>
+                    {selected.metadata.loras?.length
+                      ? selected.metadata.loras.map((lora) => lora.name).join(', ')
+                      : 'None'}
                   </dd>
                 </div>
                 <div>

@@ -178,12 +178,17 @@ class WorkflowCompiler:
                 parts.append(str(value).strip())
         return ", ".join(parts)
 
-    def compile(self, request: dict[str, Any], checkpoint_name: str) -> dict[str, Any]:
+    def compile(
+        self,
+        request: dict[str, Any],
+        checkpoint_name: str,
+        loras: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         positive = self.compile_prompt(request)
         if not positive:
             raise ValueError("Describe the frame before generating")
         negative = str(request.get("negative_prompt", "")).strip()
-        return {
+        workflow = {
             "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": checkpoint_name}},
             "2": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
             "3": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
@@ -212,6 +217,26 @@ class WorkflowCompiler:
                 "inputs": {"filename_prefix": "Vanta/generation", "images": ["6", 0]},
             },
         }
+        if not loras:
+            return workflow
+        model_source: list[Any] = ["1", 0]
+        clip_source: list[Any] = ["1", 1]
+        for index, lora in enumerate(loras, start=8):
+            workflow[str(index)] = {
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "model": model_source,
+                    "clip": clip_source,
+                    "lora_name": lora["filename"],
+                    "strength_model": lora["strength"],
+                    "strength_clip": lora["clip_strength"],
+                },
+            }
+            model_source, clip_source = [str(index), 0], [str(index), 1]
+        workflow["2"]["inputs"]["clip"] = clip_source
+        workflow["3"]["inputs"]["clip"] = clip_source
+        workflow["5"]["inputs"]["model"] = model_source
+        return workflow
 
     def diagnostic(self, checkpoint_name: str) -> dict[str, Any]:
         return self.compile(
@@ -587,7 +612,10 @@ class GenerationService:
             self._update(job_id, "preparing", 10)
             model = self.engine.model_for_alias(request["model_alias"])
             self._update(job_id, "loading_model", 15)
-            workflow = WorkflowCompiler().compile(request, Path(model["installed_path"]).name)
+            loras = self._resolve_loras(request)
+            workflow = WorkflowCompiler().compile(
+                request, Path(model["installed_path"]).name, loras
+            )
 
             def progress(value: int, maximum: int) -> None:
                 percentage = min(88, 20 + round(68 * value / maximum))
@@ -621,6 +649,7 @@ class GenerationService:
                 "comfyui_revision": self.engine.runtime.revision,
                 "steps": request["steps"],
                 "guidance": request["guidance"],
+                "loras": loras,
                 "disclosure": True,
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
@@ -668,6 +697,47 @@ class GenerationService:
         self._update(job_id, "cancelling", job["progress"])
         self.engine.runtime.interrupt(job.get("prompt_id"))
         return self.get(job_id)
+
+    def _resolve_loras(self, request: dict[str, Any]) -> list[dict[str, Any]]:
+        requested = list(request.get("lora_ids", []))
+        if not requested and request.get("character_id"):
+            requested = [
+                row["lora_id"]
+                for row in self.db.query_all(
+                    "SELECT lora_id FROM character_loras WHERE character_id=? AND enabled=1 ORDER BY position",
+                    (request["character_id"],),
+                )
+            ]
+        if len(requested) > 8:
+            raise ValueError("Use no more than eight compatible LoRAs in one generation")
+        resolved: list[dict[str, Any]] = []
+        for lora_id in requested:
+            row = self.db.query_one("SELECT * FROM lora_packs WHERE id=?", (lora_id,))
+            if row is None or not row["enabled"]:
+                raise ValueError("One selected LoRA is no longer available")
+            if row["model_family"] != "SDXL":
+                raise ValueError("The selected LoRA is not compatible with the SDXL workflow")
+            if not Path(row["installed_path"]).is_file():
+                raise ValueError("A selected LoRA file is missing; repair or remove it")
+            assignment = self.db.query_one(
+                "SELECT strength, clip_strength FROM character_loras WHERE character_id=? AND lora_id=?",
+                (request.get("character_id"), lora_id),
+            )
+            resolved.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "filename": row["filename"],
+                    "sha256": row["sha256"],
+                    "strength": float(
+                        assignment["strength"] if assignment else row["default_strength"]
+                    ),
+                    "clip_strength": float(
+                        assignment["clip_strength"] if assignment else row["default_clip_strength"]
+                    ),
+                }
+            )
+        return resolved
 
     def get(self, job_id: str) -> dict[str, Any]:
         job = self.db.query_one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))
