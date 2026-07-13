@@ -87,6 +87,8 @@ class ComponentManifest(BaseModel):
         "managed_archive",
         "managed_fixture",
         "managed_extension_archive",
+        "managed_python_runtime",
+        "managed_model",
         "bundled_runtime",
     ]
     health_checks: list[dict[str, str]]
@@ -644,6 +646,8 @@ class EngineService:
                     "image-finishing",
                     "video-generation",
                     "reference-motion",
+                    "lora-training",
+                    "captioning",
                 }
                 else "unsupported"
             )
@@ -660,6 +664,10 @@ class EngineService:
                 if component.id == "video-generation"
                 else "Install Pose Control and Image-to-Video to extract broad motion"
                 if component.id == "reference-motion"
+                else "Install the pinned local sd-scripts trainer"
+                if component.id == "lora-training"
+                else "Install the pinned local image captioner"
+                if component.id == "captioning"
                 else "Coming later; this capability is not included in the current image release"
             )
             self.db.execute(

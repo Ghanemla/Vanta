@@ -75,6 +75,11 @@ async function chooseLocalFile(command: string): Promise<string | null> {
 }
 
 export const chooseLocalImageFile = () => chooseLocalFile('choose_local_image_file');
+export async function chooseLocalTrainingImages(): Promise<string[]> {
+  if (!isTauri()) return [];
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<string[]>('choose_local_training_images');
+}
 export const chooseLocalVideoFile = () => chooseLocalFile('choose_local_video_file');
 export const chooseLocalLoraFile = () => chooseLocalFile('choose_local_lora_file');
 export const chooseLocalUpscalerFile = () => chooseLocalFile('choose_local_upscaler_file');
@@ -171,6 +176,22 @@ export const api = {
     });
     if (!response.ok)
       throw new ApiError('Vanta could not load this local motion asset.', response.status);
+    return URL.createObjectURL(await response.blob());
+  },
+  trainingImageUrl: async (imageId: string, variant: 'image' | 'thumbnail' = 'thumbnail') => {
+    const response = await fetch(`${apiBase}/api/training/images/${imageId}/${variant}`, {
+      headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
+    });
+    if (!response.ok)
+      throw new ApiError('Vanta could not load this local training image.', response.status);
+    return URL.createObjectURL(await response.blob());
+  },
+  trainingValidationUrl: async (checkpointId: string) => {
+    const response = await fetch(`${apiBase}/api/training/checkpoints/${checkpointId}/validation`, {
+      headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
+    });
+    if (!response.ok)
+      throw new ApiError('Vanta could not load this validation sample.', response.status);
     return URL.createObjectURL(await response.blob());
   },
 };

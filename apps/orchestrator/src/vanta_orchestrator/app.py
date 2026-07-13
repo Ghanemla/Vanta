@@ -41,9 +41,15 @@ from .schemas import (
     ReferenceImportInput,
     ReferenceUpdateInput,
     SettingInput,
+    TrainingCaptionInput,
+    TrainingDatasetInput,
+    TrainingImageImportInput,
+    TrainingInstallInput,
+    TrainingRunInput,
     UpscalerImportInput,
     VideoGenerationInput,
 )
+from .training import TRAINING_PROFILES, TrainingService
 from .video import MotionService
 
 AUTH_HEADER = "X-Vanta-Token"
@@ -120,6 +126,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     generation_jobs = GenerationService(db, engine)
     poses = PoseService(db, settings, engine)
     motion = MotionService(db, settings, engine)
+    training = TrainingService(db, settings, engine, loras)
     generation_jobs.recover()
     motion.recover()
 
@@ -138,6 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     def stop_managed_engine() -> None:
+        training.close()
         engine.close()
 
     def missing(error: KeyError) -> HTTPException:
@@ -451,6 +459,130 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
         return generation_jobs.queue(request)
 
+    @app.get("/api/training/profiles")
+    def training_profiles() -> dict:
+        return TRAINING_PROFILES
+
+    @app.get("/api/training/datasets")
+    def list_training_datasets() -> list[dict]:
+        return training.list_datasets()
+
+    @app.post("/api/training/datasets", status_code=201)
+    def create_training_dataset(payload: TrainingDatasetInput) -> dict:
+        try:
+            return training.create_dataset(payload)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/training/datasets/{dataset_id}")
+    def get_training_dataset(dataset_id: str) -> dict:
+        try:
+            return training.get_dataset(dataset_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/training/datasets/{dataset_id}/images", status_code=201)
+    def import_training_images(dataset_id: str, payload: TrainingImageImportInput) -> dict:
+        try:
+            if not payload.rights_confirmed:
+                raise ValueError("Confirm you own or have permission to train on every image")
+            return training.import_images(dataset_id, payload.source_paths)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.put("/api/training/images/{image_id}/caption")
+    def update_training_caption(image_id: str, payload: TrainingCaptionInput) -> dict:
+        try:
+            return training.update_caption(image_id, payload.caption)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/training/datasets/{dataset_id}/caption")
+    def caption_training_dataset(dataset_id: str) -> dict:
+        try:
+            return training.caption_dataset(dataset_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.delete("/api/training/images/{image_id}", status_code=204)
+    def remove_training_image(image_id: str) -> None:
+        try:
+            training.remove_image(image_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/training/images/{image_id}/{variant}")
+    def training_image_media(image_id: str, variant: str) -> FileResponse:
+        try:
+            path = training.dataset_media(image_id, variant)
+        except KeyError as error:
+            raise missing(error) from error
+        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "image/png")
+
+    @app.get("/api/training/runs")
+    def list_training_runs() -> list[dict]:
+        return training.list_runs()
+
+    @app.post("/api/training/runs", status_code=202)
+    def start_training_run(payload: TrainingRunInput) -> dict:
+        try:
+            return training.start_run(payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/training/runs/{run_id}")
+    def get_training_run(run_id: str) -> dict:
+        try:
+            return training.get_run(run_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/training/runs/{run_id}/cancel")
+    def cancel_training_run(run_id: str) -> dict:
+        try:
+            return training.cancel_run(run_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/training/runs/{run_id}/resume", status_code=202)
+    def resume_training_run(run_id: str) -> dict:
+        try:
+            return training.resume_run(run_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/training/runs/{run_id}/checkpoints/{checkpoint_id}/select")
+    def select_training_checkpoint(run_id: str, checkpoint_id: str) -> dict:
+        try:
+            return training.select_checkpoint(run_id, checkpoint_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/training/runs/{run_id}/install")
+    def install_training_checkpoint(run_id: str, payload: TrainingInstallInput) -> dict:
+        try:
+            return training.install_checkpoint(run_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/training/checkpoints/{checkpoint_id}/validation")
+    def training_validation_sample(checkpoint_id: str) -> FileResponse:
+        try:
+            path = training.validation_media(checkpoint_id)
+        except KeyError as error:
+            raise missing(error) from error
+        return FileResponse(path, media_type="image/png")
+
     @app.post("/api/generations", status_code=202)
     def create_generation(payload: GenerationInput) -> dict:
         try:
@@ -577,11 +709,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/engine/components")
     def list_components() -> list[dict]:
+        training.sync_components()
         return engine.list_components()
 
     @app.post("/api/engine/components/{item_id}/{action}")
     def component_action(item_id: str, action: str) -> dict:
         try:
+            if item_id in {"lora-training", "captioning"}:
+                return training.component_action(item_id, action)
             return engine.component_action(item_id, action)
         except KeyError as error:
             raise missing(error) from error

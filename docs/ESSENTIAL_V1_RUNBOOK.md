@@ -39,11 +39,10 @@ Last updated: 2026-07-13
 
 ## Current feature
 
-Local image-to-video and identity-safe Reference Motion are **implemented with current-code production evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is local LoRA training and dataset preparation.
+Local LoRA training and dataset preparation are **implemented with current-code production evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is preset/recipe mode completion and Models & Engine diagnostics polish.
 
 Remaining V1 work:
 
-- Local LoRA training, dataset checks and resumable run evidence.
 - Preset/recipe mode completion and remaining Models & Engine diagnostics polish.
 - Complete verification matrix, manual acceptance update and final NSIS installer evidence.
 
@@ -127,6 +126,30 @@ Remaining V1 work:
 - `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
 - `docs/CAPABILITY_EVIDENCE.md`
 
+## Local LoRA training files changed
+
+- `apps/orchestrator/migrations/009_local_training.sql`
+- `apps/orchestrator/src/vanta_orchestrator/training.py`
+- `apps/orchestrator/src/vanta_orchestrator/config.py`
+- `apps/orchestrator/src/vanta_orchestrator/schemas.py`
+- `apps/orchestrator/src/vanta_orchestrator/engine.py`
+- `apps/orchestrator/src/vanta_orchestrator/app.py`
+- `apps/orchestrator/tests/test_api.py`
+- `apps/orchestrator/tests/test_migrations.py`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/desktop/src/App.tsx`
+- `apps/desktop/src/App.test.tsx`
+- `apps/desktop/src/api.ts`
+- `apps/desktop/src/types.ts`
+- `apps/desktop/src/styles.css`
+- `engine/manifests/core-components.v1.json`
+- `engine/tools/vanta_training_runner.py`
+- `engine/tools/vanta_caption_runner.py`
+- `scripts/verify_managed_training.py`
+- `docs/ESSENTIAL_V1_RUNBOOK.md`
+- `docs/ENGINE_PACKS.md`
+- `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
+
 ## Tests run
 
 - Baseline Python suite: **21 passed**, 29 deprecation warnings.
@@ -164,6 +187,11 @@ Remaining V1 work:
 - Video domain coverage proves native LTXV graph shape, exact 49-frame two-second profile, distilled sigma schedule, playable managed MP4 encoding, identity-safe broad-motion description, rights enforcement, persistence migration and API job routing.
 - Desktop strict TypeScript and focused ESLint: **passed**; desktop Vitest with jsdom: **1 passed**.
 - Video-integrated renderer production build: **passed**, 1,656 modules, 309.08 kB JS / 45.66 kB CSS before gzip; Tauri `cargo check`: **passed**.
+- Full Python suite after local training integration: **34 passed**, 41 warnings.
+- Training coverage proves rights confirmation, corrupt-image rejection, exact duplicate rejection, thumbnails, editable captions, Safe/Balanced profile contracts, truthful missing-component blocking, and migration persistence.
+- Ruff and Python compilation: **passed**; desktop/domain/UI strict TypeScript and ESLint zero-warning gates: **passed**.
+- Desktop Vitest: **2 files / 2 tests passed**; Rust formatting: **passed**.
+- Training-integrated renderer production build: **passed**, 1,656 modules, 322.29 kB JS / 51.48 kB CSS before gzip.
 
 ## Real evidence produced
 
@@ -213,6 +241,14 @@ Remaining V1 work:
   - Face-disabled DWPose produced a verified 16-frame / 2.0-second / 8 fps skeleton preview. Metadata explicitly records `face_extraction=false`, `audio_transfer=false`, and `source_branding_transfer=false`; the broad description excludes reference-person identity.
   - Job `job-1e0be3d9d98b41acb197aaffdb57ece0`, generation `generation-ee3f72d06504438da0cff49114d903a3`: 49 frames, 2.04 seconds, 24.09-second render, workflow `video-ltxv-reference-motion-v1`.
   - Three-frame visual review accepted a notably stable face, coat, silhouette and restrained leftward movement. Gallery metadata preserves the source image, motion asset, trim, smoothing, strength, model hashes, FFmpeg hash and AI disclosure.
+- Real managed local LoRA training:
+  - Pinned `kohya-ss/sd-scripts` v0.10.5 revision `a1b48df430a3690aeb5c9b6e7b19025afe8fb518`; archive size 12,570,945 bytes and SHA-256 `e5c7d5de3fac08b4f2cf82399b0895aaf5430772469dbdcb5fcee9ad64404be0`.
+  - Offline SDXL tokenizers are pinned to OpenAI revision `32bd64288804d66eefd0ccbe215aa642df71cc41` and LAION revision `743c27bd53dfe508a0ade0f50698f99b39d03bec`. The managed health check loaded both locally with CUDA available before reporting Ready.
+  - Pinned local WD-SwinV2 v3 ONNX captioner revision `627aef95638667ddcaa3ac8ae625e88ea5b02f51`: model size 467,460,978 bytes, SHA-256 `e6774bff34d43bd49f75a47db4ef217dce701c9847b546523eb85ff6dbba1db1`; tag index SHA-256 `298633d94d0031d2081c0893f29c82eab7f0df00b08483ba8f29d1e979441217`.
+  - Dataset `dataset-a2c04930e00243028494fa0b580b6c08` contains three owned Vanta synthetic images. All were captioned locally, detected one subject, retained exact hashes and sharpness scores, and the two related derivatives were truthfully flagged `near_duplicate`.
+  - Safe 12 GB run `training-run-75c5fa580bde4e75b0437c55d452a350` completed 12/12 steps and one epoch in 88 seconds. Resumable state, per-run logs, ETA/progress, and a visually inspected 512x512 validation sample were persisted.
+  - Checkpoint `checkpoint-f2457c86442a40dc9d714622f9461535` is 21,588,484 bytes with SHA-256 `afb044d73ad6991a5d2e31a710b05625e043da147c54d56a4b86fb3c794de428`; it was installed as LoRA `lora-c618cb1c3a9d44e6b776a47c437c0845` and assigned to the linked fictional character.
+  - Job `job-cef676781b5d401a8988569c42602e46`, generation `generation-29d6980da0244ed08937f10d8f3bbd2c`: 512x768, 16 steps, 26.28 seconds. Visual review accepted the coherent plum-coat portrait; Gallery metadata records the trained LoRA ID, filename, exact hash, strength and disclosure.
 
 ## Blockers
 
@@ -221,7 +257,7 @@ Remaining V1 work:
 
 ## Exact next action
 
-Commit the verified video and Reference Motion slice, then implement and prove local LoRA training.
+Commit the verified local LoRA training slice, then complete preset/recipe modes and Models & Engine diagnostics.
 
 ## Final acceptance status
 

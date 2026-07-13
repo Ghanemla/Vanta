@@ -193,3 +193,34 @@ class MotionUpdateInput(StrictModel):
     fit_mode: Literal["crop", "fit"]
     smoothing: float = Field(ge=0, le=1)
     strength: float = Field(ge=0, le=1)
+
+
+class TrainingDatasetInput(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    character_id: str | None = None
+    trigger_token: str = Field(min_length=2, max_length=80, pattern=r"^[A-Za-z][A-Za-z0-9_-]+$")
+    model_alias: Literal["photoreal_balanced", "preview_fast"] = "photoreal_balanced"
+    notes: str = Field(default="", max_length=2000)
+
+
+class TrainingImageImportInput(StrictModel):
+    source_paths: list[str] = Field(min_length=1, max_length=250)
+    rights_confirmed: bool
+
+
+class TrainingCaptionInput(StrictModel):
+    caption: str = Field(min_length=1, max_length=4000)
+
+
+class TrainingRunInput(StrictModel):
+    dataset_id: str = Field(min_length=1)
+    profile: Literal["safe_12gb", "balanced_12gb"] = "safe_12gb"
+    epochs: int = Field(default=4, ge=1, le=40)
+    validation_prompt: str = Field(default="", max_length=2000)
+
+
+class TrainingInstallInput(StrictModel):
+    checkpoint_id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=120)
+    character_id: str = Field(min_length=1)
+    strength: float = Field(default=0.8, ge=0, le=2)

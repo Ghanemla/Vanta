@@ -230,6 +230,73 @@ export interface MotionAsset {
   created_at: string;
   updated_at: string;
 }
+export interface TrainingImage {
+  id: string;
+  dataset_id: string;
+  original_name: string;
+  width: number;
+  height: number;
+  blur_score: number;
+  face_count: number | null;
+  caption: string;
+  warnings: Array<'low_resolution' | 'possible_blur' | 'near_duplicate' | 'multiple_faces'>;
+}
+export interface TrainingDataset {
+  id: string;
+  name: string;
+  character_id: string | null;
+  trigger_token: string;
+  model_alias: 'photoreal_balanced' | 'preview_fast';
+  notes: string;
+  image_count: number;
+  images: TrainingImage[];
+  profiles: Record<
+    'safe_12gb' | 'balanced_12gb',
+    {
+      display_name: string;
+      resolution: number;
+      rank: number;
+      repeats: number;
+      vram_gb: number;
+      disk_gb: number;
+    }
+  >;
+}
+export interface TrainingCheckpoint {
+  id: string;
+  epoch: number;
+  step: number;
+  sha256: string;
+  file_size: number;
+  validation_sample_path: string | null;
+  selected: boolean;
+}
+export interface TrainingRun {
+  id: string;
+  dataset_id: string;
+  character_id: string | null;
+  profile: 'safe_12gb' | 'balanced_12gb';
+  status: string;
+  progress: number;
+  current_epoch: number;
+  total_epochs: number;
+  current_step: number;
+  total_steps: number;
+  eta_seconds: number | null;
+  error_message: string | null;
+  resume_state_path: string | null;
+  installed_lora_id: string | null;
+  estimates: {
+    profile: string;
+    seconds: number;
+    disk_gb: number;
+    vram_gb: number;
+    resolution: number;
+    rank: number;
+    steps: number;
+  };
+  checkpoints: TrainingCheckpoint[];
+}
 export interface SettingsRecord {
   values: Record<string, string>;
   paths: { data: string; database: string; models: string };

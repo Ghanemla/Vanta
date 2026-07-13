@@ -321,3 +321,86 @@ def test_video_request_is_persisted_as_a_local_generation_job(client, tmp_path):
     assert request["operation"] == "video"
     assert request["model_alias"] == "video_ltx_2b"
     assert request["duration_seconds"] == 2
+
+
+def test_training_dataset_quality_checks_captions_and_truthful_readiness(client, tmp_path):
+    from PIL import Image, ImageDraw
+
+    character = client.post(
+        "/api/characters",
+        json={"name": "Owned fictional trainer subject", "identity_description": "Original"},
+    ).json()
+    created = client.post(
+        "/api/training/datasets",
+        json={
+            "name": "Editorial identity set",
+            "character_id": character["id"],
+            "trigger_token": "vantaSubject",
+            "model_alias": "photoreal_balanced",
+        },
+    )
+    assert created.status_code == 201
+    dataset_id = created.json()["id"]
+
+    image_path = tmp_path / "owned.png"
+    image = Image.new("RGB", (640, 768), "white")
+    draw = ImageDraw.Draw(image)
+    for offset in range(0, 640, 32):
+        draw.rectangle((offset, 0, offset + 16, 768), fill=(offset % 255, 40, 120))
+    image.save(image_path)
+    imported = client.post(
+        f"/api/training/datasets/{dataset_id}/images",
+        json={"source_paths": [str(image_path)], "rights_confirmed": True},
+    )
+    assert imported.status_code == 201
+    training_image = imported.json()["dataset"]["images"][0]
+    assert training_image["caption"] == "vantaSubject"
+    assert training_image["width"] == 640
+    assert training_image["height"] == 768
+    assert client.get(f"/api/training/images/{training_image['id']}/thumbnail").status_code == 200
+
+    duplicate = client.post(
+        f"/api/training/datasets/{dataset_id}/images",
+        json={"source_paths": [str(image_path)], "rights_confirmed": True},
+    )
+    assert duplicate.status_code == 422
+    assert "duplicate" in duplicate.json()["detail"].lower()
+    updated = client.put(
+        f"/api/training/images/{training_image['id']}/caption",
+        json={"caption": "vantaSubject, original fictional person, editorial portrait"},
+    )
+    assert updated.status_code == 200
+    assert "editorial portrait" in updated.json()["caption"]
+
+    profiles = client.get("/api/training/profiles").json()
+    assert profiles["safe_12gb"]["resolution"] == 512
+    assert profiles["balanced_12gb"]["rank"] == 8
+    components = {item["id"]: item for item in client.get("/api/engine/components").json()}
+    assert components["lora-training"]["state"] == "not_installed"
+    assert components["captioning"]["state"] == "not_installed"
+    blocked = client.post(
+        "/api/training/runs",
+        json={"dataset_id": dataset_id, "profile": "safe_12gb", "epochs": 1},
+    )
+    assert blocked.status_code == 409
+    assert "install" in blocked.json()["detail"].lower()
+
+
+def test_training_dataset_rejects_corrupt_and_low_rights_inputs(client, tmp_path):
+    dataset = client.post(
+        "/api/training/datasets",
+        json={"name": "Local set", "trigger_token": "localSubject"},
+    ).json()
+    corrupt = tmp_path / "corrupt.png"
+    corrupt.write_bytes(b"not an image")
+    response = client.post(
+        f"/api/training/datasets/{dataset['id']}/images",
+        json={"source_paths": [str(corrupt)], "rights_confirmed": True},
+    )
+    assert response.status_code == 422
+    not_confirmed = client.post(
+        f"/api/training/datasets/{dataset['id']}/images",
+        json={"source_paths": [str(corrupt)], "rights_confirmed": False},
+    )
+    assert not_confirmed.status_code == 422
+    assert "permission" in not_confirmed.json()["detail"].lower()

@@ -523,6 +523,17 @@ fn choose_local_image_file() -> Option<String> {
 }
 
 #[tauri::command]
+fn choose_local_training_images() -> Vec<String> {
+    rfd::FileDialog::new()
+        .add_filter("Owned training images", &["png", "jpg", "jpeg", "webp"])
+        .pick_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+#[tauri::command]
 fn choose_local_video_file() -> Option<String> {
     rfd::FileDialog::new()
         .add_filter("Motion references", &["mp4", "mov", "webm", "mkv"])
@@ -633,6 +644,7 @@ pub fn run() {
             repair_application_runtime,
             choose_local_model_file,
             choose_local_image_file,
+            choose_local_training_images,
             choose_local_video_file,
             choose_local_lora_file,
             choose_local_upscaler_file

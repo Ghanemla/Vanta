@@ -1,5 +1,12 @@
 # Capability evidence
 
+## Managed local LoRA training
+
+- Vanta manages pinned `sd-scripts` v0.10.5, isolated Python dependencies, two offline SDXL tokenizer sets and the WD-SwinV2 v3 ONNX captioner. Ready requires CUDA imports, local tokenizer loading and a real ONNX session; training runs force network libraries offline.
+- Dataset `dataset-a2c04930e00243028494fa0b580b6c08` contains three owned synthetic Vanta images with local captions, exact hashes, quality metrics, one-subject counts and near-duplicate warnings.
+- Evidence on 2026-07-13: Safe 12 GB run `training-run-75c5fa580bde4e75b0437c55d452a350` completed 12/12 steps in 88 seconds and produced checkpoint SHA-256 `afb044d73ad6991a5d2e31a710b05625e043da147c54d56a4b86fb3c794de428`, resumable state and a validation sample.
+- Installed LoRA `lora-c618cb1c3a9d44e6b776a47c437c0845` then produced Gallery image `generation-29d6980da0244ed08937f10d8f3bbd2c`; reproducibility metadata records the LoRA ID, filename, hash, weights and AI disclosure.
+
 ## Native local image-to-video
 
 - Pack: `Motion — LTXV 2B Safe` (`video_ltx_2b`), pinned to the LTXV 2B distilled FP8 checkpoint and separate T5 XXL FP8 encoder with exact revisions, byte sizes and SHA-256 values.

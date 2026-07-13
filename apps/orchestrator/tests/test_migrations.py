@@ -26,6 +26,10 @@ def test_migrations_create_all_required_tables(client):
         "character_loras",
         "pose_assets",
         "motion_assets",
+        "training_datasets",
+        "training_images",
+        "training_runs",
+        "training_checkpoints",
         "schema_migrations",
     }
     assert required.issubset(tables)

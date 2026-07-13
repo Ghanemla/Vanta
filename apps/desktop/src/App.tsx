@@ -58,6 +58,7 @@ import {
   chooseLocalModelFile,
   chooseLocalUpscalerFile,
   chooseLocalVideoFile,
+  chooseLocalTrainingImages,
   exportDiagnostics,
   getLocalServiceInfo,
   repairApplicationRuntime,
@@ -76,10 +77,20 @@ import type {
   PoseRecord,
   PresetRecord,
   SettingsRecord,
+  TrainingDataset,
+  TrainingRun,
 } from './types';
 
 type Screen =
-  'create' | 'characters' | 'poses' | 'motion' | 'presets' | 'gallery' | 'engine' | 'settings';
+  | 'create'
+  | 'characters'
+  | 'poses'
+  | 'motion'
+  | 'training'
+  | 'presets'
+  | 'gallery'
+  | 'engine'
+  | 'settings';
 type AppData = {
   characters: CharacterRecord[];
   presets: PresetRecord[];
@@ -90,6 +101,8 @@ type AppData = {
   jobs: GenerationJob[];
   poses: PoseRecord[];
   motion: MotionAsset[];
+  trainingDatasets: TrainingDataset[];
+  trainingRuns: TrainingRun[];
   hardware: { gpu_name: string; vram_gb: number; ram_gb: number; free_disk_gb: number };
   settings: SettingsRecord;
 };
@@ -99,6 +112,7 @@ const navItems: { id: Screen; label: string; icon: typeof Sparkles }[] = [
   { id: 'characters', label: 'Characters', icon: CircleUserRound },
   { id: 'poses', label: 'Pose Library', icon: Image },
   { id: 'motion', label: 'Motion Library', icon: Film },
+  { id: 'training', label: 'LoRA Training', icon: Database },
   { id: 'presets', label: 'Presets', icon: BookOpen },
   { id: 'gallery', label: 'Gallery', icon: Grid3X3 },
   { id: 'engine', label: 'Models & Engine', icon: Gauge },
@@ -303,6 +317,8 @@ export function App() {
         jobs,
         poses,
         motion,
+        trainingDatasets,
+        trainingRuns,
       ] = await Promise.all([
         api.get<CharacterRecord[]>('/characters'),
         api.get<PresetRecord[]>('/presets'),
@@ -314,6 +330,8 @@ export function App() {
         api.get<GenerationJob[]>('/jobs'),
         api.get<PoseRecord[]>('/poses'),
         api.get<MotionAsset[]>('/motion-assets'),
+        api.get<TrainingDataset[]>('/training/datasets'),
+        api.get<TrainingRun[]>('/training/runs'),
       ]);
       setData({
         characters,
@@ -327,6 +345,8 @@ export function App() {
         jobs,
         poses,
         motion,
+        trainingDatasets,
+        trainingRuns,
       });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The local studio could not start.');
@@ -366,8 +386,11 @@ export function App() {
   }, [toast]);
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void api.get<GenerationJob[]>('/jobs').then((jobs) => {
-        setData((current) => (current ? { ...current, jobs } : current));
+      void Promise.all([
+        api.get<GenerationJob[]>('/jobs'),
+        api.get<TrainingRun[]>('/training/runs'),
+      ]).then(([jobs, trainingRuns]) => {
+        setData((current) => (current ? { ...current, jobs, trainingRuns } : current));
       });
     }, 1100);
     return () => window.clearInterval(timer);
@@ -563,6 +586,9 @@ export function App() {
               )}
               {screen === 'motion' && (
                 <MotionLibraryScreen items={data.motion} refresh={load} notify={notify} />
+              )}
+              {screen === 'training' && (
+                <TrainingScreen data={data} refresh={load} notify={notify} />
               )}
               {screen === 'presets' && (
                 <PresetsScreen items={data.presets} refresh={load} notify={notify} />
@@ -2439,6 +2465,588 @@ const presetCategories = [
   'negative',
   'motion',
 ];
+function LocalTrainingImage({
+  imageId,
+  alt,
+  variant = 'thumbnail',
+}: {
+  imageId: string;
+  alt: string;
+  variant?: 'image' | 'thumbnail';
+}) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api.trainingImageUrl(imageId, variant).then((next) => {
+      objectUrl = next;
+      if (active) setUrl(next);
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [imageId, variant]);
+  return url ? <img src={url} alt={alt} /> : <div className="training-image-placeholder" />;
+}
+
+function TrainingValidationImage({ checkpointId }: { checkpointId: string }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api
+      .trainingValidationUrl(checkpointId)
+      .then((next) => {
+        objectUrl = next;
+        if (active) setUrl(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [checkpointId]);
+  return url ? <img src={url} alt="Local checkpoint validation sample" /> : null;
+}
+
+function TrainingScreen({
+  data,
+  refresh,
+  notify,
+}: {
+  data: AppData;
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [selectedId, setSelectedId] = useState(data.trainingDatasets[0]?.id ?? '');
+  const [creating, setCreating] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [profile, setProfile] = useState<'safe_12gb' | 'balanced_12gb'>('safe_12gb');
+  const [epochs, setEpochs] = useState(4);
+  const [validationPrompt, setValidationPrompt] = useState('');
+  const [installCharacterId, setInstallCharacterId] = useState('');
+  const selected =
+    data.trainingDatasets.find((item) => item.id === selectedId) ?? data.trainingDatasets[0];
+  const trainerReady =
+    data.components.find((item) => item.id === 'lora-training')?.state === 'ready';
+  const captionReady = data.components.find((item) => item.id === 'captioning')?.state === 'ready';
+  const activeRun = data.trainingRuns.find((run) =>
+    ['queued', 'preparing', 'training', 'cancelling'].includes(run.status),
+  );
+
+  useEffect(() => {
+    if (selected && !selectedId) setSelectedId(selected.id);
+    if (selected?.character_id) setInstallCharacterId(selected.character_id);
+  }, [selected, selectedId]);
+
+  const createDataset = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy('create');
+    try {
+      const dataset = await api.post<TrainingDataset>('/training/datasets', {
+        name: form.get('name'),
+        character_id: form.get('character_id') || null,
+        trigger_token: form.get('trigger_token'),
+        model_alias: form.get('model_alias'),
+        notes: form.get('notes'),
+      });
+      setSelectedId(dataset.id);
+      setCreating(false);
+      notify('Private local training dataset created');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const importImages = async () => {
+    if (!selected || !rightsConfirmed) return;
+    const sourcePaths = await chooseLocalTrainingImages();
+    if (!sourcePaths.length) return;
+    setBusy('import');
+    try {
+      const result = await api.post<{ accepted: string[]; rejected: unknown[] }>(
+        `/training/datasets/${selected.id}/images`,
+        { source_paths: sourcePaths, rights_confirmed: true },
+      );
+      notify(
+        `${result.accepted.length} owned image${result.accepted.length === 1 ? '' : 's'} checked and imported${result.rejected.length ? ` · ${result.rejected.length} rejected` : ''}`,
+      );
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const autoCaption = async () => {
+    if (!selected) return;
+    setBusy('caption');
+    try {
+      await api.post(`/training/datasets/${selected.id}/caption`);
+      notify('Local captions generated · review every caption before training');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const startTraining = async () => {
+    if (!selected) return;
+    setBusy('train');
+    try {
+      await api.post('/training/runs', {
+        dataset_id: selected.id,
+        profile,
+        epochs,
+        validation_prompt: validationPrompt,
+      });
+      notify('Local LoRA training queued on this GPU');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const profileConfig = selected?.profiles[profile] ?? {
+    display_name: profile === 'safe_12gb' ? 'Safe 12 GB' : 'Balanced 12 GB',
+    resolution: profile === 'safe_12gb' ? 512 : 768,
+    rank: profile === 'safe_12gb' ? 4 : 8,
+    repeats: profile === 'safe_12gb' ? 4 : 6,
+    vram_gb: profile === 'safe_12gb' ? 10.5 : 11.7,
+    disk_gb: profile === 'safe_12gb' ? 2.2 : 3.8,
+  };
+  const estimatedSteps = selected
+    ? Math.max(
+        1,
+        Math.ceil(
+          (selected.image_count * profileConfig.repeats * epochs) /
+            (profile === 'balanced_12gb' ? 2 : 1),
+        ),
+      )
+    : 0;
+  const estimatedMinutes = Math.ceil(
+    (estimatedSteps * (profile === 'balanced_12gb' ? 28 : 18) + 240) / 60,
+  );
+
+  return (
+    <div className="screen training-screen">
+      <PageTitle
+        eyebrow="Local LoRA training"
+        title="Teach an original character, privately."
+        body="Build a reviewed dataset, train with a hardware-safe profile, compare checkpoints, then install the chosen LoRA into its character."
+        actions={
+          <Button onClick={() => setCreating(true)}>
+            <Plus /> New dataset
+          </Button>
+        }
+      />
+
+      <div className="training-readiness" aria-label="Training capability readiness">
+        <StatusPill tone={trainerReady ? 'ready' : 'warning'}>
+          Trainer {trainerReady ? 'ready' : 'setup needed'}
+        </StatusPill>
+        <StatusPill tone={captionReady ? 'ready' : 'warning'}>
+          Captioning {captionReady ? 'ready' : 'setup needed'}
+        </StatusPill>
+        <span>sd-scripts 0.10.5 · local CUDA · no cloud upload</span>
+      </div>
+
+      {!data.trainingDatasets.length ? (
+        <EmptyState
+          title="No training datasets yet"
+          body="Create a private dataset for an original character, then import only images you own or can use."
+          action={<Button onClick={() => setCreating(true)}>Create dataset</Button>}
+        />
+      ) : (
+        <div className="training-workspace">
+          <aside className="training-dataset-list" aria-label="Training datasets">
+            {data.trainingDatasets.map((dataset) => (
+              <button
+                type="button"
+                key={dataset.id}
+                className={selected?.id === dataset.id ? 'active' : ''}
+                onClick={() => setSelectedId(dataset.id)}
+              >
+                <span>{dataset.name}</span>
+                <small>
+                  {dataset.image_count} images · {dataset.trigger_token}
+                </small>
+              </button>
+            ))}
+          </aside>
+
+          {selected && (
+            <div className="training-detail">
+              <Panel className="training-dataset-header">
+                <div>
+                  <span className="eyebrow">Dataset</span>
+                  <h2>{selected.name}</h2>
+                  <p>
+                    Trigger <code>{selected.trigger_token}</code> · {selected.model_alias}
+                  </p>
+                </div>
+                <div className="training-import-actions">
+                  <label className="rights-check">
+                    <input
+                      type="checkbox"
+                      checked={rightsConfirmed}
+                      onChange={(event) => setRightsConfirmed(event.target.checked)}
+                    />
+                    I own or have permission to train on these images
+                  </label>
+                  <div>
+                    <Button
+                      onClick={() => void importImages()}
+                      disabled={!rightsConfirmed || busy === 'import'}
+                    >
+                      <Upload /> Import images
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      onClick={() => void autoCaption()}
+                      disabled={!captionReady || !selected.image_count || busy === 'caption'}
+                    >
+                      <Sparkles /> Auto-caption locally
+                    </Button>
+                  </div>
+                </div>
+              </Panel>
+
+              {selected.images.length ? (
+                <div className="training-image-grid">
+                  {selected.images.map((image) => (
+                    <Panel className="training-image-card" key={image.id}>
+                      <div className="training-image-frame">
+                        <LocalTrainingImage imageId={image.id} alt={image.original_name} />
+                        <span>
+                          {image.width} × {image.height}
+                        </span>
+                      </div>
+                      <div className="training-warning-row">
+                        {image.warnings.length ? (
+                          image.warnings.map((warning) => (
+                            <StatusPill key={warning} tone="warning">
+                              {warning.replaceAll('_', ' ')}
+                            </StatusPill>
+                          ))
+                        ) : (
+                          <StatusPill tone="ready">Quality check passed</StatusPill>
+                        )}
+                      </div>
+                      <label>
+                        Reviewed caption
+                        <textarea
+                          defaultValue={image.caption}
+                          onBlur={(event) => {
+                            if (event.target.value.trim() !== image.caption)
+                              void api
+                                .put(`/training/images/${image.id}/caption`, {
+                                  caption: event.target.value.trim(),
+                                })
+                                .then(() => notify('Caption saved locally'));
+                          }}
+                        />
+                      </label>
+                      <footer>
+                        <small>Blur score {image.blur_score.toFixed(1)}</small>
+                        <Button
+                          variant="ghost"
+                          onClick={async () => {
+                            await api.delete(`/training/images/${image.id}`);
+                            await refresh();
+                          }}
+                        >
+                          <Trash2 /> Remove
+                        </Button>
+                      </footer>
+                    </Panel>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  title="This dataset is empty"
+                  body="Import several varied, sharp images. Vanta will flag exact and near duplicates, low resolution, blur, and multiple subjects."
+                />
+              )}
+
+              <Panel className="training-profile-panel">
+                <div className="section-heading">
+                  <div>
+                    <span className="eyebrow">Hardware-safe setup</span>
+                    <h2>Training profile</h2>
+                  </div>
+                  <p>Estimates adapt to this dataset and remain visible before the GPU starts.</p>
+                </div>
+                <div className="training-profile-options">
+                  {(['safe_12gb', 'balanced_12gb'] as const).map((id) => {
+                    const item = selected.profiles[id];
+                    return (
+                      <label className={profile === id ? 'selected' : ''} key={id}>
+                        <input
+                          type="radio"
+                          name="training-profile"
+                          value={id}
+                          checked={profile === id}
+                          onChange={() => setProfile(id)}
+                        />
+                        <strong>{item.display_name}</strong>
+                        <span>
+                          {item.resolution}px · rank {item.rank} · about {item.vram_gb} GB VRAM
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="training-run-form">
+                  <label>
+                    Epochs
+                    <input
+                      type="number"
+                      min={1}
+                      max={40}
+                      value={epochs}
+                      onChange={(event) => setEpochs(Number(event.target.value))}
+                    />
+                  </label>
+                  <label className="training-validation-prompt">
+                    Validation prompt
+                    <input
+                      value={validationPrompt}
+                      onChange={(event) => setValidationPrompt(event.target.value)}
+                      placeholder={`portrait photograph of ${selected.trigger_token}`}
+                    />
+                  </label>
+                  <dl className="training-estimates">
+                    <div>
+                      <dt>Estimated time</dt>
+                      <dd>~{estimatedMinutes} min</dd>
+                    </div>
+                    <div>
+                      <dt>Steps</dt>
+                      <dd>{estimatedSteps}</dd>
+                    </div>
+                    <div>
+                      <dt>Working disk</dt>
+                      <dd>~{profileConfig.disk_gb} GB</dd>
+                    </div>
+                  </dl>
+                  <Button
+                    variant="primary"
+                    onClick={() => void startTraining()}
+                    disabled={
+                      !trainerReady ||
+                      !selected.image_count ||
+                      Boolean(activeRun) ||
+                      busy === 'train'
+                    }
+                  >
+                    <Play /> Start local training
+                  </Button>
+                </div>
+              </Panel>
+            </div>
+          )}
+        </div>
+      )}
+
+      <section className="training-runs-section">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Persistent local runs</span>
+            <h2>Progress & checkpoints</h2>
+          </div>
+          <p>
+            Epoch state, checkpoint files, validation samples, cancellation, and resume stay on
+            disk.
+          </p>
+        </div>
+        {data.trainingRuns.length ? (
+          <div className="training-run-list">
+            {data.trainingRuns.map((run) => {
+              const dataset = data.trainingDatasets.find((item) => item.id === run.dataset_id);
+              return (
+                <Panel className="training-run-card" key={run.id}>
+                  <header>
+                    <div>
+                      <h3>{dataset?.name ?? 'Local dataset'}</h3>
+                      <p>
+                        {run.estimates.profile} · epoch {run.current_epoch}/{run.total_epochs} ·
+                        step {run.current_step}/{run.total_steps}
+                      </p>
+                    </div>
+                    <StatusPill tone={stateTone(run.status)}>
+                      {stateLabels[run.status] ?? run.status}
+                    </StatusPill>
+                  </header>
+                  <div className="progress" aria-label={`${run.progress}% trained`}>
+                    <span style={{ width: `${run.progress}%` }} />
+                  </div>
+                  <div className="training-run-meta">
+                    <span>{run.progress}%</span>
+                    <span>
+                      {run.eta_seconds != null
+                        ? `${Math.ceil(run.eta_seconds / 60)} min remaining`
+                        : `${run.estimates.vram_gb} GB estimated VRAM`}
+                    </span>
+                  </div>
+                  {run.error_message && <p className="inline-error">{run.error_message}</p>}
+                  <div className="training-checkpoints">
+                    {run.checkpoints.map((checkpoint) => (
+                      <article
+                        className={checkpoint.selected ? 'selected' : ''}
+                        key={checkpoint.id}
+                      >
+                        <TrainingValidationImage checkpointId={checkpoint.id} />
+                        <div>
+                          <strong>Epoch {checkpoint.epoch}</strong>
+                          <small>
+                            {(checkpoint.file_size / 1024 / 1024).toFixed(1)} MB ·{' '}
+                            {checkpoint.sha256.slice(0, 10)}…
+                          </small>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          onClick={async () => {
+                            await api.post(
+                              `/training/runs/${run.id}/checkpoints/${checkpoint.id}/select`,
+                            );
+                            await refresh();
+                          }}
+                        >
+                          {checkpoint.selected ? <Check /> : <Star />} Select
+                        </Button>
+                      </article>
+                    ))}
+                  </div>
+                  <footer>
+                    {['queued', 'preparing', 'training', 'cancelling'].includes(run.status) && (
+                      <Button onClick={() => void api.post(`/training/runs/${run.id}/cancel`)}>
+                        Cancel safely
+                      </Button>
+                    )}
+                    {['failed', 'cancelled'].includes(run.status) && run.resume_state_path && (
+                      <Button
+                        onClick={async () => {
+                          await api.post(`/training/runs/${run.id}/resume`);
+                          await refresh();
+                        }}
+                      >
+                        <RotateCcw /> Resume saved state
+                      </Button>
+                    )}
+                    {run.status === 'completed' &&
+                      run.checkpoints.length > 0 &&
+                      !run.installed_lora_id && (
+                        <>
+                          <select
+                            aria-label="Character for trained LoRA"
+                            value={installCharacterId || dataset?.character_id || ''}
+                            onChange={(event) => setInstallCharacterId(event.target.value)}
+                          >
+                            <option value="">Choose character…</option>
+                            {data.characters.map((character) => (
+                              <option value={character.id} key={character.id}>
+                                {character.name}
+                              </option>
+                            ))}
+                          </select>
+                          <Button
+                            variant="primary"
+                            disabled={!installCharacterId && !dataset?.character_id}
+                            onClick={async () => {
+                              const checkpoint =
+                                run.checkpoints.find((item) => item.selected) ??
+                                run.checkpoints[run.checkpoints.length - 1];
+                              if (!checkpoint) return;
+                              await api.post(`/training/runs/${run.id}/install`, {
+                                checkpoint_id: checkpoint.id,
+                                name: `${dataset?.name ?? 'Vanta'} trained LoRA`,
+                                character_id: installCharacterId || dataset?.character_id,
+                                strength: 0.8,
+                              });
+                              notify('Selected trained LoRA installed into the character');
+                              await refresh();
+                            }}
+                          >
+                            <Zap /> Install into character
+                          </Button>
+                        </>
+                      )}
+                    {run.installed_lora_id && (
+                      <StatusPill tone="ready">Installed in character</StatusPill>
+                    )}
+                  </footer>
+                </Panel>
+              );
+            })}
+          </div>
+        ) : (
+          <EmptyState
+            title="No training runs"
+            body="Completed, cancelled, failed, and resumable runs will remain here with honest state."
+          />
+        )}
+      </section>
+
+      <Drawer
+        open={creating}
+        title="New private training dataset"
+        onClose={() => setCreating(false)}
+      >
+        <form className="drawer-form" onSubmit={(event) => void createDataset(event)}>
+          <label>
+            Dataset name
+            <input name="name" required placeholder="Mara editorial identity" />
+          </label>
+          <label>
+            Original character
+            <select name="character_id" defaultValue="">
+              <option value="">Choose later</option>
+              {data.characters.map((character) => (
+                <option key={character.id} value={character.id}>
+                  {character.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Unique trigger token
+            <input
+              name="trigger_token"
+              required
+              pattern="[A-Za-z][A-Za-z0-9_-]+"
+              placeholder="maraVanta"
+            />
+            <small>Use an invented token that is not a real person’s name.</small>
+          </label>
+          <label>
+            SDXL base profile
+            <select name="model_alias" defaultValue="photoreal_balanced">
+              <option value="photoreal_balanced">Realistic — Balanced</option>
+              <option value="preview_fast">Preview — Fast</option>
+            </select>
+          </label>
+          <label>
+            Notes
+            <textarea name="notes" placeholder="Rights, source, and intended style notes" />
+          </label>
+          <footer>
+            <Button type="button" variant="ghost" onClick={() => setCreating(false)}>
+              Cancel
+            </Button>
+            <Button variant="primary" type="submit" disabled={busy === 'create'}>
+              Create local dataset
+            </Button>
+          </footer>
+        </form>
+      </Drawer>
+    </div>
+  );
+}
+
 function PresetsScreen({
   items,
   refresh,

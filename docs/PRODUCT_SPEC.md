@@ -38,6 +38,6 @@ No inference APIs are required. Runtime costs are electricity, storage and optio
 
 Store the supplied Y2K bedroom concept as a recipe, but normalize the identity wording to clearly describe an adult original character. Do not depend on proprietary “GPT Image 2 in Eromify”; choose the best installed local model/profile through the engine adapter.
 
-## Later training flow
+## Local training flow
 
 Dataset import → quality checks → duplicate detection → auto-caption locally → caption review → GPU-safe training recommendation → train → sample checkpoints → choose winner → install into character.

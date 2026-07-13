@@ -37,8 +37,12 @@ Initial shipped core:
 - generation metadata support
 - one compatible upscaler
 - required Python packages
+- pinned local SDXL LoRA trainer and offline tokenizer assets
+- pinned local ONNX captioner with identity-name tag exclusion
 
 Users should never be asked to locate a missing node manually during normal operation.
+
+Training datasets, captions, checkpoints and resumable run state are user data and survive component repair or removal. Only the managed trainer/captioner runtime is removed by a component Remove action.
 
 ## Model packs
 

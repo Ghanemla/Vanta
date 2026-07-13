@@ -224,6 +224,108 @@
       "repair_strategy": "reverify_and_restore",
       "dependencies": ["workflow-runtime", "pose-control", "video-generation"],
       "provided_capabilities": ["Video Import", "Broad Motion Extraction", "Motion Preview"]
+    },
+    {
+      "id": "lora-training",
+      "display_name": "LoRA Training",
+      "version": "sd-scripts-0.10.5-vanta-2",
+      "pinned_revision": "a1b48df430a3690aeb5c9b6e7b19025afe8fb518",
+      "source": {
+        "type": "managed_python_runtime",
+        "url": "https://codeload.github.com/kohya-ss/sd-scripts/zip/a1b48df430a3690aeb5c9b6e7b19025afe8fb518",
+        "sha256": "e5c7d5de3fac08b4f2cf82399b0895aaf5430772469dbdcb5fcee9ad64404be0",
+        "bytes": 12570945,
+        "python": "Managed ComfyUI Python with isolated training packages",
+        "packages": [
+          "accelerate==1.6.0",
+          "transformers==4.54.1",
+          "tokenizers==0.21.4",
+          "huggingface-hub==0.34.3",
+          "diffusers==0.32.1",
+          "ftfy==6.3.1",
+          "opencv-python-headless==4.13.0.92",
+          "toml==0.10.2",
+          "voluptuous==0.15.2",
+          "rich==14.1.0",
+          "imagesize==1.4.1"
+        ],
+        "tokenizers": [
+          {
+            "repository": "openai/clip-vit-large-patch14",
+            "revision": "32bd64288804d66eefd0ccbe215aa642df71cc41",
+            "cache_name": "openai_clip-vit-large-patch14"
+          },
+          {
+            "repository": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+            "revision": "743c27bd53dfe508a0ade0f50698f99b39d03bec",
+            "cache_name": "laion_CLIP-ViT-bigG-14-laion2B-39B-b160k"
+          }
+        ],
+        "shared_runtime_constraints": { "minimum_torch": "2.6.0", "python_tested_by_vanta": "3.13" }
+      },
+      "license": {
+        "name": "Apache-2.0 sd-scripts; dependency licenses retained",
+        "source_url": "https://github.com/kohya-ss/sd-scripts/tree/a1b48df430a3690aeb5c9b6e7b19025afe8fb518",
+        "redistribution_reviewed": false,
+        "acceptance_required": true
+      },
+      "install_strategy": "managed_python_runtime",
+      "health_checks": [
+        {
+          "type": "subprocess_probe",
+          "target": "sdxl_train_network",
+          "description": "Pinned trainer imports with CUDA PyTorch"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime"],
+      "provided_capabilities": ["SDXL LoRA Training", "Checkpoint Resume", "Validation Samples"]
+    },
+    {
+      "id": "captioning",
+      "display_name": "Local Captioning",
+      "version": "wd-swinv2-v3-onnx-1",
+      "pinned_revision": "627aef95638667ddcaa3ac8ae625e88ea5b02f51",
+      "source": {
+        "type": "managed_model",
+        "repository": "SmilingWolf/wd-swinv2-tagger-v3",
+        "transport_fallback": "Windows curl.exe with retry and resume for Xet-backed blobs",
+        "model": {
+          "url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/627aef95638667ddcaa3ac8ae625e88ea5b02f51/model.onnx?download=true",
+          "filename": "model.onnx",
+          "sha256": "e6774bff34d43bd49f75a47db4ef217dce701c9847b546523eb85ff6dbba1db1",
+          "bytes": 467460978
+        },
+        "tags": {
+          "url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/627aef95638667ddcaa3ac8ae625e88ea5b02f51/selected_tags.csv?download=true",
+          "filename": "selected_tags.csv",
+          "sha256": "298633d94d0031d2081c0893f29c82eab7f0df00b08483ba8f29d1e979441217",
+          "bytes": 308468
+        },
+        "packages": ["onnxruntime==1.23.2"],
+        "identity_policy": "Character-name tags are excluded; captions describe visible general attributes only"
+      },
+      "license": {
+        "name": "Apache-2.0",
+        "source_url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3",
+        "redistribution_reviewed": false,
+        "acceptance_required": true
+      },
+      "install_strategy": "managed_model",
+      "health_checks": [
+        {
+          "type": "subprocess_probe",
+          "target": "wd_swinv2_onnx",
+          "description": "Local ONNX caption model and tag index are verified"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime"],
+      "provided_capabilities": [
+        "Local Auto-Captioning",
+        "Caption Review",
+        "Multiple-Subject Warnings"
+      ]
     }
   ]
 }

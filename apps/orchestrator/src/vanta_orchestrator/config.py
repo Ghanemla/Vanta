@@ -118,6 +118,26 @@ class Settings:
         return self.data_dir / "media" / "motion-references"
 
     @property
+    def training_root(self) -> Path:
+        return self.data_dir / "training"
+
+    @property
+    def training_dataset_root(self) -> Path:
+        return self.training_root / "datasets"
+
+    @property
+    def training_run_root(self) -> Path:
+        return self.training_root / "runs"
+
+    @property
+    def trainer_runtime_root(self) -> Path:
+        return self.engine_root / "trainer"
+
+    @property
+    def captioning_root(self) -> Path:
+        return self.engine_root / "captioning"
+
+    @property
     def media_root(self) -> Path:
         return self.data_dir / "media" / "generations"
 
@@ -160,4 +180,8 @@ class Settings:
         self.pose_root.mkdir(parents=True, exist_ok=True)
         self.inpaint_root.mkdir(parents=True, exist_ok=True)
         self.motion_root.mkdir(parents=True, exist_ok=True)
+        self.training_dataset_root.mkdir(parents=True, exist_ok=True)
+        self.training_run_root.mkdir(parents=True, exist_ok=True)
+        self.trainer_runtime_root.mkdir(parents=True, exist_ok=True)
+        self.captioning_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)
