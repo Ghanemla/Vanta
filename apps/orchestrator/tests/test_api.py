@@ -189,3 +189,56 @@ def test_pose_library_persists_source_progress_edit_and_delete(client, tmp_path)
     assert updated.json()["strength"] == 0.55
     assert client.delete(f"/api/poses/{pose_id}").status_code == 204
     assert client.get(f"/api/poses/{pose_id}").status_code == 404
+
+
+def test_inpaint_request_persists_a_validated_mask_outside_job_json(client, tmp_path):
+    import base64
+    import io
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from PIL import Image, ImageDraw
+
+    database_path = client.get("/api/settings").json()["paths"]["database"]
+    source = tmp_path / "owned-source.png"
+    Image.new("RGB", (512, 512), "navy").save(source)
+    now = datetime.now(UTC).isoformat()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO generations
+            (id, image_path, prompt, seed, model_alias, width, height, metadata, created_at)
+            VALUES ('generation-inpaint-source', ?, 'original owned image', 1,
+            'photoreal_balanced', 512, 512, '{}', ?)""",
+            (str(source), now),
+        )
+    mask = Image.new("L", (512, 512), 0)
+    ImageDraw.Draw(mask).ellipse((160, 120, 360, 380), fill=255)
+    encoded = io.BytesIO()
+    mask.save(encoded, "PNG")
+    response = client.post(
+        "/api/generations",
+        json={
+            "operation": "inpaint",
+            "source_generation_id": "generation-inpaint-source",
+            "region_prompt": "tailored rose jacket",
+            "region_negative_prompt": "text",
+            "inpaint_mask_data_url": "data:image/png;base64,"
+            + base64.b64encode(encoded.getvalue()).decode(),
+            "seed": 12,
+            "width": 512,
+            "height": 512,
+            "steps": 2,
+            "guidance": 4,
+        },
+    )
+    assert response.status_code == 202
+    with sqlite3.connect(database_path) as connection:
+        request = json.loads(
+            connection.execute(
+                "SELECT request_json FROM generation_jobs WHERE id=?", (response.json()["id"],)
+            ).fetchone()[0]
+        )
+    assert "inpaint_mask_data_url" not in request
+    assert request["inpaint_mask_path"].endswith(".png")
+    assert Image.open(request["inpaint_mask_path"]).getbbox() is not None

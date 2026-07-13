@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -11,6 +13,7 @@ import uuid
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
 from urllib.error import URLError
@@ -68,7 +71,12 @@ class ComponentManifest(BaseModel):
     pinned_revision: str
     source: dict[str, Any]
     license: LicenseMetadata
-    install_strategy: Literal["managed_archive", "managed_fixture", "managed_extension_archive"]
+    install_strategy: Literal[
+        "managed_archive",
+        "managed_fixture",
+        "managed_extension_archive",
+        "bundled_runtime",
+    ]
     health_checks: list[dict[str, str]]
     repair_strategy: Literal["reverify_and_restore"]
     dependencies: list[str]
@@ -202,6 +210,7 @@ class WorkflowCompiler:
             "camera",
             "quality",
             "direction",
+            "variation_prompt",
             "custom_tags",
         )
         parts: list[str] = []
@@ -209,8 +218,9 @@ class WorkflowCompiler:
             value = request.get(key, "")
             if isinstance(value, list):
                 value = ", ".join(str(item).strip() for item in value if str(item).strip())
-            if str(value).strip():
-                parts.append(str(value).strip())
+            text = str(value).strip()
+            if text and text not in parts:
+                parts.append(text)
         return ", ".join(parts)
 
     def compile(
@@ -346,6 +356,100 @@ class WorkflowCompiler:
             checkpoint_name,
         )
 
+    def compile_inpaint(
+        self,
+        request: dict[str, Any],
+        checkpoint_name: str,
+        source_image_name: str,
+        mask_image_name: str,
+        loras: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        positive = str(request.get("region_prompt") or "").strip()
+        if not positive:
+            raise ValueError("Describe the change inside the painted region")
+        negative = str(request.get("region_negative_prompt") or "").strip()
+        workflow: dict[str, Any] = {
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": checkpoint_name},
+            },
+            "2": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": positive, "clip": ["1", 1]},
+            },
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": negative, "clip": ["1", 1]},
+            },
+            "20": {"class_type": "LoadImage", "inputs": {"image": source_image_name}},
+            "21": {
+                "class_type": "LoadImageMask",
+                "inputs": {"image": mask_image_name, "channel": "red"},
+            },
+            "4": {
+                "class_type": "VAEEncodeForInpaint",
+                "inputs": {
+                    "pixels": ["20", 0],
+                    "vae": ["1", 2],
+                    "mask": ["21", 0],
+                    "grow_mask_by": 12,
+                },
+            },
+            "5": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": request["seed"],
+                    "steps": request["steps"],
+                    "cfg": request["guidance"],
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": request["inpaint_strength"],
+                    "model": ["1", 0],
+                    "positive": ["2", 0],
+                    "negative": ["3", 0],
+                    "latent_image": ["4", 0],
+                },
+            },
+            "6": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["5", 0], "vae": ["1", 2]},
+            },
+            "22": {
+                "class_type": "ImageCompositeMasked",
+                "inputs": {
+                    "destination": ["20", 0],
+                    "source": ["6", 0],
+                    "x": 0,
+                    "y": 0,
+                    "resize_source": False,
+                    "mask": ["21", 0],
+                },
+            },
+            "7": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "Vanta/inpaint", "images": ["22", 0]},
+            },
+        }
+        if loras:
+            model_source: list[Any] = ["1", 0]
+            clip_source: list[Any] = ["1", 1]
+            for index, lora in enumerate(loras, start=8):
+                workflow[str(index)] = {
+                    "class_type": "LoraLoader",
+                    "inputs": {
+                        "model": model_source,
+                        "clip": clip_source,
+                        "lora_name": lora["filename"],
+                        "strength_model": lora["strength"],
+                        "strength_clip": lora["clip_strength"],
+                    },
+                }
+                model_source, clip_source = [str(index), 0], [str(index), 1]
+            workflow["2"]["inputs"]["clip"] = clip_source
+            workflow["3"]["inputs"]["clip"] = clip_source
+            workflow["5"]["inputs"]["model"] = model_source
+        return workflow
+
     @staticmethod
     def upscale(source_image_name: str, model_name: str) -> dict[str, Any]:
         """Compile a non-generative derivative workflow through ComfyUI's native tiled model node."""
@@ -397,6 +501,7 @@ class EngineService:
         self._seed()
         self._sync_pose_component()
         self._sync_identity_component()
+        self._sync_image_finishing_component()
 
     def close(self) -> None:
         self.runtime.stop()
@@ -406,7 +511,8 @@ class EngineService:
         for component in self.core.components:
             state = (
                 "not_installed"
-                if component.id in {"workflow-runtime", "pose-control", "identity-lock"}
+                if component.id
+                in {"workflow-runtime", "pose-control", "identity-lock", "image-finishing"}
                 else "unsupported"
             )
             message = (
@@ -416,6 +522,8 @@ class EngineService:
                 if component.id == "pose-control"
                 else "Install the reviewed local identity-conditioning extension"
                 if component.id == "identity-lock"
+                else "Install the managed Image Workflow Engine to enable local editing"
+                if component.id == "image-finishing"
                 else "Coming later; this capability is not included in the current image release"
             )
             self.db.execute(
@@ -476,6 +584,7 @@ class EngineService:
         self._sync_runtime()
         self._sync_pose_component()
         self._sync_identity_component()
+        self._sync_image_finishing_component()
         manifests = {item.id: item for item in self.core.components}
         return [
             {
@@ -524,6 +633,19 @@ class EngineService:
             else:
                 raise ValueError("Use Install, Verify, Repair, or Remove for Identity Lock")
             return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
+        if item_id == "image-finishing":
+            if action in {"install", "repair", "health_check", "start"}:
+                self._verify_image_finishing_component()
+            elif action == "stop":
+                self.runtime.stop()
+                self._sync_image_finishing_component()
+            elif action == "remove":
+                raise ValueError(
+                    "Image Editing is part of the shared local workflow runtime and cannot be removed separately"
+                )
+            else:
+                raise ValueError("Use Install, Verify, Repair, Start, or Stop for Image Editing")
+            return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
         if item_id != "workflow-runtime":
             raise ValueError(
                 "This capability is coming later and is not available in the image release"
@@ -550,6 +672,60 @@ class EngineService:
 
     def _identity_manifest(self) -> ComponentManifest:
         return next(item for item in self.core.components if item.id == "identity-lock")
+
+    def _sync_image_finishing_component(self) -> None:
+        snapshot = self.runtime.snapshot()
+        state = snapshot.state
+        message = "Install and start the managed Image Workflow Engine to enable local editing"
+        if snapshot.state == "ready":
+            required = {
+                "LoadImage",
+                "LoadImageMask",
+                "VAEEncodeForInpaint",
+                "ImageCompositeMasked",
+                "SaveImage",
+            }
+            try:
+                nodes = self.runtime._request_json("/object_info")
+                missing = required.difference(nodes)
+                state = "ready" if not missing else "repair_needed"
+                message = (
+                    "Native inpainting, mask compositing, image I/O, and upscaling nodes are verified"
+                    if not missing
+                    else f"Image Editing runtime is missing: {', '.join(sorted(missing))}"
+                )
+            except Exception:
+                state = "repair_needed"
+                message = "Image Editing node verification did not complete; use Verify or Repair"
+        self.db.execute(
+            "UPDATE engine_components SET state=?, progress=?, last_health_message=?, updated_at=? WHERE id='image-finishing'",
+            (state, 100 if state == "ready" else 0, message, utc_now()),
+        )
+
+    def _verify_image_finishing_component(self) -> None:
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=45):
+            raise ValueError("Start the Local Generation Engine before verifying Image Editing")
+        nodes = self.runtime._request_json("/object_info")
+        required = {
+            "LoadImage",
+            "LoadImageMask",
+            "VAEEncodeForInpaint",
+            "ImageCompositeMasked",
+            "SaveImage",
+        }
+        if not required.issubset(nodes):
+            missing = ", ".join(sorted(required.difference(nodes)))
+            raise ValueError(
+                f"The local Image Editing runtime is missing required nodes: {missing}"
+            )
+        self.db.execute(
+            "UPDATE engine_components SET state='ready', progress=100, last_health_message=?, updated_at=? WHERE id='image-finishing'",
+            (
+                "Native inpainting, mask compositing, image I/O, and upscaling nodes are verified",
+                utc_now(),
+            ),
+        )
 
     def _identity_extension_root(self) -> Path | None:
         layout = self.runtime.installed_layout()
@@ -1424,6 +1600,9 @@ class GenerationService:
 
     def queue(self, request: dict[str, Any]) -> dict[str, Any]:
         job_id, now = f"job-{uuid.uuid4().hex}", utc_now()
+        request = dict(request)
+        if request.get("operation") == "inpaint":
+            self._persist_inpaint_mask(job_id, request)
         self.db.execute(
             "INSERT INTO generation_jobs(id, status, request_json, progress, created_at, updated_at) VALUES (?, 'queued', ?, 0, ?, ?)",
             (job_id, json.dumps(request), now, now),
@@ -1485,18 +1664,36 @@ class GenerationService:
             model = self.engine.model_for_alias(request["model_alias"])
             self._update(job_id, "loading_model", 15)
             loras = self._resolve_loras(request)
-            source_image_name = self._prepare_variation_source(request)
-            identity_image_name = self._prepare_identity_reference(request)
-            pose_image_name, pose_metadata = self._prepare_pose_control(request)
-            workflow = WorkflowCompiler().compile(
-                request,
-                Path(model["installed_path"]).name,
-                loras,
-                source_image_name,
-                identity_image_name,
-                pose_image_name,
-                request.get("pose_strength"),
-            )
+            inpaint_metadata: dict[str, Any] | None = None
+            if request.get("operation") == "inpaint":
+                source_image_name, mask_image_name, inpaint_metadata = self._prepare_inpaint_inputs(
+                    request
+                )
+                identity_image_name = None
+                pose_image_name, pose_metadata = None, None
+            else:
+                source_image_name = self._prepare_variation_source(request)
+                mask_image_name = None
+                identity_image_name = self._prepare_identity_reference(request)
+                pose_image_name, pose_metadata = self._prepare_pose_control(request)
+            if request.get("operation") == "inpaint":
+                workflow = WorkflowCompiler().compile_inpaint(
+                    request,
+                    Path(model["installed_path"]).name,
+                    source_image_name,
+                    mask_image_name or "",
+                    loras,
+                )
+            else:
+                workflow = WorkflowCompiler().compile(
+                    request,
+                    Path(model["installed_path"]).name,
+                    loras,
+                    source_image_name,
+                    identity_image_name,
+                    pose_image_name,
+                    request.get("pose_strength"),
+                )
 
             def progress(value: int, maximum: int) -> None:
                 percentage = min(88, 20 + round(68 * value / maximum))
@@ -1528,13 +1725,27 @@ class GenerationService:
                 rendered.thumbnail((480, 480))
                 rendered.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
             metadata = {
-                "workflow_version": WorkflowCompiler.workflow_version(
-                    source_image=bool(source_image_name),
-                    identity_image=bool(identity_image_name),
-                    pose_image=bool(pose_image_name),
+                "workflow_version": (
+                    "image-sdxl-inpaint-v1"
+                    if request.get("operation") == "inpaint"
+                    else WorkflowCompiler.workflow_version(
+                        source_image=bool(source_image_name),
+                        identity_image=bool(identity_image_name),
+                        pose_image=bool(pose_image_name),
+                    )
                 ),
-                "compiled_positive_prompt": WorkflowCompiler.compile_prompt(request),
-                "negative_prompt": request.get("negative_prompt", ""),
+                "operation": request.get("operation", "generate"),
+                "derivative_of": request.get("source_generation_id"),
+                "compiled_positive_prompt": (
+                    str(request.get("region_prompt") or "").strip()
+                    if request.get("operation") == "inpaint"
+                    else WorkflowCompiler.compile_prompt(request)
+                ),
+                "negative_prompt": (
+                    request.get("region_negative_prompt", "")
+                    if request.get("operation") == "inpaint"
+                    else request.get("negative_prompt", "")
+                ),
                 "model_filename": Path(model["installed_path"]).name,
                 "model_sha256": json.loads(model["metadata"]).get("sha256"),
                 "comfyui_revision": self.engine.runtime.revision,
@@ -1543,8 +1754,11 @@ class GenerationService:
                 "loras": loras,
                 "source_generation_id": request.get("source_generation_id"),
                 "variation_strength": request.get("variation_strength"),
+                "variation_mode": request.get("variation_mode"),
+                "variation_prompt": request.get("variation_prompt"),
                 "identity_reference_id": request.get("identity_reference_id"),
                 "pose_control": pose_metadata,
+                "inpaint": inpaint_metadata,
                 "disclosure": True,
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
@@ -1568,7 +1782,13 @@ class GenerationService:
                     utc_now(),
                 ),
             )
-            self._update(job_id, "completed", 100, completed_at=utc_now())
+            self._update(
+                job_id,
+                "completed",
+                100,
+                completed_at=utc_now(),
+                result_generation_id=generation_id,
+            )
         except Exception as error:
             current = self.get(job_id)
             if current["status"] == "cancelling":
@@ -1669,7 +1889,13 @@ class GenerationService:
                 utc_now(),
             ),
         )
-        self._update(job_id, "completed", 100, completed_at=utc_now())
+        self._update(
+            job_id,
+            "completed",
+            100,
+            completed_at=utc_now(),
+            result_generation_id=generation_id,
+        )
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
@@ -1725,10 +1951,28 @@ class GenerationService:
         if not generation_id:
             return None
         source = self.db.query_one(
-            "SELECT image_path FROM generations WHERE id=?", (generation_id,)
+            "SELECT image_path, character_id, metadata FROM generations WHERE id=?",
+            (generation_id,),
         )
         if source is None or not Path(source["image_path"]).is_file():
             raise ValueError("The selected source image is no longer available for a variation")
+        source_metadata = json.loads(source["metadata"])
+        mode = str(request.get("variation_mode") or "general")
+        if mode == "preserve_identity":
+            if not request.get("character_id") and source.get("character_id"):
+                request["character_id"] = source["character_id"]
+            if not request.get("identity_reference_id"):
+                request["identity_reference_id"] = source_metadata.get("identity_reference_id")
+            if not request.get("identity_reference_id") and not request.get("character_id"):
+                raise ValueError(
+                    "Preserve identity requires a source with a character or identity reference"
+                )
+        if mode == "preserve_pose" and not request.get("pose_id"):
+            pose = source_metadata.get("pose_control") or {}
+            request["pose_id"] = pose.get("id")
+            request["pose_strength"] = pose.get("strength")
+            if not request.get("pose_id"):
+                raise ValueError("Preserve pose requires a source created with Pose Control")
         layout = self.engine.runtime.installed_layout()
         if layout is None:
             raise ValueError("Start the Local Generation Engine before creating a variation")
@@ -1737,6 +1981,80 @@ class GenerationService:
         filename = f"{generation_id}.png"
         shutil.copy2(source["image_path"], input_dir / filename)
         return f"Vanta/{filename}"
+
+    def _persist_inpaint_mask(self, job_id: str, request: dict[str, Any]) -> None:
+        encoded = request.pop("inpaint_mask_data_url", None)
+        existing = request.get("inpaint_mask_path")
+        if not encoded:
+            if existing and Path(existing).is_file():
+                return
+            raise ValueError("Paint a mask before starting the inpaint")
+        prefix = "data:image/png;base64,"
+        if not isinstance(encoded, str) or not encoded.startswith(prefix):
+            raise ValueError("The inpaint mask must be a local PNG canvas")
+        try:
+            raw = base64.b64decode(encoded[len(prefix) :], validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("The inpaint mask data is not valid") from error
+        if not raw or len(raw) > 12_000_000:
+            raise ValueError("The inpaint mask is empty or too large")
+        try:
+            with Image.open(BytesIO(raw)) as imported:
+                imported.load()
+                mask = imported.convert("L")
+        except (OSError, ValueError) as error:
+            raise ValueError("The inpaint mask PNG could not be read") from error
+        if mask.width > 4096 or mask.height > 4096:
+            raise ValueError("The inpaint mask exceeds the supported local canvas size")
+        if mask.getbbox() is None:
+            raise ValueError("Paint at least one region before starting the inpaint")
+        destination = self.engine.settings.inpaint_root / f"{job_id}.png"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        mask.save(destination, "PNG", optimize=True)
+        request["inpaint_mask_path"] = str(destination)
+
+    def _prepare_inpaint_inputs(self, request: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+        generation_id = str(request.get("source_generation_id") or "")
+        source = self.db.query_one(
+            "SELECT image_path, character_id, recipe_id, width, height FROM generations WHERE id=?",
+            (generation_id,),
+        )
+        if source is None or not Path(source["image_path"]).is_file():
+            raise ValueError("The selected source image is no longer available for inpainting")
+        mask_path = Path(str(request.get("inpaint_mask_path") or ""))
+        if (
+            not mask_path.is_file()
+            or mask_path.parent.resolve() != self.engine.settings.inpaint_root.resolve()
+        ):
+            raise ValueError("The persisted inpaint mask is missing")
+        with Image.open(source["image_path"]) as original, Image.open(mask_path) as mask:
+            if original.size != mask.size:
+                raise ValueError("The inpaint mask no longer matches the source image")
+            request["width"], request["height"] = original.size
+        request["character_id"] = request.get("character_id") or source.get("character_id")
+        request["recipe_id"] = request.get("recipe_id") or source.get("recipe_id")
+        layout = self.engine.runtime.installed_layout()
+        if layout is None:
+            raise ValueError("Start the Local Generation Engine before inpainting")
+        input_dir = layout[0].parent / "input" / "Vanta"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        source_name = f"{generation_id}-inpaint-source.png"
+        mask_name = f"{request.get('seed', 0)}-{mask_path.name}"
+        shutil.copy2(source["image_path"], input_dir / source_name)
+        shutil.copy2(mask_path, input_dir / mask_name)
+        return (
+            f"Vanta/{source_name}",
+            f"Vanta/{mask_name}",
+            {
+                "mask_path": str(mask_path),
+                "mask_sha256": sha256_file(mask_path),
+                "region_prompt": request.get("region_prompt"),
+                "region_negative_prompt": request.get("region_negative_prompt"),
+                "denoise_strength": request.get("inpaint_strength"),
+                "outside_mask_composite": True,
+                "mask_grow_pixels": 12,
+            },
+        )
 
     def _prepare_identity_reference(self, request: dict[str, Any]) -> str | None:
         reference_id = request.get("identity_reference_id")

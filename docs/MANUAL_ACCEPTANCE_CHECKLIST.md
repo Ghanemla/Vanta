@@ -21,4 +21,6 @@ Add a checked, dated evidence line here only after the matching capability creat
 
 - [ ] Create an original adult character, add owned local image references, import a compatible SDXL LoRA, assign it to the character, then generate through Create. Confirm the Gallery metadata names the LoRA.
 - [ ] From a Gallery image, choose Create variation, set a different seed or prompt direction, and confirm the derived image retains its source-generation metadata after restart.
-- [ ] Identity Lock, Pose Control, Inpainting, Upscaling, LoRA Training, Captioning, Video Generation and Motion Reference must remain visibly unavailable until each has a reviewed managed component manifest and a real local acceptance artifact.
+- [ ] Exercise each controlled variation goal (composition, identity, pose, clothing, background, lighting, expression and custom), then restart and confirm its derivative source, goal and denoise metadata remain visible.
+- [ ] Open a full-resolution Gallery image in Inpaint, test zoom/pan/fit, brush/eraser/size/clear/invert, cancel one run, complete one run, inspect before/after and mask metadata, then restart and confirm both original and derivative remain available.
+- [ ] Identity Lock, Pose Control, Inpainting and Upscaling show Ready only when their reviewed manifests and real node/model health checks pass. LoRA Training, Captioning, Video Generation and Motion Reference must remain visibly unavailable until their matching integration is complete.

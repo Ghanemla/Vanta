@@ -39,11 +39,10 @@ Last updated: 2026-07-13
 
 ## Current feature
 
-Pose Control and managed Identity Lock are **complete pending the repository-wide pre-commit verification below**. The next independent Essential V1 slice is real inpainting and controlled variations.
+Real inpainting and controlled variations are **implemented with current-code local evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is the native FLUX-family adapter.
 
 Remaining V1 work:
 
-- Inpainting/masking and controlled variations with real outputs.
 - Separate FLUX adapter with native FLUX workflow/model selection and real output while preserving the installed 17.1 GB model.
 - Local image-to-video, reference motion and video adapter.
 - Local LoRA training, dataset checks and resumable run evidence.
@@ -70,6 +69,25 @@ Remaining V1 work:
   - `apps/orchestrator/tests/test_real_generation_domain.py`
   - `apps/desktop/src/App.test.tsx`
 
+## Inpainting and variation files changed
+
+- `apps/orchestrator/migrations/007_derivative_results.sql`
+- `apps/orchestrator/src/vanta_orchestrator/config.py`
+- `apps/orchestrator/src/vanta_orchestrator/schemas.py`
+- `apps/orchestrator/src/vanta_orchestrator/engine.py`
+- `apps/orchestrator/src/vanta_orchestrator/app.py`
+- `apps/orchestrator/tests/test_api.py`
+- `apps/orchestrator/tests/test_migrations.py`
+- `apps/orchestrator/tests/test_real_generation_domain.py`
+- `apps/desktop/src/App.tsx`
+- `apps/desktop/src/api.ts`
+- `apps/desktop/src/types.ts`
+- `apps/desktop/src/styles.css`
+- `engine/manifests/core-components.v1.json`
+- `scripts/verify_managed_pose.py`
+- `docs/ESSENTIAL_V1_RUNBOOK.md`
+- `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
+
 ## Tests run
 
 - Baseline Python suite: **21 passed**, 29 deprecation warnings.
@@ -86,6 +104,16 @@ Remaining V1 work:
 - Prettier check on all changed web, manifest and runbook files: **passed**.
 - UTF-8 JSON parse of both engine manifests: **passed**.
 - Desktop production renderer build: **passed**, 1,656 modules, 281.02 kB JS / 38.48 kB CSS before gzip.
+- Tauri `cargo check`: **passed**.
+- Inpainting/derivative focused API, migration and workflow suite: **17 passed** before final slice gate.
+- Inpainting request test proves the base64 canvas is validated into a Vanta-owned PNG and removed from persisted job JSON.
+- Desktop strict TypeScript and focused ESLint after editor integration: **passed**.
+- Full Python suite after inpainting/variations: **25 passed**, 33 deprecation warnings.
+- Full Ruff lint and format gate: **passed** (16 files formatted).
+- Full desktop/domain/UI strict TypeScript and ESLint zero-warning gate: **passed**.
+- Desktop Vitest: **2 files / 2 tests passed**.
+- Changed-file Prettier and manifest UTF-8 JSON validation: **passed**.
+- Desktop production renderer build: **passed**, 1,656 modules, 293.75 kB JS / 42.76 kB CSS before gzip.
 - Tauri `cargo check`: **passed**.
 
 ## Real evidence produced
@@ -104,6 +132,19 @@ Remaining V1 work:
   - 768x1024, 25 steps, 51.75 seconds, workflow `image-sdxl-identity-pose-v1`; the same pose hashes and strength 0.75 are stored in Gallery metadata.
   - Visually inspected against the source: recognizable fictional-character identity, intended upright full-body pose, coherent anatomy and no text/watermark.
 - All evidence is persisted under `%APPDATA%\\studio.vanta.desktop`; no fixture or fake Ready state was used. Existing large models remain present and untouched.
+- Real current-code inpaint:
+  - Source `generation-44d21d6c6860476497f4ef2d711fea59`, job `job-bc1f87bf430045f08badb547bb7bd821`, derivative `generation-2f7a5235250f4e0b855011602a0fb35b`.
+  - 832x1216, 25 steps, denoise 0.55, 36.36 seconds, workflow `image-sdxl-inpaint-v1`.
+  - Persisted mask SHA-256 `2e5dadc02982cdecb7070a784411383b6f34a1f3850dbb7277c13428a15ea947`; metadata records region prompts, 12-pixel latent mask growth and exact outside-mask compositing.
+  - Visual review accepted the coherent cream blouse edit; face, hair, arms, pose, skirt and environment remain unchanged outside the torso mask.
+  - Two earlier real integration passes remain honestly persisted: one was rejected for an over-broad mask, and one feathering experiment exposed black-vignette behavior. Automatic feathering was removed; neither rejected artifact is counted as acceptance evidence.
+- Real controlled clothing variation:
+  - Source `generation-44d21d6c6860476497f4ef2d711fea59`, job `job-a2961eeecfe3428ba20119ae073bce75`, derivative `generation-0bcd65442839465e9b0ac6acce1506d9`.
+  - 832x1216, denoise 0.62, 25 steps, 35.94 seconds, workflow `image-sdxl-variation-img2img-v1`, mode `clothing`.
+  - Visual review confirms an obvious wardrobe derivative (structured buttoned vest and tailored shorts) while retaining the bedroom composition and original-character appearance.
+- Real controlled lighting variation:
+  - Source `generation-44d21d6c6860476497f4ef2d711fea59`, job `job-af15c7a5123240fe9ad881991ccc187d`, derivative `generation-21fc2465440e4a6d82850cd22167536b`.
+  - 832x1216, denoise 0.38, 25 steps, 35.20 seconds, mode `lighting` with warm rose-gold prompt and preserved composition.
 
 ## Blockers
 
@@ -112,7 +153,7 @@ Remaining V1 work:
 
 ## Exact next action
 
-Commit the verified Pose + Identity slice, then audit and finish real inpainting and controlled variations vertically.
+Commit the verified inpainting/variation slice, then implement and prove the separate native FLUX-family adapter without modifying the original FLUX model.
 
 ## Final acceptance status
 

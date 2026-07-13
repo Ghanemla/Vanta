@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   Archive,
@@ -11,6 +19,7 @@ import {
   Database,
   Download,
   Edit3,
+  Eraser,
   FileDown,
   FileUp,
   FolderLock,
@@ -21,10 +30,13 @@ import {
   Info,
   Menu,
   Minus,
+  Move,
   MoreHorizontal,
   Plus,
+  Paintbrush,
   RotateCcw,
   Search,
+  Scan,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
@@ -537,6 +549,9 @@ export function App() {
               {screen === 'gallery' && (
                 <GalleryScreen
                   items={data.gallery}
+                  editingReady={
+                    data.components.find((item) => item.id === 'image-finishing')?.state === 'ready'
+                  }
                   notify={notify}
                   refresh={load}
                   onGenerateSimilar={(draft) => {
@@ -548,6 +563,8 @@ export function App() {
                       ...(generation.metadata.request ?? {}),
                       source_generation_id: generation.id,
                       variation_strength: 0.45,
+                      variation_mode: 'general',
+                      variation_prompt: 'a refined editorial reinterpretation',
                       seed: Math.floor(Math.random() * 2_000_000_000),
                     });
                     navigate('create');
@@ -807,6 +824,8 @@ function CreateScreen({
   );
   const [sourceGenerationId, setSourceGenerationId] = useState<string | null>(null);
   const [variationStrength, setVariationStrength] = useState(0.45);
+  const [variationMode, setVariationMode] = useState('general');
+  const [variationPrompt, setVariationPrompt] = useState('');
   const [poseId, setPoseId] = useState('');
   const [poseStrength, setPoseStrength] = useState(0.8);
   const availablePoses = data.poses.filter(
@@ -826,6 +845,28 @@ function CreateScreen({
     'camera',
     'quality',
   ];
+  const variationModes = [
+    ['general', 'General variation', 'A fresh interpretation with the source as structure.'],
+    ['preserve_composition', 'Preserve composition', 'Keep framing and spatial relationships.'],
+    ['preserve_identity', 'Preserve identity', 'Use the character reference with image-to-image.'],
+    ['preserve_pose', 'Preserve pose', 'Restore the source Pose Control asset.'],
+    ['clothing', 'Change clothing', 'Replace wardrobe while preserving the scene.'],
+    ['background', 'Change background', 'Replace location while preserving the subject.'],
+    ['lighting', 'Change lighting', 'Relight the same composition.'],
+    ['expression', 'Change expression', 'Adjust expression with restrained denoise.'],
+    ['custom', 'Custom prompt override', 'Direct a specific controlled change.'],
+  ] as const;
+  const variationDefaults: Record<string, string> = {
+    general: 'a refined editorial reinterpretation',
+    preserve_composition: 'subtle detail variation, preserve framing and composition',
+    preserve_identity: 'preserve the original fictional character identity',
+    preserve_pose: 'preserve the selected structural pose',
+    clothing: 'tailored deep rose blazer and black trousers, natural fabric folds',
+    background: 'restrained plum editorial studio with a seamless backdrop',
+    lighting: 'soft rose-gold side light with controlled cinematic shadows',
+    expression: 'calm confident expression with a subtle closed-mouth smile',
+    custom: '',
+  };
   const options = (category: string) =>
     data.presets.filter((preset) => preset.category === category);
   const [selected, setSelected] = useState<Record<string, string>>(() =>
@@ -844,6 +885,8 @@ function CreateScreen({
       initialDraft.source_generation_id ? String(initialDraft.source_generation_id) : null,
     );
     setVariationStrength(Number(initialDraft.variation_strength ?? 0.45));
+    setVariationMode(String(initialDraft.variation_mode ?? 'general'));
+    setVariationPrompt(String(initialDraft.variation_prompt ?? ''));
     setPoseId(String(initialDraft.pose_id ?? ''));
     setPoseStrength(Number(initialDraft.pose_strength ?? 0.8));
     onDraftUsed();
@@ -858,11 +901,11 @@ function CreateScreen({
     recipe_id: null,
     character_identity:
       data.characters.find((item) => item.id === characterId)?.identity_description ?? '',
-    wardrobe: presetText('wardrobe'),
-    expression: presetText('expression'),
+    wardrobe: variationMode === 'clothing' ? variationPrompt : presetText('wardrobe'),
+    expression: variationMode === 'expression' ? variationPrompt : presetText('expression'),
     pose: presetText('pose'),
-    location: presetText('location'),
-    lighting: presetText('lighting'),
+    location: variationMode === 'background' ? variationPrompt : presetText('location'),
+    lighting: variationMode === 'lighting' ? variationPrompt : presetText('lighting'),
     camera: presetText('camera'),
     quality: presetText('quality'),
     direction: prompt,
@@ -876,6 +919,8 @@ function CreateScreen({
     guidance,
     source_generation_id: sourceGenerationId,
     variation_strength: variationStrength,
+    variation_mode: variationMode,
+    variation_prompt: variationPrompt,
     pose_id: poseId || null,
     pose_strength: poseId ? poseStrength : null,
   });
@@ -1085,6 +1130,64 @@ function CreateScreen({
                 </label>
               ))}
             </div>
+            {sourceGenerationId && (
+              <div className="variation-control">
+                <div className="section-rule">
+                  <span>Controlled variation</span>
+                </div>
+                <p className="field-help">
+                  Derivative of {sourceGenerationId}. The original remains untouched.
+                </p>
+                <label>
+                  Variation goal
+                  <select
+                    value={variationMode}
+                    onChange={(event) => {
+                      const next = event.target.value;
+                      setVariationMode(next);
+                      setVariationPrompt(variationDefaults[next] ?? '');
+                    }}
+                  >
+                    {variationModes.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <small>{variationModes.find(([value]) => value === variationMode)?.[2]}</small>
+                <label>
+                  Change prompt
+                  <textarea
+                    value={variationPrompt}
+                    onChange={(event) => setVariationPrompt(event.target.value)}
+                    placeholder="Describe only what should change"
+                  />
+                </label>
+                <label>
+                  Denoise strength <span>{variationStrength.toFixed(2)}</span>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={0.95}
+                    step={0.05}
+                    value={variationStrength}
+                    onChange={(event) => setVariationStrength(Number(event.target.value))}
+                  />
+                </label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    setSourceGenerationId(null);
+                    setVariationMode('general');
+                    setVariationPrompt('');
+                  }}
+                >
+                  <X /> Leave variation mode
+                </Button>
+              </div>
+            )}
             <div className="pose-create-control">
               <label>
                 Pose Control
@@ -2250,8 +2353,399 @@ function LocalGenerationImage({
   );
 }
 
+function LocalInpaintMask({ generationId }: { generationId: string }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api.imageUrl(generationId, 'mask').then((next) => {
+      objectUrl = next;
+      if (active) setUrl(next);
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [generationId]);
+  return url ? (
+    <img className="inpaint-mask-preview" src={url} alt="Persisted inpaint mask" />
+  ) : null;
+}
+
+function InpaintWorkspace({
+  source,
+  refresh,
+  notify,
+  onClose,
+}: {
+  source: GenerationRecord;
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+  onClose: () => void;
+}) {
+  const maskRef = useRef<HTMLCanvasElement>(null);
+  const drawingRef = useRef(false);
+  const lastPointRef = useRef<{ x: number; y: number } | null>(null);
+  const panDragRef = useRef<{
+    clientX: number;
+    clientY: number;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [sourceUrl, setSourceUrl] = useState('');
+  const [tool, setTool] = useState<'brush' | 'eraser' | 'pan'>('brush');
+  const [brushSize, setBrushSize] = useState(72);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [regionPrompt, setRegionPrompt] = useState(
+    'tailored deep rose blazer with realistic fabric folds and editorial detail',
+  );
+  const [regionNegativePrompt, setRegionNegativePrompt] = useState(
+    'text, watermark, malformed fabric, extra limbs, distorted anatomy',
+  );
+  const [strength, setStrength] = useState(0.62);
+  const [job, setJob] = useState<GenerationJob | null>(null);
+  const [resultGenerationId, setResultGenerationId] = useState('');
+  const [error, setError] = useState('');
+  const active = Boolean(job && !['completed', 'failed', 'cancelled'].includes(job.status));
+
+  useEffect(() => {
+    let objectUrl = '';
+    let mounted = true;
+    void api.imageUrl(source.id).then((url) => {
+      objectUrl = url;
+      if (mounted) setSourceUrl(url);
+    });
+    return () => {
+      mounted = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [source.id]);
+
+  useEffect(() => {
+    if (!active || !job) return;
+    const timer = window.setInterval(() => {
+      void api.get<GenerationJob>(`/generations/${job.id}`).then(async (next) => {
+        setJob(next);
+        if (next.status === 'completed' && next.result_generation_id) {
+          setResultGenerationId(next.result_generation_id);
+          await refresh();
+          notify('Inpaint derivative saved locally; the original is unchanged');
+        }
+        if (next.status === 'failed') setError(next.error_message ?? 'The local inpaint failed');
+      });
+    }, 900);
+    return () => window.clearInterval(timer);
+  }, [active, job, notify, refresh]);
+
+  const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const canvas = maskRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((event.clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+  const drawSegment = (from: { x: number; y: number }, to: { x: number; y: number }) => {
+    const canvas = maskRef.current;
+    const context = canvas?.getContext('2d');
+    if (!context) return;
+    context.save();
+    context.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+    context.strokeStyle = '#ffffff';
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    context.lineWidth = brushSize;
+    context.beginPath();
+    context.moveTo(from.x, from.y);
+    context.lineTo(to.x, to.y);
+    context.stroke();
+    context.restore();
+  };
+  const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (tool === 'pan') {
+      panDragRef.current = { clientX: event.clientX, clientY: event.clientY, ...pan };
+      return;
+    }
+    drawingRef.current = true;
+    const point = canvasPoint(event);
+    lastPointRef.current = point;
+    drawSegment(point, point);
+  };
+  const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (tool === 'pan' && panDragRef.current) {
+      setPan({
+        x: panDragRef.current.x + event.clientX - panDragRef.current.clientX,
+        y: panDragRef.current.y + event.clientY - panDragRef.current.clientY,
+      });
+      return;
+    }
+    if (!drawingRef.current || !lastPointRef.current) return;
+    const point = canvasPoint(event);
+    drawSegment(lastPointRef.current, point);
+    lastPointRef.current = point;
+  };
+  const pointerUp = () => {
+    drawingRef.current = false;
+    lastPointRef.current = null;
+    panDragRef.current = null;
+  };
+  const clearMask = () => {
+    const canvas = maskRef.current;
+    canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+  };
+  const invertMask = () => {
+    const canvas = maskRef.current;
+    const context = canvas?.getContext('2d');
+    if (!canvas || !context) return;
+    const previous = document.createElement('canvas');
+    previous.width = canvas.width;
+    previous.height = canvas.height;
+    previous.getContext('2d')?.drawImage(canvas, 0, 0);
+    context.save();
+    context.globalCompositeOperation = 'source-over';
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.globalCompositeOperation = 'destination-out';
+    context.drawImage(previous, 0, 0);
+    context.restore();
+  };
+  const exportMask = () => {
+    const canvas = maskRef.current;
+    if (!canvas) throw new Error('The mask canvas is not ready');
+    const output = document.createElement('canvas');
+    output.width = canvas.width;
+    output.height = canvas.height;
+    const context = output.getContext('2d');
+    if (!context) throw new Error('The mask canvas is unavailable');
+    context.fillStyle = '#000000';
+    context.fillRect(0, 0, output.width, output.height);
+    context.drawImage(canvas, 0, 0);
+    return output.toDataURL('image/png');
+  };
+  const submit = async () => {
+    setError('');
+    if (!regionPrompt.trim()) {
+      setError('Describe what should appear inside the painted region.');
+      return;
+    }
+    try {
+      const next = await api.post<GenerationJob>('/generations', {
+        operation: 'inpaint',
+        source_generation_id: source.id,
+        character_id: source.character_id ?? null,
+        recipe_id: source.recipe_id ?? null,
+        direction: regionPrompt,
+        region_prompt: regionPrompt,
+        region_negative_prompt: regionNegativePrompt,
+        inpaint_mask_data_url: exportMask(),
+        inpaint_strength: strength,
+        model_alias: source.model_alias,
+        seed: Math.floor(Math.random() * 2_000_000_000),
+        width: 512,
+        height: 512,
+        steps: 25,
+        guidance: 5.5,
+      });
+      setJob(next);
+      notify('Local inpaint queued');
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error ? nextError.message : 'The local inpaint could not start',
+      );
+    }
+  };
+
+  return (
+    <div className="inpaint-overlay" role="dialog" aria-modal="true" aria-label="Inpaint editor">
+      <div className="inpaint-workspace">
+        <header>
+          <div>
+            <span className="eyebrow">Full-resolution local editor</span>
+            <h2>Paint only what should change.</h2>
+            <p>The saved original is never overwritten.</p>
+          </div>
+          <Button variant="ghost" onClick={onClose} aria-label="Close inpaint editor">
+            <X /> Close
+          </Button>
+        </header>
+        {resultGenerationId ? (
+          <div className="inpaint-comparison">
+            <figure>
+              <LocalGenerationImage generationId={source.id} alt="Original before inpaint" />
+              <figcaption>Before · preserved original</figcaption>
+            </figure>
+            <figure>
+              <LocalGenerationImage
+                generationId={resultGenerationId}
+                alt="Derivative after inpaint"
+              />
+              <figcaption>After · local derivative</figcaption>
+            </figure>
+          </div>
+        ) : (
+          <div className="inpaint-layout">
+            <section className="inpaint-canvas-panel">
+              <div className="inpaint-toolbar" aria-label="Mask tools">
+                <Button
+                  variant={tool === 'brush' ? 'primary' : 'ghost'}
+                  onClick={() => setTool('brush')}
+                  aria-pressed={tool === 'brush'}
+                >
+                  <Paintbrush /> Brush
+                </Button>
+                <Button
+                  variant={tool === 'eraser' ? 'primary' : 'ghost'}
+                  onClick={() => setTool('eraser')}
+                  aria-pressed={tool === 'eraser'}
+                >
+                  <Eraser /> Eraser
+                </Button>
+                <Button
+                  variant={tool === 'pan' ? 'primary' : 'ghost'}
+                  onClick={() => setTool('pan')}
+                  aria-pressed={tool === 'pan'}
+                >
+                  <Move /> Pan
+                </Button>
+                <label>
+                  Brush {brushSize}px
+                  <input
+                    type="range"
+                    min={12}
+                    max={240}
+                    value={brushSize}
+                    onChange={(event) => setBrushSize(Number(event.target.value))}
+                  />
+                </label>
+                <Button variant="ghost" onClick={clearMask}>
+                  Clear
+                </Button>
+                <Button variant="ghost" onClick={invertMask}>
+                  Invert
+                </Button>
+              </div>
+              <div className="inpaint-viewport">
+                <div
+                  className="inpaint-stage"
+                  style={{
+                    aspectRatio: `${source.width} / ${source.height}`,
+                    width: `min(100%, ${(68 * source.width) / source.height}vh)`,
+                    transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                  }}
+                >
+                  {sourceUrl && <img src={sourceUrl} alt="Source to edit" draggable={false} />}
+                  <canvas
+                    ref={maskRef}
+                    className={`inpaint-mask inpaint-mask--${tool}`}
+                    width={source.width}
+                    height={source.height}
+                    onPointerDown={pointerDown}
+                    onPointerMove={pointerMove}
+                    onPointerUp={pointerUp}
+                    onPointerCancel={pointerUp}
+                    aria-label="Painted inpaint mask overlay"
+                  />
+                </div>
+              </div>
+              <div className="inpaint-zoom">
+                <Scan />
+                <label>
+                  Zoom {Math.round(zoom * 100)}%
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={3}
+                    step={0.1}
+                    value={zoom}
+                    onChange={(event) => setZoom(Number(event.target.value))}
+                  />
+                </label>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setZoom(1);
+                    setPan({ x: 0, y: 0 });
+                  }}
+                >
+                  Fit
+                </Button>
+              </div>
+            </section>
+            <aside className="inpaint-settings">
+              <label>
+                Region prompt
+                <textarea
+                  value={regionPrompt}
+                  onChange={(event) => setRegionPrompt(event.target.value)}
+                />
+              </label>
+              <label>
+                Region negative prompt
+                <textarea
+                  value={regionNegativePrompt}
+                  onChange={(event) => setRegionNegativePrompt(event.target.value)}
+                />
+              </label>
+              <label>
+                Denoise strength <span>{strength.toFixed(2)}</span>
+                <input
+                  type="range"
+                  min={0.05}
+                  max={1}
+                  step={0.05}
+                  value={strength}
+                  onChange={(event) => setStrength(Number(event.target.value))}
+                />
+              </label>
+              <p className="field-help">
+                Vanta composites the generated region over the untouched source pixels outside the
+                mask.
+              </p>
+              {job && (
+                <div className="inpaint-progress" role="status" aria-live="polite">
+                  <strong>{stateLabels[job.status] ?? job.status}</strong>
+                  <div className="progress">
+                    <span style={{ width: `${job.progress}%` }} />
+                  </div>
+                  <small>
+                    {job.current_step && job.total_steps
+                      ? `Step ${job.current_step} / ${job.total_steps}`
+                      : `${job.progress}%`}
+                  </small>
+                </div>
+              )}
+              {error && <p className="error-text">{error}</p>}
+              <Button
+                variant="primary"
+                disabled={!sourceUrl}
+                onClick={() =>
+                  void (active && job ? api.post(`/generations/${job.id}/cancel`) : submit())
+                }
+              >
+                {active ? (
+                  <>
+                    <X /> Cancel inpaint
+                  </>
+                ) : (
+                  <>
+                    <Sparkles /> Generate masked edit
+                  </>
+                )}
+              </Button>
+            </aside>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function GalleryScreen({
   items,
+  editingReady,
   notify,
   refresh,
   onGenerateSimilar,
@@ -2259,6 +2753,7 @@ function GalleryScreen({
   onUpscale,
 }: {
   items: GenerationRecord[];
+  editingReady: boolean;
   notify: (message: string) => void;
   refresh: () => Promise<void>;
   onGenerateSimilar: (draft: Record<string, unknown>) => void;
@@ -2267,9 +2762,18 @@ function GalleryScreen({
 }) {
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState<GenerationRecord | null>(null);
+  const [inpaintSource, setInpaintSource] = useState<GenerationRecord | null>(null);
   const filtered = filter === 'all' ? items : items.filter((item) => item.model_alias === filter);
   return (
     <div className="screen gallery-screen">
+      {inpaintSource && (
+        <InpaintWorkspace
+          source={inpaintSource}
+          refresh={refresh}
+          notify={notify}
+          onClose={() => setInpaintSource(null)}
+        />
+      )}
       <PageTitle
         eyebrow="Local archive"
         title="Every frame remembers."
@@ -2373,6 +2877,32 @@ function GalleryScreen({
                   </dd>
                 </div>
                 <div>
+                  <dt>Workflow</dt>
+                  <dd>{selected.metadata.workflow_version ?? 'Legacy local workflow'}</dd>
+                </div>
+                <div>
+                  <dt>Derivative source</dt>
+                  <dd>{selected.metadata.derivative_of ?? 'Original generation'}</dd>
+                </div>
+                {selected.metadata.variation_mode && selected.metadata.derivative_of && (
+                  <div>
+                    <dt>Variation goal</dt>
+                    <dd>
+                      {selected.metadata.variation_mode.replaceAll('_', ' ')} · denoise{' '}
+                      {selected.metadata.variation_strength?.toFixed(2)}
+                    </dd>
+                  </div>
+                )}
+                {selected.metadata.inpaint && (
+                  <div>
+                    <dt>Inpaint preservation</dt>
+                    <dd>
+                      Outside-mask composite · denoise{' '}
+                      {selected.metadata.inpaint.denoise_strength.toFixed(2)}
+                    </dd>
+                  </div>
+                )}
+                <div>
                   <dt>Disclosure</dt>
                   <dd>
                     {selected.metadata.disclosure ? 'AI-created metadata attached' : 'Not attached'}
@@ -2384,6 +2914,14 @@ function GalleryScreen({
               <span className="eyebrow">Prompt</span>
               <p>{selected.prompt}</p>
             </div>
+            {selected.metadata.inpaint && (
+              <div className="metadata-section">
+                <span className="eyebrow">Persisted edit mask</span>
+                <LocalInpaintMask generationId={selected.id} />
+                <p>{selected.metadata.inpaint.region_prompt}</p>
+                <small>SHA-256 {selected.metadata.inpaint.mask_sha256}</small>
+              </div>
+            )}
             <Button
               variant="primary"
               onClick={async () => {
@@ -2398,6 +2936,21 @@ function GalleryScreen({
             </Button>
             <Button variant="ghost" onClick={() => onCreateVariation(selected)}>
               <Sparkles /> Create variation
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={!editingReady}
+              title={
+                editingReady
+                  ? 'Paint a local edit mask'
+                  : 'Start and verify Image Editing in Models & Engine first'
+              }
+              onClick={() => {
+                setInpaintSource(selected);
+                setSelected(null);
+              }}
+            >
+              <Paintbrush /> Inpaint selected region
             </Button>
             <Button
               variant="ghost"

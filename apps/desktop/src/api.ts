@@ -134,7 +134,7 @@ export const api = {
   delete: (path: string) => request<void>(path, { method: 'DELETE' }),
   imageUrl: async (
     generationId: string,
-    variant: 'image' | 'thumbnail' = 'image',
+    variant: 'image' | 'thumbnail' | 'mask' = 'image',
   ): Promise<string> => {
     const response = await fetch(`${apiBase}/api/generations/${generationId}/${variant}`, {
       headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},

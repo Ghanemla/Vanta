@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
 import time
 from pathlib import Path
+
+from PIL import Image, ImageDraw
 
 from vanta_orchestrator.config import Settings
 from vanta_orchestrator.database import Database
@@ -71,6 +75,9 @@ def main() -> int:
             "extract",
             "generate",
             "generate-identity-pose",
+            "inpaint",
+            "variation-clothing",
+            "variation-lighting",
         ],
     )
     parser.add_argument(
@@ -81,6 +88,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=2400)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--pose-id")
+    parser.add_argument("--source-generation-id")
     args = parser.parse_args()
 
     settings = settings_for(args.data_dir.resolve())
@@ -293,6 +301,155 @@ def main() -> int:
                         "SELECT * FROM generations ORDER BY created_at DESC LIMIT 1"
                     ),
                 }
+        elif args.action == "inpaint":
+            if not args.source_generation_id:
+                parser.error("inpaint requires --source-generation-id")
+            source = db.query_one(
+                "SELECT * FROM generations WHERE id=?", (args.source_generation_id,)
+            )
+            if source is None or not Path(source["image_path"]).is_file():
+                raise RuntimeError("The requested source generation is unavailable")
+            with Image.open(source["image_path"]) as original:
+                width, height = original.size
+            mask = Image.new("L", (width, height), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.rounded_rectangle(
+                (
+                    round(width * 0.27),
+                    round(height * 0.31),
+                    round(width * 0.73),
+                    round(height * 0.64),
+                ),
+                radius=max(12, round(width * 0.08)),
+                fill=255,
+            )
+            encoded = io.BytesIO()
+            mask.save(encoded, "PNG")
+            generations = GenerationService(db, engine)
+            row = generations.queue(
+                {
+                    "operation": "inpaint",
+                    "character_id": source.get("character_id"),
+                    "recipe_id": source.get("recipe_id"),
+                    "character_identity": "",
+                    "wardrobe": "",
+                    "expression": "",
+                    "pose": "",
+                    "location": "",
+                    "lighting": "",
+                    "camera": "",
+                    "quality": "",
+                    "direction": "cream satin blouse",
+                    "custom_tags": ["essential-v1", "inpaint-evidence"],
+                    "negative_prompt": "",
+                    "model_alias": source["model_alias"],
+                    "seed": 14072028,
+                    "width": 512,
+                    "height": 512,
+                    "steps": 25,
+                    "guidance": 5.5,
+                    "lora_ids": [],
+                    "source_generation_id": source["id"],
+                    "identity_reference_id": None,
+                    "pose_id": None,
+                    "pose_strength": None,
+                    "variation_strength": 0.45,
+                    "variation_mode": "general",
+                    "variation_prompt": "",
+                    "region_prompt": (
+                        "front view fitted cream satin blouse worn by the woman, elegant "
+                        "off-shoulder neckline, realistic fabric folds, premium editorial styling"
+                    ),
+                    "region_negative_prompt": (
+                        "text, watermark, malformed fabric, extra limbs, distorted anatomy"
+                    ),
+                    "inpaint_mask_data_url": "data:image/png;base64,"
+                    + base64.b64encode(encoded.getvalue()).decode(),
+                    "inpaint_strength": 0.55,
+                    "upscale_profile": None,
+                }
+            )
+            deadline = time.monotonic() + args.timeout
+            while (
+                row["status"] not in {"completed", "failed", "cancelled"}
+                and time.monotonic() < deadline
+            ):
+                print(f"{row['status']} {row['progress']}%", flush=True)
+                time.sleep(1)
+                row = generations.get(row["id"])
+            success = row["status"] == "completed"
+            if success:
+                row = {
+                    "job": row,
+                    "generation": db.query_one(
+                        "SELECT * FROM generations WHERE id=?",
+                        (row["result_generation_id"],),
+                    ),
+                }
+        elif args.action in {"variation-clothing", "variation-lighting"}:
+            if not args.source_generation_id:
+                parser.error(f"{args.action} requires --source-generation-id")
+            source = db.query_one(
+                "SELECT * FROM generations WHERE id=?", (args.source_generation_id,)
+            )
+            if source is None:
+                raise RuntimeError("The requested source generation is unavailable")
+            source_metadata = json.loads(source["metadata"])
+            request = dict(source_metadata.get("request") or {})
+            mode = "clothing" if args.action == "variation-clothing" else "lighting"
+            change = (
+                "bright crimson red tailored blazer over a black silk top, premium wool fabric"
+                if mode == "clothing"
+                else "warm rose-gold side light, cinematic controlled shadows, subtle rim light"
+            )
+            request.update(
+                {
+                    "operation": "generate",
+                    "source_generation_id": source["id"],
+                    "variation_mode": mode,
+                    "variation_prompt": change,
+                    "variation_strength": 0.62 if mode == "clothing" else 0.38,
+                    "wardrobe": change
+                    if mode == "clothing"
+                    else request.get("wardrobe", ""),
+                    "lighting": change
+                    if mode == "lighting"
+                    else request.get("lighting", ""),
+                    "seed": 14072029 if mode == "clothing" else 14072030,
+                    "width": source["width"],
+                    "height": source["height"],
+                    "steps": 25,
+                    "guidance": 5.5,
+                    "lora_ids": [],
+                    "identity_reference_id": None,
+                    "pose_id": None,
+                    "pose_strength": None,
+                    "inpaint_mask_data_url": None,
+                    "region_prompt": "",
+                    "region_negative_prompt": "",
+                    "inpaint_strength": 0.62,
+                    "upscale_profile": None,
+                }
+            )
+            generations = GenerationService(db, engine)
+            row = generations.queue(request)
+            deadline = time.monotonic() + args.timeout
+            while (
+                row["status"] not in {"completed", "failed", "cancelled"}
+                and time.monotonic() < deadline
+            ):
+                print(f"{row['status']} {row['progress']}%", flush=True)
+                time.sleep(1)
+                row = generations.get(row["id"])
+            success = row["status"] == "completed"
+            if success:
+                row = {
+                    "job": row,
+                    "generation": db.query_one(
+                        "SELECT * FROM generations WHERE id=?",
+                        (row["result_generation_id"],),
+                    ),
+                }
         else:
             row = {
                 "component": db.query_one(
@@ -301,6 +458,9 @@ def main() -> int:
                 "model": engine._pack_row(POSE_PACK_ALIAS),
                 "identity_component": db.query_one(
                     "SELECT * FROM engine_components WHERE id='identity-lock'"
+                ),
+                "image_editing_component": db.query_one(
+                    "SELECT * FROM engine_components WHERE id='image-finishing'"
                 ),
                 "identity_model": engine._pack_row(IDENTITY_PACK_ALIAS),
                 "latest_jobs": db.query_all(

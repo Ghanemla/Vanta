@@ -120,6 +120,8 @@ export interface ModelPack {
 }
 export interface GenerationRecord {
   id: string;
+  character_id?: string | null;
+  recipe_id?: string | null;
   image_path: string;
   prompt: string;
   negative_prompt: string;
@@ -146,7 +148,19 @@ export interface GenerationRecord {
       clip_strength: number;
     }[];
     source_generation_id?: string | null;
+    derivative_of?: string | null;
     variation_strength?: number;
+    variation_mode?: string;
+    variation_prompt?: string;
+    operation?: string;
+    inpaint?: {
+      mask_path: string;
+      mask_sha256: string;
+      region_prompt: string;
+      region_negative_prompt: string;
+      denoise_strength: number;
+      outside_mask_composite: boolean;
+    } | null;
     pose_control?: {
       id: string;
       name: string;
@@ -167,6 +181,7 @@ export interface GenerationJob {
   current_step?: number | null;
   total_steps?: number | null;
   queue_position?: number | null;
+  result_generation_id?: string | null;
   created_at?: string;
 }
 export interface SettingsRecord {

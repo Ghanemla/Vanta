@@ -114,7 +114,7 @@ class IdentityAdapterImportInput(StrictModel):
 
 
 class GenerationInput(StrictModel):
-    operation: Literal["generate", "upscale"] = "generate"
+    operation: Literal["generate", "upscale", "inpaint"] = "generate"
     character_id: str | None = None
     recipe_id: str | None = None
     character_identity: str = Field(default="", max_length=8000)
@@ -142,4 +142,20 @@ class GenerationInput(StrictModel):
     pose_id: str | None = None
     pose_strength: float | None = Field(default=None, ge=0, le=1)
     variation_strength: float = Field(default=0.45, ge=0.05, le=0.95)
+    variation_mode: Literal[
+        "general",
+        "preserve_composition",
+        "preserve_identity",
+        "preserve_pose",
+        "clothing",
+        "background",
+        "lighting",
+        "expression",
+        "custom",
+    ] = "general"
+    variation_prompt: str = Field(default="", max_length=8000)
+    region_prompt: str = Field(default="", max_length=8000)
+    region_negative_prompt: str = Field(default="", max_length=8000)
+    inpaint_mask_data_url: str | None = Field(default=None, max_length=16_000_000)
+    inpaint_strength: float = Field(default=0.62, ge=0.05, le=1)
     upscale_profile: Literal["realesrgan_x2plus", "ultrasharp_x4"] | None = None

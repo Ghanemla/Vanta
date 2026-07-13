@@ -94,6 +94,32 @@ def test_variation_workflow_encodes_a_local_source_image():
     assert workflow["5"]["inputs"]["denoise"] == 0.42
 
 
+def test_inpaint_workflow_masks_sampling_and_composites_over_the_untouched_source():
+    request = {
+        "region_prompt": "tailored rose blazer with natural fabric folds",
+        "region_negative_prompt": "text, malformed fabric",
+        "seed": 11,
+        "steps": 24,
+        "guidance": 5.0,
+        "inpaint_strength": 0.62,
+    }
+    workflow = WorkflowCompiler().compile_inpaint(
+        request,
+        "model.safetensors",
+        "Vanta/source.png",
+        "Vanta/mask.png",
+    )
+    assert workflow["20"]["class_type"] == "LoadImage"
+    assert workflow["21"]["class_type"] == "LoadImageMask"
+    assert workflow["21"]["inputs"]["channel"] == "red"
+    assert workflow["4"]["class_type"] == "VAEEncodeForInpaint"
+    assert workflow["5"]["inputs"]["denoise"] == 0.62
+    assert workflow["22"]["class_type"] == "ImageCompositeMasked"
+    assert workflow["22"]["inputs"]["destination"] == ["20", 0]
+    assert workflow["22"]["inputs"]["mask"] == ["21", 0]
+    assert workflow["7"]["inputs"]["images"] == ["22", 0]
+
+
 def test_upscale_workflow_uses_the_local_model_loader_and_native_tiled_execution_node():
     workflow = WorkflowCompiler.upscale("Vanta/source.png", "RealESRGAN_x2plus.pth")
     assert workflow["1"]["class_type"] == "LoadImage"

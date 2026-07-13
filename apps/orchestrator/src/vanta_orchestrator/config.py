@@ -106,6 +106,10 @@ class Settings:
         return self.data_dir / "media" / "poses"
 
     @property
+    def inpaint_root(self) -> Path:
+        return self.data_dir / "media" / "inpaint-masks"
+
+    @property
     def media_root(self) -> Path:
         return self.data_dir / "media" / "generations"
 
@@ -145,4 +149,5 @@ class Settings:
         self.ipadapter_root.mkdir(parents=True, exist_ok=True)
         self.reference_root.mkdir(parents=True, exist_ok=True)
         self.pose_root.mkdir(parents=True, exist_ok=True)
+        self.inpaint_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)

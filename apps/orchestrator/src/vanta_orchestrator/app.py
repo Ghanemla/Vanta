@@ -433,6 +433,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return json.loads(row["metadata"]).get("request", {})
 
     def generation_media(generation_id: str, variant: str) -> FileResponse:
+        if variant == "mask":
+            row = db.query_one("SELECT metadata FROM generations WHERE id=?", (generation_id,))
+            metadata = json.loads(row["metadata"]) if row else {}
+            path = Path((metadata.get("inpaint") or {}).get("mask_path") or "")
+            if not path.is_file() or path.parent.resolve() != settings.inpaint_root.resolve():
+                raise HTTPException(status_code=404, detail="Generated mask file was not found")
+            return FileResponse(path, media_type="image/png")
         if variant not in {"image", "thumbnail"}:
             raise HTTPException(status_code=404, detail="Generated media variant was not found")
         column = "image_path" if variant == "image" else "thumbnail_path"
@@ -449,6 +456,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/generations/{generation_id}/thumbnail")
     def generation_thumbnail(generation_id: str) -> FileResponse:
         return generation_media(generation_id, "thumbnail")
+
+    @app.get("/api/generations/{generation_id}/mask")
+    def generation_mask(generation_id: str) -> FileResponse:
+        return generation_media(generation_id, "mask")
 
     @app.post("/api/generations/{generation_id}/repair-media")
     def repair_generation_media(generation_id: str) -> dict:
@@ -484,13 +495,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.delete("/api/generations/{generation_id}", status_code=204)
     def delete_generation(generation_id: str) -> None:
         row = db.query_one(
-            "SELECT image_path, thumbnail_path FROM generations WHERE id=?", (generation_id,)
+            "SELECT image_path, thumbnail_path, metadata FROM generations WHERE id=?",
+            (generation_id,),
         )
         if row is None:
             raise HTTPException(status_code=404, detail="Generation was not found")
         for path in {row["image_path"], row.get("thumbnail_path")}:
             if path:
                 Path(path).unlink(missing_ok=True)
+        mask_path = (json.loads(row["metadata"]).get("inpaint") or {}).get("mask_path") or ""
+        if mask_path:
+            candidate = Path(mask_path)
+            if candidate.parent.resolve() == settings.inpaint_root.resolve():
+                candidate.unlink(missing_ok=True)
         db.execute("DELETE FROM generations WHERE id=?", (generation_id,))
 
     @app.get("/api/engine/components")

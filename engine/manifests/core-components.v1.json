@@ -123,16 +123,26 @@
     },
     {
       "id": "image-finishing",
-      "display_name": "Image Finishing",
-      "version": "1.0.0",
-      "pinned_revision": "vanta-finish-001",
-      "source": { "type": "managed_archive", "url": "https://example.invalid/vanta/finishing" },
+      "display_name": "Image Editing & Finishing",
+      "version": "0.27.0-native-1",
+      "pinned_revision": "v0.27.0",
+      "source": {
+        "type": "bundled_runtime",
+        "url": "https://github.com/Comfy-Org/ComfyUI/tree/v0.27.0",
+        "nodes": [
+          "LoadImage",
+          "LoadImageMask",
+          "VAEEncodeForInpaint",
+          "ImageCompositeMasked",
+          "SaveImage"
+        ]
+      },
       "license": {
-        "name": "MIT",
-        "source_url": "https://example.invalid/licenses/finishing",
+        "name": "GPL-3.0; provided by the pinned managed ComfyUI runtime",
+        "source_url": "https://github.com/Comfy-Org/ComfyUI/blob/v0.27.0/LICENSE",
         "redistribution_reviewed": false
       },
-      "install_strategy": "managed_fixture",
+      "install_strategy": "bundled_runtime",
       "health_checks": [
         {
           "type": "capability_probe",
