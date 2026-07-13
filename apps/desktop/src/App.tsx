@@ -491,6 +491,15 @@ export function App() {
                     setGenerationDraft(draft);
                     navigate('create');
                   }}
+                  onCreateVariation={(generation) => {
+                    setGenerationDraft({
+                      ...(generation.metadata.request ?? {}),
+                      source_generation_id: generation.id,
+                      variation_strength: 0.45,
+                      seed: Math.floor(Math.random() * 2_000_000_000),
+                    });
+                    navigate('create');
+                  }}
                 />
               )}
               {screen === 'engine' && <EngineScreen data={data} refresh={load} notify={notify} />}
@@ -691,6 +700,8 @@ function CreateScreen({
   const [negativePrompt, setNegativePrompt] = useState(
     'low quality, malformed hands, artificial skin texture',
   );
+  const [sourceGenerationId, setSourceGenerationId] = useState<string | null>(null);
+  const [variationStrength, setVariationStrength] = useState(0.45);
   const runtime = data.components.find((item) => item.id === 'workflow-runtime');
   const model =
     data.packs.find((item) => item.is_default) ??
@@ -719,6 +730,10 @@ function CreateScreen({
     setGuidance(Number(initialDraft.guidance ?? guidance));
     setSeed(Number(initialDraft.seed ?? seed));
     setNegativePrompt(String(initialDraft.negative_prompt ?? negativePrompt));
+    setSourceGenerationId(
+      initialDraft.source_generation_id ? String(initialDraft.source_generation_id) : null,
+    );
+    setVariationStrength(Number(initialDraft.variation_strength ?? 0.45));
     onDraftUsed();
   }, [initialDraft]);
   const presetText = (category: string) =>
@@ -744,6 +759,8 @@ function CreateScreen({
     height: 1216,
     steps,
     guidance,
+    source_generation_id: sourceGenerationId,
+    variation_strength: variationStrength,
   });
   const saveRecipe = async () => {
     setSaving(true);
@@ -1750,11 +1767,13 @@ function GalleryScreen({
   notify,
   refresh,
   onGenerateSimilar,
+  onCreateVariation,
 }: {
   items: GenerationRecord[];
   notify: (message: string) => void;
   refresh: () => Promise<void>;
   onGenerateSimilar: (draft: Record<string, unknown>) => void;
+  onCreateVariation: (generation: GenerationRecord) => void;
 }) {
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState<GenerationRecord | null>(null);
@@ -1874,6 +1893,9 @@ function GalleryScreen({
               }}
             >
               <Copy /> Generate similar
+            </Button>
+            <Button variant="ghost" onClick={() => onCreateVariation(selected)}>
+              <Sparkles /> Create variation
             </Button>
             <Button
               variant="ghost"

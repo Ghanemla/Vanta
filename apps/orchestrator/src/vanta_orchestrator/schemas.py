@@ -105,3 +105,5 @@ class GenerationInput(StrictModel):
     steps: int = Field(default=30, ge=1, le=60)
     guidance: float = Field(default=5.5, ge=1, le=15)
     lora_ids: list[str] = Field(default_factory=list, max_length=8)
+    source_generation_id: str | None = None
+    variation_strength: float = Field(default=0.45, ge=0.05, le=0.95)

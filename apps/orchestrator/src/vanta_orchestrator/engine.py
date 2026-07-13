@@ -183,6 +183,7 @@ class WorkflowCompiler:
         request: dict[str, Any],
         checkpoint_name: str,
         loras: list[dict[str, Any]] | None = None,
+        source_image_name: str | None = None,
     ) -> dict[str, Any]:
         positive = self.compile_prompt(request)
         if not positive:
@@ -217,25 +218,32 @@ class WorkflowCompiler:
                 "inputs": {"filename_prefix": "Vanta/generation", "images": ["6", 0]},
             },
         }
-        if not loras:
-            return workflow
-        model_source: list[Any] = ["1", 0]
-        clip_source: list[Any] = ["1", 1]
-        for index, lora in enumerate(loras, start=8):
-            workflow[str(index)] = {
-                "class_type": "LoraLoader",
-                "inputs": {
-                    "model": model_source,
-                    "clip": clip_source,
-                    "lora_name": lora["filename"],
-                    "strength_model": lora["strength"],
-                    "strength_clip": lora["clip_strength"],
-                },
+        if loras:
+            model_source: list[Any] = ["1", 0]
+            clip_source: list[Any] = ["1", 1]
+            for index, lora in enumerate(loras, start=8):
+                workflow[str(index)] = {
+                    "class_type": "LoraLoader",
+                    "inputs": {
+                        "model": model_source,
+                        "clip": clip_source,
+                        "lora_name": lora["filename"],
+                        "strength_model": lora["strength"],
+                        "strength_clip": lora["clip_strength"],
+                    },
+                }
+                model_source, clip_source = [str(index), 0], [str(index), 1]
+            workflow["2"]["inputs"]["clip"] = clip_source
+            workflow["3"]["inputs"]["clip"] = clip_source
+            workflow["5"]["inputs"]["model"] = model_source
+        if source_image_name:
+            workflow["9"] = {"class_type": "LoadImage", "inputs": {"image": source_image_name}}
+            workflow["10"] = {
+                "class_type": "VAEEncode",
+                "inputs": {"pixels": ["9", 0], "vae": ["1", 2]},
             }
-            model_source, clip_source = [str(index), 0], [str(index), 1]
-        workflow["2"]["inputs"]["clip"] = clip_source
-        workflow["3"]["inputs"]["clip"] = clip_source
-        workflow["5"]["inputs"]["model"] = model_source
+            workflow["5"]["inputs"]["latent_image"] = ["10", 0]
+            workflow["5"]["inputs"]["denoise"] = request["variation_strength"]
         return workflow
 
     def diagnostic(self, checkpoint_name: str) -> dict[str, Any]:
@@ -613,8 +621,9 @@ class GenerationService:
             model = self.engine.model_for_alias(request["model_alias"])
             self._update(job_id, "loading_model", 15)
             loras = self._resolve_loras(request)
+            source_image_name = self._prepare_variation_source(request)
             workflow = WorkflowCompiler().compile(
-                request, Path(model["installed_path"]).name, loras
+                request, Path(model["installed_path"]).name, loras, source_image_name
             )
 
             def progress(value: int, maximum: int) -> None:
@@ -650,6 +659,8 @@ class GenerationService:
                 "steps": request["steps"],
                 "guidance": request["guidance"],
                 "loras": loras,
+                "source_generation_id": request.get("source_generation_id"),
+                "variation_strength": request.get("variation_strength"),
                 "disclosure": True,
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
@@ -738,6 +749,24 @@ class GenerationService:
                 }
             )
         return resolved
+
+    def _prepare_variation_source(self, request: dict[str, Any]) -> str | None:
+        generation_id = request.get("source_generation_id")
+        if not generation_id:
+            return None
+        source = self.db.query_one(
+            "SELECT image_path FROM generations WHERE id=?", (generation_id,)
+        )
+        if source is None or not Path(source["image_path"]).is_file():
+            raise ValueError("The selected source image is no longer available for a variation")
+        layout = self.engine.runtime.installed_layout()
+        if layout is None:
+            raise ValueError("Start the Local Generation Engine before creating a variation")
+        input_dir = layout[0].parent / "input" / "Vanta"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{generation_id}.png"
+        shutil.copy2(source["image_path"], input_dir / filename)
+        return f"Vanta/{filename}"
 
     def get(self, job_id: str) -> dict[str, Any]:
         job = self.db.query_one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))

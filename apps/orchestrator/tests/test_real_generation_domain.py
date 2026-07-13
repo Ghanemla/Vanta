@@ -71,3 +71,23 @@ def test_sdxl_lora_workflow_is_inserted_without_exposing_nodes_to_the_ui():
     assert workflow["8"]["class_type"] == "LoraLoader"
     assert workflow["5"]["inputs"]["model"] == ["8", 0]
     assert workflow["2"]["inputs"]["clip"] == ["8", 1]
+
+
+def test_variation_workflow_encodes_a_local_source_image():
+    request = {
+        "direction": "original adult editorial portrait variation",
+        "negative_prompt": "",
+        "seed": 8,
+        "width": 832,
+        "height": 1216,
+        "steps": 2,
+        "guidance": 5.5,
+        "variation_strength": 0.42,
+    }
+    workflow = WorkflowCompiler().compile(
+        request, "model.safetensors", source_image_name="Vanta/source.png"
+    )
+    assert workflow["9"]["class_type"] == "LoadImage"
+    assert workflow["10"]["class_type"] == "VAEEncode"
+    assert workflow["5"]["inputs"]["latent_image"] == ["10", 0]
+    assert workflow["5"]["inputs"]["denoise"] == 0.42

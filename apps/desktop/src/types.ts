@@ -126,6 +126,8 @@ export interface GenerationRecord {
       strength: number;
       clip_strength: number;
     }[];
+    source_generation_id?: string | null;
+    variation_strength?: number;
     request?: Record<string, unknown>;
   };
   created_at: string;
