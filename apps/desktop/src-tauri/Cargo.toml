@@ -1,0 +1,21 @@
+[package]
+name = "vanta-desktop"
+version = "0.1.0"
+description = "Project Vanta local character studio"
+authors = ["Project Vanta"]
+edition = "2021"
+
+[lib]
+name = "vanta_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+rfd = "0.16"
+uuid = { version = "1", features = ["v4"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

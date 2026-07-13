@@ -1,0 +1,27 @@
+{
+  "name": "project-vanta",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev": "pnpm --filter @vanta/desktop dev",
+    "tauri": "pnpm --filter @vanta/desktop tauri",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings 0",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "sidecar:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\build-orchestrator-sidecar.ps1",
+    "tauri:check": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml",
+    "tauri:build": "pnpm sidecar:build && pnpm --filter @vanta/desktop tauri build --no-bundle",
+    "tauri:bundle": "pnpm sidecar:build && pnpm --filter @vanta/desktop tauri build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "eslint": "^9.31.0",
+    "globals": "^16.3.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.38.0"
+  }
+}

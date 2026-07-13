@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
+
+from .config import Settings
+from .database import Database, utc_now
+from .engine import EngineService, GenerationService
+from .repositories import CharacterRepository, PresetRepository, RecipeRepository
+from .schemas import (
+    CharacterInput,
+    GenerationInput,
+    ModelImportInput,
+    PresetInput,
+    RecipeInput,
+    SettingInput,
+)
+
+AUTH_HEADER = "X-Vanta-Token"
+ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+ALLOWED_HEADERS = ["Content-Type", "Accept", AUTH_HEADER]
+logger = logging.getLogger("vanta.orchestrator.requests")
+
+
+class LaunchTokenMiddleware(BaseHTTPMiddleware):
+    """Require the per-launch token for API requests, never for CORS preflight."""
+
+    def __init__(self, app: ASGIApp, launch_token: str | None) -> None:
+        super().__init__(app)
+        self.launch_token = launch_token
+
+    async def dispatch(self, request: Request, call_next):
+        if (
+            request.url.path.startswith("/api")
+            and request.method != "OPTIONS"
+            and self.launch_token
+        ):
+            provided = request.headers.get(AUTH_HEADER, "")
+            if not hmac.compare_digest(provided, self.launch_token):
+                return JSONResponse(
+                    status_code=401, content={"detail": "Local service authentication failed"}
+                )
+        return await call_next(request)
+
+
+class RequestDiagnosticsMiddleware(BaseHTTPMiddleware):
+    """Log local CORS/auth routing metadata without ever logging the launch token."""
+
+    def __init__(self, app: ASGIApp, enabled: bool) -> None:
+        super().__init__(app)
+        self.enabled = enabled
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if self.enabled and request.url.path.startswith("/api"):
+            preflight = request.method == "OPTIONS" and bool(
+                request.headers.get("access-control-request-method")
+            )
+            logger.info(
+                "request method=%s path=%s origin=%s requested_method=%s requested_headers=%s "
+                "preflight=%s token_auth_attempted=%s status=%s",
+                request.method,
+                request.url.path,
+                request.headers.get("origin", ""),
+                request.headers.get("access-control-request-method", ""),
+                request.headers.get("access-control-request-headers", ""),
+                preflight,
+                request.url.path.startswith("/api") and request.method != "OPTIONS",
+                response.status_code,
+            )
+        return response
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    db = Database(
+        settings.database_path,
+        settings.migrations_dir,
+        settings.starter_presets_path,
+    )
+    db.migrate()
+    characters, presets, recipes = (
+        CharacterRepository(db),
+        PresetRepository(db),
+        RecipeRepository(db),
+    )
+    engine = EngineService(db, settings)
+    generation_jobs = GenerationService(db, engine)
+    generation_jobs.recover()
+
+    app = FastAPI(title="Vanta Local Orchestrator", version="0.1.0", docs_url="/api/docs")
+    # Starlette applies the most recently added middleware first. CORS must be
+    # outermost so it can answer browser preflight before token authentication.
+    app.add_middleware(LaunchTokenMiddleware, launch_token=settings.launch_token)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.allowed_origins,
+        allow_methods=ALLOWED_METHODS,
+        allow_headers=ALLOWED_HEADERS,
+        allow_credentials=False,
+    )
+    app.add_middleware(RequestDiagnosticsMiddleware, enabled=settings.diagnostics_enabled)
+
+    @app.on_event("shutdown")
+    def stop_managed_engine() -> None:
+        engine.close()
+
+    def missing(error: KeyError) -> HTTPException:
+        return HTTPException(status_code=404, detail=f"Item {error.args[0]} was not found")
+
+    @app.get("/api/health")
+    def health() -> dict:
+        return {
+            "status": "ready",
+            "host": "127.0.0.1",
+            "privacy": "local-only",
+            "version": app.version,
+        }
+
+    @app.get("/api/characters")
+    def list_characters(include_archived: bool = False) -> list[dict]:
+        return characters.list(include_archived)
+
+    @app.post("/api/characters", status_code=201)
+    def create_character(payload: CharacterInput) -> dict:
+        return characters.create(payload)
+
+    @app.put("/api/characters/{item_id}")
+    def update_character(item_id: str, payload: CharacterInput) -> dict:
+        try:
+            return characters.update(item_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.delete("/api/characters/{item_id}", status_code=204)
+    def archive_character(item_id: str) -> None:
+        try:
+            characters.archive(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/presets")
+    def list_presets() -> list[dict]:
+        return presets.list()
+
+    @app.post("/api/presets", status_code=201)
+    def create_preset(payload: PresetInput) -> dict:
+        return presets.create(payload)
+
+    @app.put("/api/presets/{item_id}")
+    def update_preset(item_id: str, payload: PresetInput) -> dict:
+        try:
+            return presets.update(item_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/presets/{item_id}/duplicate", status_code=201)
+    def duplicate_preset(item_id: str) -> dict:
+        try:
+            return presets.duplicate(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.delete("/api/presets/{item_id}", status_code=204)
+    def delete_preset(item_id: str) -> None:
+        try:
+            presets.delete(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/presets/restore-builtins")
+    def restore_builtins() -> dict:
+        presets.restore_builtins()
+        return {"message": "Built-in presets restored"}
+
+    @app.get("/api/presets-export")
+    def export_presets() -> dict:
+        return {
+            "schema_version": 1,
+            "presets": [item for item in presets.list() if item["origin"] == "user"],
+        }
+
+    @app.post("/api/presets-import")
+    def import_presets(payload: dict) -> dict:
+        if payload.get("schema_version") != 1 or not isinstance(payload.get("presets"), list):
+            raise HTTPException(status_code=422, detail="Unsupported preset export format")
+        imported = []
+        for item in payload["presets"]:
+            imported.append(presets.create(PresetInput.model_validate(item)))
+        return {"imported": len(imported)}
+
+    @app.get("/api/recipes")
+    def list_recipes() -> list[dict]:
+        return recipes.list()
+
+    @app.post("/api/recipes", status_code=201)
+    def create_recipe(payload: RecipeInput) -> dict:
+        return recipes.create(payload)
+
+    @app.get("/api/gallery")
+    def gallery(model: str | None = Query(default=None)) -> list[dict]:
+        sql, params = "SELECT * FROM generations", ()
+        if model:
+            sql, params = f"{sql} WHERE model_alias=?", (model,)
+        rows = db.query_all(f"{sql} ORDER BY created_at DESC", params)
+        for row in rows:
+            row["metadata"] = json.loads(row["metadata"])
+        return rows
+
+    @app.post("/api/generations", status_code=202)
+    def create_generation(payload: GenerationInput) -> dict:
+        try:
+            return generation_jobs.queue(payload.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/generations/{job_id}")
+    def get_generation_job(job_id: str) -> dict:
+        try:
+            return generation_jobs.get(job_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/generations/{job_id}/cancel")
+    def cancel_generation(job_id: str) -> dict:
+        try:
+            return generation_jobs.cancel(job_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/generations/{generation_id}/similar")
+    def generation_similar(generation_id: str) -> dict:
+        row = db.query_one("SELECT metadata FROM generations WHERE id=?", (generation_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Generation was not found")
+        return json.loads(row["metadata"]).get("request", {})
+
+    @app.get("/api/generations/{generation_id}/image")
+    def generation_image(generation_id: str) -> FileResponse:
+        row = db.query_one("SELECT image_path FROM generations WHERE id=?", (generation_id,))
+        if row is None or not Path(row["image_path"]).is_file():
+            raise HTTPException(status_code=404, detail="Generated image file was not found")
+        return FileResponse(row["image_path"], media_type="image/png")
+
+    @app.delete("/api/generations/{generation_id}", status_code=204)
+    def delete_generation(generation_id: str) -> None:
+        row = db.query_one(
+            "SELECT image_path, thumbnail_path FROM generations WHERE id=?", (generation_id,)
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Generation was not found")
+        for path in {row["image_path"], row.get("thumbnail_path")}:
+            if path:
+                Path(path).unlink(missing_ok=True)
+        db.execute("DELETE FROM generations WHERE id=?", (generation_id,))
+
+    @app.get("/api/engine/components")
+    def list_components() -> list[dict]:
+        return engine.list_components()
+
+    @app.post("/api/engine/components/{item_id}/{action}")
+    def component_action(item_id: str, action: str) -> dict:
+        try:
+            return engine.component_action(item_id, action)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/engine/model-packs")
+    def list_model_packs() -> dict:
+        return {"hardware": engine.hardware, "packs": engine.list_packs()}
+
+    @app.post("/api/engine/model-packs/{item_id}/{action}")
+    def pack_action(item_id: str, action: str) -> dict:
+        try:
+            return engine.pack_action(item_id, action)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/engine/models/import")
+    def import_local_model(payload: ModelImportInput) -> dict:
+        try:
+            return engine.import_model(payload.source_path, payload.alias, payload.license_notes)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/engine/diagnostics")
+    def diagnostics() -> dict:
+        return engine.diagnostics()
+
+    @app.get("/api/diagnostics/export")
+    def export_diagnostics() -> FileResponse:
+        export_dir = settings.data_dir / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        archive = export_dir / "vanta-diagnostics.zip"
+        metadata = {
+            "desktop_data_dir": str(settings.data_dir),
+            "database_path": str(settings.database_path),
+            "logs_path": str(settings.logs_dir or settings.data_dir / "logs"),
+            "orchestrator_version": app.version,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr("system-metadata.json", json.dumps(metadata, indent=2))
+            for log in (settings.logs_dir or settings.data_dir / "logs").glob("*.log"):
+                sanitized = log.read_text(encoding="utf-8", errors="replace").replace(
+                    settings.launch_token or "", "[redacted]"
+                )
+                bundle.writestr(f"logs/{log.name}", sanitized)
+        return FileResponse(archive, media_type="application/zip", filename=archive.name)
+
+    @app.get("/api/settings")
+    def get_settings() -> dict:
+        values = {row["key"]: row["value"] for row in db.query_all("SELECT * FROM app_settings")}
+        return {
+            "values": values,
+            "paths": {
+                "data": str(settings.data_dir.resolve()),
+                "database": str(settings.database_path.resolve()),
+                "models": str((settings.data_dir / "models").resolve()),
+            },
+        }
+
+    @app.put("/api/settings/{key}")
+    def set_setting(key: str, payload: SettingInput) -> dict:
+        db.execute(
+            "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, payload.value, utc_now()),
+        )
+        return {"key": key, "value": payload.value}
+
+    return app

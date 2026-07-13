@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "manifest_id": "vanta-core-2026.07.1",
+  "components": [
+    {
+      "id": "workflow-runtime",
+      "display_name": "Image Workflow Engine",
+      "version": "0.27.0",
+      "pinned_revision": "v0.27.0",
+      "source": {
+        "type": "managed_archive",
+        "url": "https://github.com/Comfy-Org/ComfyUI/releases/download/v0.27.0/ComfyUI_windows_portable_nvidia.7z",
+        "sha256": "d27cafec26ecf244c59420fc1e4636ebb880f72cf6aa5ae76765b57d99c500d1",
+        "bytes": 2086299430,
+        "extractor": {
+          "relative_path": "tools/7zr.exe",
+          "sha256": "56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72",
+          "version": "26.02",
+          "license": "LGPL-2.1-or-later",
+          "source_url": "https://github.com/ip7z/7zip/releases/download/26.02/7zr.exe"
+        }
+      },
+      "license": {
+        "name": "GPL-3.0",
+        "source_url": "https://github.com/Comfy-Org/ComfyUI/blob/v0.27.0/LICENSE",
+        "redistribution_reviewed": false
+      },
+      "install_strategy": "managed_archive",
+      "health_checks": [
+        {
+          "type": "loopback_http",
+          "target": "127.0.0.1",
+          "description": "Local workflow engine responds"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": [],
+      "provided_capabilities": ["Workflow Execution", "Generation Metadata"]
+    },
+    {
+      "id": "pose-control",
+      "display_name": "Pose Control",
+      "version": "1.0.0",
+      "pinned_revision": "vanta-pose-001",
+      "source": { "type": "managed_archive", "url": "https://example.invalid/vanta/pose" },
+      "license": {
+        "name": "Apache-2.0",
+        "source_url": "https://example.invalid/licenses/pose",
+        "redistribution_reviewed": false
+      },
+      "install_strategy": "managed_fixture",
+      "health_checks": [
+        {
+          "type": "capability_probe",
+          "target": "pose_preprocess",
+          "description": "Pose Control is available"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime"],
+      "provided_capabilities": ["Pose Control", "Pose Preprocessing"]
+    },
+    {
+      "id": "identity-lock",
+      "display_name": "Identity Lock",
+      "version": "1.0.0",
+      "pinned_revision": "vanta-identity-001",
+      "source": { "type": "managed_archive", "url": "https://example.invalid/vanta/identity" },
+      "license": {
+        "name": "Apache-2.0",
+        "source_url": "https://example.invalid/licenses/identity",
+        "redistribution_reviewed": false
+      },
+      "install_strategy": "managed_fixture",
+      "health_checks": [
+        {
+          "type": "capability_probe",
+          "target": "identity_adapter",
+          "description": "Identity Lock is available"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime"],
+      "provided_capabilities": ["Identity Lock", "Face Detail"]
+    },
+    {
+      "id": "image-finishing",
+      "display_name": "Image Finishing",
+      "version": "1.0.0",
+      "pinned_revision": "vanta-finish-001",
+      "source": { "type": "managed_archive", "url": "https://example.invalid/vanta/finishing" },
+      "license": {
+        "name": "MIT",
+        "source_url": "https://example.invalid/licenses/finishing",
+        "redistribution_reviewed": false
+      },
+      "install_strategy": "managed_fixture",
+      "health_checks": [
+        {
+          "type": "capability_probe",
+          "target": "image_finish",
+          "description": "Image finishing tools are available"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime"],
+      "provided_capabilities": ["Inpainting", "Upscaling", "Image I/O"]
+    }
+  ]
+}

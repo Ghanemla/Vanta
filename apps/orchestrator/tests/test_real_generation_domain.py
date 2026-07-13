@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from vanta_orchestrator.comfy_runtime import ensure_safe_archive_members, validate_safetensors
+from vanta_orchestrator.engine import WorkflowCompiler
+
+
+def test_prompt_compilation_is_stable_and_workflow_is_local_comfy_api_shape():
+    request = {
+        "character_identity": "original adult character",
+        "wardrobe": "black silk dress",
+        "expression": "calm expression",
+        "pose": "standing",
+        "location": "editorial studio",
+        "lighting": "soft key light",
+        "camera": "85mm portrait",
+        "quality": "photorealistic",
+        "direction": "restrained fashion editorial",
+        "custom_tags": ["cinematic", "35mm"],
+        "negative_prompt": "low quality",
+        "seed": 42,
+        "width": 832,
+        "height": 1216,
+        "steps": 30,
+        "guidance": 5.5,
+    }
+    prompt = WorkflowCompiler.compile_prompt(request)
+    assert prompt.startswith("original adult character, black silk dress, calm expression")
+    workflow = WorkflowCompiler().compile(request, "model.safetensors")
+    assert [workflow[str(node)]["class_type"] for node in range(1, 8)] == [
+        "CheckpointLoaderSimple",
+        "CLIPTextEncode",
+        "CLIPTextEncode",
+        "EmptyLatentImage",
+        "KSampler",
+        "VAEDecode",
+        "SaveImage",
+    ]
+    assert workflow["4"]["inputs"]["width"] == 832
+    assert workflow["4"]["inputs"]["batch_size"] == 1
+
+
+def test_safetensors_validation_and_archive_path_safety(tmp_path: Path):
+    checkpoint = tmp_path / "model.safetensors"
+    header = json.dumps({"__metadata__": {"format": "pt"}}).encode("utf-8")
+    checkpoint.write_bytes(len(header).to_bytes(8, "little") + header + b"payload")
+    assert validate_safetensors(checkpoint)["__metadata__"]["format"] == "pt"
+    with pytest.raises(RuntimeError, match="unsafe"):
+        ensure_safe_archive_members(["ComfyUI/../escape.txt"])

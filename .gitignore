@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+target/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+.env
+data/runtime/
+apps/desktop/src-tauri/gen/

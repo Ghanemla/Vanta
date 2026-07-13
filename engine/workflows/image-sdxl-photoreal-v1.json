@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "workflow_id": "image-sdxl-photoreal-v1",
+  "engine_adapter": "comfyui",
+  "model_alias": "photoreal_balanced",
+  "required_capabilities": ["Workflow Execution", "Identity Lock", "Image I/O"],
+  "parameters": [
+    "positive_prompt",
+    "negative_prompt",
+    "seed",
+    "width",
+    "height",
+    "steps",
+    "guidance"
+  ],
+  "internal_template": "Milestone 1 compiler fixture; engine node graph is intentionally isolated from the UI."
+}

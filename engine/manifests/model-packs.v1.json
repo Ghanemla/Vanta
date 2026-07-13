@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "packs": [
+    {
+      "id": "vanta-sdxl-balanced-v1",
+      "alias": "photoreal_balanced",
+      "display_name": "Realistic — Balanced",
+      "model_family": "SDXL",
+      "capabilities": ["Photoreal Portrait", "Identity Lock", "Pose Control", "Inpainting"],
+      "hardware": { "minimum_vram_gb": 10, "recommended_vram_gb": 12, "minimum_ram_gb": 24 },
+      "disk_gb": 14.2,
+      "download": {
+        "source_name": "User-selected verified SDXL source",
+        "url": null,
+        "authentication": "source_dependent"
+      },
+      "license": {
+        "name": "Source dependent; review required",
+        "acceptance_required": true,
+        "source_url": null
+      },
+      "sha256": "fixture:must-be-resolved-before-install",
+      "target_path": "models/checkpoints/photoreal_balanced.safetensors",
+      "compatible_workflows": ["image-sdxl-photoreal-v1", "image-sdxl-preview-v1"],
+      "active_default": true
+    },
+    {
+      "id": "vanta-flux-maximum-v1",
+      "alias": "photoreal_max",
+      "display_name": "Realistic — Maximum",
+      "model_family": "FLUX-compatible quantized",
+      "capabilities": ["Maximum Detail", "Photoreal Portrait"],
+      "hardware": { "minimum_vram_gb": 16, "recommended_vram_gb": 24, "minimum_ram_gb": 32 },
+      "disk_gb": 24.5,
+      "download": {
+        "source_name": "User-selected licensed source",
+        "url": null,
+        "authentication": "may_be_required"
+      },
+      "license": {
+        "name": "Source dependent; explicit review required",
+        "acceptance_required": true,
+        "source_url": null
+      },
+      "sha256": "fixture:must-be-resolved-before-install",
+      "target_path": "models/checkpoints/photoreal_max.safetensors",
+      "compatible_workflows": ["image-flux-photoreal-v1"],
+      "active_default": false
+    },
+    {
+      "id": "vanta-sdxl-preview-v1",
+      "alias": "preview_fast",
+      "display_name": "Preview — Fast",
+      "model_family": "SDXL",
+      "capabilities": ["Fast Preview", "Composition Test"],
+      "hardware": { "minimum_vram_gb": 6, "recommended_vram_gb": 8, "minimum_ram_gb": 16 },
+      "disk_gb": 8.1,
+      "download": {
+        "source_name": "User-selected verified SDXL source",
+        "url": null,
+        "authentication": "source_dependent"
+      },
+      "license": {
+        "name": "Source dependent; review required",
+        "acceptance_required": true,
+        "source_url": null
+      },
+      "sha256": "fixture:must-be-resolved-before-install",
+      "target_path": "models/checkpoints/preview_fast.safetensors",
+      "compatible_workflows": ["image-sdxl-preview-v1"],
+      "active_default": false
+    }
+  ]
+}

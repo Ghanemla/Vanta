@@ -1,0 +1,50 @@
+{
+  "wardrobe": [
+    {
+      "id": "wardrobe-y2k-noir",
+      "name": "Y2K Noir",
+      "prompt": "black leather corset top, low-rise denim mini skirt, studded belt, tall black leather boots, gothic cross rosary necklace, silver rings",
+      "tags": ["y2k", "alt", "black"],
+      "builtin": true
+    },
+    {
+      "id": "wardrobe-quiet-luxury",
+      "name": "Quiet Luxury",
+      "prompt": "cream cashmere knit, tailored wide-leg trousers, understated leather handbag, small gold earrings",
+      "tags": ["luxury", "minimal"],
+      "builtin": true
+    }
+  ],
+  "expression": [
+    {
+      "id": "expression-sultry",
+      "name": "Sultry",
+      "prompt": "confident sultry expression, relaxed eyelids, one finger resting gently near the lips",
+      "tags": ["editorial"],
+      "builtin": true
+    },
+    {
+      "id": "expression-soft-smile",
+      "name": "Soft Smile",
+      "prompt": "subtle closed-mouth smile, relaxed eyes, natural cheeks",
+      "tags": ["natural"],
+      "builtin": true
+    }
+  ],
+  "lighting": [
+    {
+      "id": "lighting-blue-bedroom",
+      "name": "Blue Bedroom",
+      "prompt": "dim cool-toned ambient lighting, subtle blue cast, soft shadow falloff",
+      "tags": ["moody", "low-light"],
+      "builtin": true
+    },
+    {
+      "id": "lighting-window",
+      "name": "Soft Window",
+      "prompt": "large soft window light, gentle directional shadows, realistic skin highlights",
+      "tags": ["daylight"],
+      "builtin": true
+    }
+  ]
+}
