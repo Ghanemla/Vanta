@@ -42,6 +42,7 @@ import {
   chooseLocalImageFile,
   chooseLocalLoraFile,
   chooseLocalModelFile,
+  chooseLocalUpscalerFile,
   exportDiagnostics,
   getLocalServiceInfo,
   repairApplicationRuntime,
@@ -527,6 +528,16 @@ export function App() {
                       seed: Math.floor(Math.random() * 2_000_000_000),
                     });
                     navigate('create');
+                  }}
+                  onUpscale={async (generation) => {
+                    await api.post('/generations', {
+                      operation: 'upscale',
+                      source_generation_id: generation.id,
+                      seed: 0,
+                      upscale_profile: 'realesrgan_x2plus',
+                    });
+                    notify('2× upscale queued locally');
+                    await load();
                   }}
                 />
               )}
@@ -1845,12 +1856,14 @@ function GalleryScreen({
   refresh,
   onGenerateSimilar,
   onCreateVariation,
+  onUpscale,
 }: {
   items: GenerationRecord[];
   notify: (message: string) => void;
   refresh: () => Promise<void>;
   onGenerateSimilar: (draft: Record<string, unknown>) => void;
   onCreateVariation: (generation: GenerationRecord) => void;
+  onUpscale: (generation: GenerationRecord) => Promise<void>;
 }) {
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState<GenerationRecord | null>(null);
@@ -1980,6 +1993,14 @@ function GalleryScreen({
             </Button>
             <Button
               variant="ghost"
+              onClick={() => {
+                void onUpscale(selected);
+              }}
+            >
+              <Sparkles /> Upscale 2×
+            </Button>
+            <Button
+              variant="ghost"
               onClick={async () => {
                 await api.delete(`/generations/${selected.id}`);
                 setSelected(null);
@@ -2038,6 +2059,26 @@ function EngineScreen({
         license_notes: '',
       });
       notify('Local SDXL checkpoint imported and verified');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
+  const importUpscaler = async (alias: 'realesrgan_x2plus' | 'ultrasharp_x4') => {
+    const sourcePath = await chooseLocalUpscalerFile();
+    if (!sourcePath) return;
+    setBusy(`upscaler-${alias}`);
+    try {
+      await api.post('/engine/upscalers/import', {
+        source_path: sourcePath,
+        alias,
+        license_notes: '',
+      });
+      notify(
+        alias === 'realesrgan_x2plus'
+          ? '2× local upscaler imported'
+          : 'Optional 4× profile imported',
+      );
       await refresh();
     } finally {
       setBusy('');
@@ -2226,9 +2267,20 @@ function EngineScreen({
                     <Upload /> Import local model
                   </Button>
                 )}
-                {!item.installed && item.alias !== 'photoreal_balanced' && (
-                  <Button disabled>Coming later</Button>
-                )}
+                {!item.installed &&
+                  item.alias !== 'photoreal_balanced' &&
+                  (item.alias === 'realesrgan_x2plus' || item.alias === 'ultrasharp_x4' ? (
+                    <Button
+                      onClick={() =>
+                        void importUpscaler(item.alias as 'realesrgan_x2plus' | 'ultrasharp_x4')
+                      }
+                      disabled={busy === `upscaler-${item.alias}`}
+                    >
+                      <Upload /> Import local pack
+                    </Button>
+                  ) : (
+                    <Button disabled>Coming later</Button>
+                  ))}
                 {item.installed && !item.is_default && (
                   <Button
                     variant="primary"

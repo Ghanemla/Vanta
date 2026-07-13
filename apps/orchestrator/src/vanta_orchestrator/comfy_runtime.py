@@ -245,7 +245,10 @@ class ManagedComfyRuntime:
             "vanta:\n"
             f"  base_path: {self.settings.engine_root.as_posix()}\n"
             "  checkpoints: models/checkpoints\n"
-            "  loras: models/loras\n",
+            "  loras: models/loras\n"
+            "  controlnet: models/controlnet\n"
+            "  clip_vision: models/clip_vision\n"
+            "  upscale_models: models/upscale_models\n",
             encoding="utf-8",
         )
 

@@ -88,6 +88,9 @@ def test_engine_manifest_and_model_pack_services(client):
     assert balanced["installed"] is False
     assert balanced["verified"] is False
     assert balanced["is_default"] is False
+    upscale = next(item for item in packs["packs"] if item["alias"] == "realesrgan_x2plus")
+    assert upscale["installed"] is False
+    assert "Tiled Execution" in upscale["capabilities"]
 
 
 def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):

@@ -530,6 +530,14 @@ fn choose_local_lora_file() -> Option<String> {
         .map(|path| path.display().to_string())
 }
 
+#[tauri::command]
+fn choose_local_upscaler_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Local upscale models", &["pth", "pt"])
+        .pick_file()
+        .map(|path| path.display().to_string())
+}
+
 fn acquire_desktop_lock(data_dir: &Path) -> Result<DesktopLock, String> {
     let path = data_dir.join("desktop-instance.lock");
     let open_lock = || OpenOptions::new().write(true).create_new(true).open(&path);
@@ -617,7 +625,8 @@ pub fn run() {
             repair_application_runtime,
             choose_local_model_file,
             choose_local_image_file,
-            choose_local_lora_file
+            choose_local_lora_file,
+            choose_local_upscaler_file
         ]);
 
     let app = builder

@@ -76,6 +76,7 @@ async function chooseLocalFile(command: string): Promise<string | null> {
 
 export const chooseLocalImageFile = () => chooseLocalFile('choose_local_image_file');
 export const chooseLocalLoraFile = () => chooseLocalFile('choose_local_lora_file');
+export const chooseLocalUpscalerFile = () => chooseLocalFile('choose_local_upscaler_file');
 
 export async function exportDiagnostics(): Promise<void> {
   const response = await fetch(`${apiBase}/api/diagnostics/export`, {

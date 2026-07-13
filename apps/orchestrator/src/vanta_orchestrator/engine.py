@@ -261,6 +261,22 @@ class WorkflowCompiler:
             checkpoint_name,
         )
 
+    @staticmethod
+    def upscale(source_image_name: str, model_name: str) -> dict[str, Any]:
+        """Compile a non-generative derivative workflow through ComfyUI's native tiled model node."""
+        return {
+            "1": {"class_type": "LoadImage", "inputs": {"image": source_image_name}},
+            "2": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": model_name}},
+            "3": {
+                "class_type": "ImageUpscaleWithModel",
+                "inputs": {"upscale_model": ["2", 0], "image": ["1", 0]},
+            },
+            "4": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "Vanta/upscale", "images": ["3", 0]},
+            },
+        }
+
 
 class EngineService:
     allowed_component_actions = {"install", "repair", "cancel", "health_check", "start", "stop"}
@@ -422,6 +438,49 @@ class EngineService:
             ),
         )
         return self.verify_model(alias)
+
+    def import_upscaler(
+        self, source_path: str, alias: str, license_notes: str = ""
+    ) -> dict[str, Any]:
+        expected = {
+            "realesrgan_x2plus": "RealESRGAN_x2plus.pth",
+            "ultrasharp_x4": "4xUltrasharp_4xUltrasharpV10.pt",
+        }
+        if alias not in expected:
+            raise ValueError("Choose a supported Vanta upscale pack")
+        source = Path(source_path).expanduser().resolve()
+        if source.suffix.lower() not in {".pth", ".pt"} or not source.is_file():
+            raise ValueError("Choose an existing .pth or .pt local upscale model")
+        if source.stat().st_size < 1_000_000:
+            raise ValueError("This upscale model file is too small to be valid")
+        self.settings.upscale_root.mkdir(parents=True, exist_ok=True)
+        destination = self.settings.upscale_root / expected[alias]
+        if source != destination:
+            shutil.copy2(source, destination)
+        metadata = json.loads(self._pack_row(alias)["metadata"])
+        metadata.update(
+            {
+                "filename": destination.name,
+                "sha256": sha256_file(destination),
+                "source_information": "Imported from a user-selected local file",
+            }
+        )
+        self.db.execute(
+            """UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100,
+            metadata=?, installed_path=?, original_path=?, file_size=?, license_notes=?, imported_at=?, updated_at=?
+            WHERE alias=?""",
+            (
+                json.dumps(metadata),
+                str(destination),
+                str(source),
+                destination.stat().st_size,
+                license_notes,
+                utc_now(),
+                utc_now(),
+                alias,
+            ),
+        )
+        return self._pack_row(alias)
 
     def verify_model(self, alias: str) -> dict[str, Any]:
         row = self._pack_row(alias)
@@ -629,6 +688,9 @@ class GenerationService:
             self.engine.runtime.start()
             if not self.engine.runtime.wait_healthy(timeout=45):
                 raise RuntimeError("The Local Generation Engine is not ready")
+            if request.get("operation") == "upscale":
+                self._run_upscale(job_id, request, started)
+                return
             self._update(job_id, "preparing", 10)
             model = self.engine.model_for_alias(request["model_alias"])
             self._update(job_id, "loading_model", 15)
@@ -718,6 +780,92 @@ class GenerationService:
                 self._update(
                     job_id, "failed", current["progress"], str(error), completed_at=utc_now()
                 )
+
+    def _run_upscale(self, job_id: str, request: dict[str, Any], started: float) -> None:
+        source_id = str(request.get("source_generation_id") or "")
+        source_row = self.db.query_one(
+            "SELECT image_path FROM generations WHERE id=?", (source_id,)
+        )
+        if source_row is None or not Path(source_row["image_path"]).is_file():
+            raise ValueError("The selected source image is no longer available for upscaling")
+        profile = request.get("upscale_profile") or "realesrgan_x2plus"
+        models = {
+            "realesrgan_x2plus": ("RealESRGAN_x2plus.pth", 2),
+            "ultrasharp_x4": ("4xUltrasharp_4xUltrasharpV10.pt", 4),
+        }
+        if profile not in models:
+            raise ValueError("Choose a supported local upscale profile")
+        model_name, scale = models[profile]
+        model_path = self.engine.settings.upscale_root / model_name
+        if not model_path.is_file():
+            raise ValueError(
+                f"{model_name} is not installed. Import the local model pack in Models & Engine first."
+            )
+        layout = self.engine.runtime.installed_layout()
+        if layout is None:
+            raise RuntimeError("The Local Generation Engine is not installed")
+        input_dir = layout[0].parent / "input" / "Vanta"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        source_name = f"{source_id}-upscale-source.png"
+        shutil.copy2(source_row["image_path"], input_dir / source_name)
+        self._update(job_id, "preparing", 15)
+        workflow = WorkflowCompiler.upscale(f"Vanta/{source_name}", model_name)
+
+        def progress(value: int, maximum: int) -> None:
+            percentage = min(90, 20 + round(70 * value / max(maximum, 1)))
+            self._update(job_id, "generating", percentage, current_step=value, total_steps=maximum)
+
+        prompt_id, history = self.engine.runtime.submit(workflow, progress)
+        self._update(job_id, "saving", 94, prompt_id=prompt_id)
+        output = history.get("outputs", {}).get("4", {}).get("images", [])
+        if not output:
+            raise RuntimeError("The local upscaler completed without an output image")
+        image = output[0]
+        rendered = (
+            self.engine.runtime.root / "output" / image.get("subfolder", "") / image["filename"]
+        )
+        if not rendered.is_file():
+            raise RuntimeError("The local upscaler output file is missing")
+        generation_id = f"generation-{uuid.uuid4().hex}"
+        destination = self.engine.settings.media_root / f"{generation_id}.png"
+        thumbnail = self.engine.settings.media_root / f"{generation_id}.thumb.jpg"
+        shutil.copy2(rendered, destination)
+        with Image.open(destination) as final_image:
+            width, height = final_image.size
+            final_image.thumbnail((480, 480))
+            final_image.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
+        source_metadata = self.db.query_one(
+            "SELECT metadata FROM generations WHERE id=?", (source_id,)
+        )
+        metadata = {
+            "workflow_version": "image-upscale-realesrgan-v1",
+            "operation": "upscale",
+            "derivative_of": source_id,
+            "upscale_profile": profile,
+            "upscale_model": model_name,
+            "upscale_model_sha256": sha256_file(model_path),
+            "scale": scale,
+            "tiled_execution": True,
+            "source_metadata_available": bool(source_metadata),
+            "disclosure": True,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "request": request,
+        }
+        self.db.execute(
+            """INSERT INTO generations(id, character_id, recipe_id, image_path, thumbnail_path, prompt, negative_prompt, seed, model_alias, width, height, metadata, created_at)
+            VALUES (?, NULL, NULL, ?, ?, ?, '', 0, 'photoreal_balanced', ?, ?, ?, ?)""",
+            (
+                generation_id,
+                str(destination),
+                str(thumbnail),
+                f"{scale}x upscale of {source_id}",
+                width,
+                height,
+                json.dumps(metadata),
+                utc_now(),
+            ),
+        )
+        self._update(job_id, "completed", 100, completed_at=utc_now())
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)

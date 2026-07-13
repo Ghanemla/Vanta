@@ -82,6 +82,18 @@ class Settings:
         return self.engine_root / "models" / "loras"
 
     @property
+    def upscale_root(self) -> Path:
+        return self.engine_root / "models" / "upscale_models"
+
+    @property
+    def controlnet_root(self) -> Path:
+        return self.engine_root / "models" / "controlnet"
+
+    @property
+    def clip_vision_root(self) -> Path:
+        return self.engine_root / "models" / "clip_vision"
+
+    @property
     def reference_root(self) -> Path:
         return self.data_dir / "media" / "references"
 
@@ -119,5 +131,8 @@ class Settings:
         self.engine_root.mkdir(parents=True, exist_ok=True)
         self.model_root.mkdir(parents=True, exist_ok=True)
         self.lora_root.mkdir(parents=True, exist_ok=True)
+        self.upscale_root.mkdir(parents=True, exist_ok=True)
+        self.controlnet_root.mkdir(parents=True, exist_ok=True)
+        self.clip_vision_root.mkdir(parents=True, exist_ok=True)
         self.reference_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)

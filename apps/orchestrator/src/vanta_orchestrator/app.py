@@ -35,6 +35,7 @@ from .schemas import (
     ReferenceImportInput,
     ReferenceUpdateInput,
     SettingInput,
+    UpscalerImportInput,
 )
 
 AUTH_HEADER = "X-Vanta-Token"
@@ -457,6 +458,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def import_local_model(payload: ModelImportInput) -> dict:
         try:
             return engine.import_model(payload.source_path, payload.alias, payload.license_notes)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/engine/upscalers/import")
+    def import_upscaler(payload: UpscalerImportInput) -> dict:
+        try:
+            return engine.import_upscaler(payload.source_path, payload.alias, payload.license_notes)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 

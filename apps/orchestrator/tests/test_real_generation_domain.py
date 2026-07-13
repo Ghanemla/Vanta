@@ -91,3 +91,12 @@ def test_variation_workflow_encodes_a_local_source_image():
     assert workflow["10"]["class_type"] == "VAEEncode"
     assert workflow["5"]["inputs"]["latent_image"] == ["10", 0]
     assert workflow["5"]["inputs"]["denoise"] == 0.42
+
+
+def test_upscale_workflow_uses_the_local_model_loader_and_native_tiled_execution_node():
+    workflow = WorkflowCompiler.upscale("Vanta/source.png", "RealESRGAN_x2plus.pth")
+    assert workflow["1"]["class_type"] == "LoadImage"
+    assert workflow["2"]["class_type"] == "UpscaleModelLoader"
+    assert workflow["2"]["inputs"]["model_name"] == "RealESRGAN_x2plus.pth"
+    assert workflow["3"]["class_type"] == "ImageUpscaleWithModel"
+    assert workflow["4"]["class_type"] == "SaveImage"

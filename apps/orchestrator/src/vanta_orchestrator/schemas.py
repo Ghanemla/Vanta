@@ -82,7 +82,14 @@ class ModelImportInput(StrictModel):
     license_notes: str = Field(default="", max_length=2000)
 
 
+class UpscalerImportInput(StrictModel):
+    source_path: str = Field(min_length=1, max_length=32767)
+    alias: Literal["realesrgan_x2plus", "ultrasharp_x4"]
+    license_notes: str = Field(default="", max_length=2000)
+
+
 class GenerationInput(StrictModel):
+    operation: Literal["generate", "upscale"] = "generate"
     character_id: str | None = None
     recipe_id: str | None = None
     character_identity: str = Field(default="", max_length=8000)
@@ -107,3 +114,4 @@ class GenerationInput(StrictModel):
     lora_ids: list[str] = Field(default_factory=list, max_length=8)
     source_generation_id: str | None = None
     variation_strength: float = Field(default=0.45, ge=0.05, le=0.95)
+    upscale_profile: Literal["realesrgan_x2plus", "ultrasharp_x4"] | None = None

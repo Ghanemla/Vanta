@@ -69,6 +69,52 @@
       "target_path": "models/checkpoints/preview_fast.safetensors",
       "compatible_workflows": ["image-sdxl-preview-v1"],
       "active_default": false
+    },
+    {
+      "id": "vanta-realesrgan-x2plus-v1",
+      "alias": "realesrgan_x2plus",
+      "display_name": "Finish — RealESRGAN 2×",
+      "model_family": "ESRGAN upscaler",
+      "capabilities": ["2× Upscale", "Gallery Derivatives", "Tiled Execution"],
+      "hardware": { "minimum_vram_gb": 4, "recommended_vram_gb": 8, "minimum_ram_gb": 16 },
+      "disk_gb": 0.07,
+      "download": {
+        "source_name": "User-selected licensed local model",
+        "url": null,
+        "authentication": "none"
+      },
+      "license": {
+        "name": "License recorded from the selected source",
+        "acceptance_required": true,
+        "source_url": null
+      },
+      "sha256": "resolved-on-local-import",
+      "target_path": "models/upscale_models/RealESRGAN_x2plus.pth",
+      "compatible_workflows": ["image-upscale-realesrgan-v1"],
+      "active_default": false
+    },
+    {
+      "id": "vanta-ultrasharp-x4-v1",
+      "alias": "ultrasharp_x4",
+      "display_name": "Finish — UltraSharp 4× (optional)",
+      "model_family": "ESRGAN upscaler",
+      "capabilities": ["4× Upscale", "Gallery Derivatives"],
+      "hardware": { "minimum_vram_gb": 6, "recommended_vram_gb": 12, "minimum_ram_gb": 16 },
+      "disk_gb": 0.07,
+      "download": {
+        "source_name": "User-selected licensed local model",
+        "url": null,
+        "authentication": "none"
+      },
+      "license": {
+        "name": "License recorded from the selected source",
+        "acceptance_required": true,
+        "source_url": null
+      },
+      "sha256": "resolved-on-local-import",
+      "target_path": "models/upscale_models/4xUltrasharp_4xUltrasharpV10.pt",
+      "compatible_workflows": ["image-upscale-realesrgan-v1"],
+      "active_default": false
     }
   ]
 }
