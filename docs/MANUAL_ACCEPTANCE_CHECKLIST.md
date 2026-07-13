@@ -1,6 +1,6 @@
 # Vanta manual acceptance checklist
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 These checks need native Windows interaction and must be run against the final NSIS installer. They are deliberately not represented as automated or simulated evidence.
 

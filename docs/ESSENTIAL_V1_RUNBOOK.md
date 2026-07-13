@@ -1,6 +1,6 @@
 # Project Vanta Essential V1 Runbook
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Repository audit
 
@@ -39,12 +39,9 @@ Last updated: 2026-07-13
 
 ## Current feature
 
-All Essential V1 feature slices are implemented. The active work is the complete verification matrix and final NSIS installer evidence.
+All Essential V1 feature slices are implemented. The complete automated verification matrix and final NSIS installer build pass.
 
-Remaining V1 work:
-
-- Run the full Python, TypeScript, ESLint, Vitest, formatter, renderer, Rust and package gates.
-- Build and inspect the final NSIS installer; retain native GUI acceptance items as explicitly manual rather than simulated evidence.
+Remaining V1 work is limited to the explicitly manual native Windows checks in `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`. Installer clicking, file-picker interaction, screenshot capture and extended visual QA are not represented as automated evidence.
 
 ## Pose and Identity files changed
 
@@ -218,6 +215,16 @@ Remaining V1 work:
 - Preset/recipe focused API and migration suite: **15 passed** after diagnostics, LoRA repair and atomic recipe validation were added.
 - Strict TypeScript and ESLint zero-warning gates after the complete Simple/Studio, recipe library, Models & Engine, diagnostics, About and path-control integration: **passed**.
 - Automated coverage now proves all ten starter categories, scoped preset CRUD, immutable built-ins with user-owned copies, full recipe round trips, duplicate/favorite/delete/import/export, failure preflight, component provenance, sanitized diagnostics ZIPs and LoRA verify/repair.
+- Final Python suite: **37 passed**, 45 deprecation warnings; API, migration, workflow, release-runtime and domain tests are included.
+- Final frontend/package Vitest: **20 passed** across domain, UI and desktop; strict TypeScript and ESLint zero-warning gates passed.
+- Repository-wide Prettier, Ruff lint/format, Rust format and `git diff --check`: **passed**.
+- Rust check and tests: **passed**, including **3/3** desktop lifecycle/sanitization/loopback tests.
+- Final production renderer: **passed**, 1,656 modules, 343.21 kB JS / 52.45 kB CSS before gzip.
+- Tauri optimized release and packaged orchestrator self-test: **passed**. The packaged sidecar created a fresh 266,240-byte migrated SQLite database and local log in an isolated release-smoke directory.
+- Final NSIS installer: `Vanta_0.1.0_x64-setup.exe`, 58,555,979 bytes, SHA-256 `146207fb0c4486b4658aadadfdbf797954f01d4adf85c4532f3ef216998bc60a`.
+- Release desktop executable: 8,907,264 bytes, SHA-256 `e2624d6f45e2004986119bf1e1b3fc34c24b12f5716f97fc24918bc930dcefe1`.
+- Packaged orchestrator: 56,565,914 bytes, SHA-256 `e016a41f519fb0857343fd94a08299e46f6b68a876e91e24e57110346345a21f`.
+- Post-build preservation check: `flux_dev.safetensors` remains 17,078,891,958 bytes and `juggernautXL_version6Rundiffusion.safetensors` remains 7,105,348,560 bytes.
 
 ## Real evidence produced
 
@@ -284,10 +291,11 @@ Remaining V1 work:
 
 - None currently.
 - Upstream pose and identity packages/models require user license review and acceptance. Manifests preserve exact source, revision, size, hash and license metadata; the UI does not claim redistribution review has occurred.
+- The locally built NSIS artifact is not Authenticode-signed because no code-signing certificate or signing secret is present. This does not block the requested installer build, but Windows may show an unknown-publisher warning until a release certificate is supplied.
 
 ## Exact next action
 
-Commit the completed preset/recipe and engine-management slice, then run the final verification and NSIS packaging gate.
+Run the documented native installer and visual acceptance checklist on a clean Windows user profile.
 
 ## Final acceptance status
 
