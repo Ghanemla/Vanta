@@ -52,6 +52,12 @@ export interface LoraRecord {
   enabled: boolean;
   verification_state: string;
 }
+export interface PoseRecord {
+  id: string; name: string; scope: 'global' | 'character'; character_id: string | null;
+  source_thumbnail_path: string; control_thumbnail_path: string; tags: string[]; favorite: boolean;
+  notes: string; strength: number; source_sha256: string; control_sha256: string;
+  preprocessor_revision: string; workflow_pack_version: string;
+}
 export interface PresetRecord {
   id: string;
   category: string;

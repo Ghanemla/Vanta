@@ -185,6 +185,8 @@ class WorkflowCompiler:
         loras: list[dict[str, Any]] | None = None,
         source_image_name: str | None = None,
         identity_image_name: str | None = None,
+        pose_image_name: str | None = None,
+        pose_strength: float | None = None,
     ) -> dict[str, Any]:
         positive = self.compile_prompt(request)
         if not positive:
@@ -269,6 +271,29 @@ class WorkflowCompiler:
                 },
             }
             workflow["5"]["inputs"]["model"] = ["22", 0]
+        if pose_image_name:
+            workflow["30"] = {"class_type": "LoadImage", "inputs": {"image": pose_image_name}}
+            workflow["31"] = {
+                "class_type": "DiffControlNetLoader",
+                "inputs": {
+                    "model": workflow["5"]["inputs"]["model"],
+                    "control_net_name": "control-lora-openposeXL2-rank256.safetensors",
+                },
+            }
+            workflow["32"] = {
+                "class_type": "ControlNetApplyAdvanced",
+                "inputs": {
+                    "positive": ["2", 0],
+                    "negative": ["3", 0],
+                    "control_net": ["31", 0],
+                    "image": ["30", 0],
+                    "strength": pose_strength if pose_strength is not None else 0.8,
+                    "start_percent": 0.0,
+                    "end_percent": 1.0,
+                },
+            }
+            workflow["5"]["inputs"]["positive"] = ["32", 0]
+            workflow["5"]["inputs"]["negative"] = ["32", 1]
         return workflow
 
     def diagnostic(self, checkpoint_name: str) -> dict[str, Any]:
@@ -839,12 +864,15 @@ class GenerationService:
             loras = self._resolve_loras(request)
             source_image_name = self._prepare_variation_source(request)
             identity_image_name = self._prepare_identity_reference(request)
+            pose_image_name, pose_metadata = self._prepare_pose_control(request)
             workflow = WorkflowCompiler().compile(
                 request,
                 Path(model["installed_path"]).name,
                 loras,
                 source_image_name,
                 identity_image_name,
+                pose_image_name,
+                request.get("pose_strength"),
             )
 
             def progress(value: int, maximum: int) -> None:
@@ -889,6 +917,7 @@ class GenerationService:
                 "source_generation_id": request.get("source_generation_id"),
                 "variation_strength": request.get("variation_strength"),
                 "identity_reference_id": request.get("identity_reference_id"),
+                "pose_control": pose_metadata,
                 "disclosure": True,
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
@@ -1111,6 +1140,46 @@ class GenerationService:
         filename = f"identity-{reference_id}.png"
         shutil.copy2(reference["image_path"], input_dir / filename)
         return f"Vanta/{filename}"
+
+    def _prepare_pose_control(
+        self, request: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        pose_id = request.get("pose_id")
+        if not pose_id:
+            return None, None
+        pose = self.db.query_one("SELECT * FROM pose_assets WHERE id=?", (pose_id,))
+        if pose is None or not Path(pose["control_path"]).is_file():
+            raise ValueError("The selected pose control image is no longer available")
+        model = (
+            self.engine.settings.controlnet_root / "control-lora-openposeXL2-rank256.safetensors"
+        )
+        if not model.is_file():
+            raise ValueError(
+                "Install the Vanta OpenPose XL control model before using a saved pose"
+            )
+        layout = self.engine.runtime.installed_layout()
+        if layout is None:
+            raise ValueError("Start the Local Generation Engine before using a saved pose")
+        input_dir = layout[0].parent / "input" / "Vanta"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"pose-{pose_id}.png"
+        shutil.copy2(pose["control_path"], input_dir / filename)
+        request["pose_strength"] = (
+            request.get("pose_strength")
+            if request.get("pose_strength") is not None
+            else pose["strength"]
+        )
+        return f"Vanta/{filename}", {
+            key: pose[key]
+            for key in (
+                "id",
+                "source_sha256",
+                "control_sha256",
+                "crop_settings",
+                "preprocessor_revision",
+                "workflow_pack_version",
+            )
+        }
 
     def get(self, job_id: str) -> dict[str, Any]:
         job = self.db.query_one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))

@@ -17,6 +17,7 @@ from starlette.types import ASGIApp
 from .config import Settings
 from .database import Database, utc_now
 from .engine import EngineService, GenerationService
+from .pose import PoseService
 from .repositories import (
     CharacterRepository,
     LoraRepository,
@@ -31,6 +32,7 @@ from .schemas import (
     IdentityAdapterImportInput,
     LoraImportInput,
     ModelImportInput,
+    PoseImportInput,
     PresetInput,
     RecipeInput,
     ReferenceImportInput,
@@ -111,6 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     loras = LoraRepository(db, settings.lora_root)
     engine = EngineService(db, settings)
     generation_jobs = GenerationService(db, engine)
+    poses = PoseService(db, settings, engine)
     generation_jobs.recover()
 
     app = FastAPI(title="Vanta Local Orchestrator", version="0.1.0", docs_url="/api/docs")
@@ -233,6 +236,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/loras")
     def list_loras() -> list[dict]:
         return loras.list()
+
+    @app.get("/api/poses")
+    def list_poses(query: str = "") -> list[dict]:
+        return poses.list(query)
+
+    @app.post("/api/poses/import", status_code=201)
+    def import_pose(payload: PoseImportInput) -> dict:
+        try:
+            return poses.import_pose(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.post("/api/loras/import", status_code=201)
     def import_lora(payload: LoraImportInput) -> dict:

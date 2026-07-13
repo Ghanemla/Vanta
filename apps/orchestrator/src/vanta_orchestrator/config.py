@@ -102,6 +102,10 @@ class Settings:
         return self.data_dir / "media" / "references"
 
     @property
+    def pose_root(self) -> Path:
+        return self.data_dir / "media" / "poses"
+
+    @property
     def media_root(self) -> Path:
         return self.data_dir / "media" / "generations"
 
@@ -140,4 +144,5 @@ class Settings:
         self.clip_vision_root.mkdir(parents=True, exist_ok=True)
         self.ipadapter_root.mkdir(parents=True, exist_ok=True)
         self.reference_root.mkdir(parents=True, exist_ok=True)
+        self.pose_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)

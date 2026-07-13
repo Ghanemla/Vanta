@@ -57,11 +57,12 @@ import type {
   GenerationRecord,
   LoraRecord,
   ModelPack,
+  PoseRecord,
   PresetRecord,
   SettingsRecord,
 } from './types';
 
-type Screen = 'create' | 'characters' | 'presets' | 'gallery' | 'engine' | 'settings';
+type Screen = 'create' | 'characters' | 'poses' | 'presets' | 'gallery' | 'engine' | 'settings';
 type AppData = {
   characters: CharacterRecord[];
   presets: PresetRecord[];
@@ -70,6 +71,7 @@ type AppData = {
   packs: ModelPack[];
   loras: LoraRecord[];
   jobs: GenerationJob[];
+  poses: PoseRecord[];
   hardware: { gpu_name: string; vram_gb: number; ram_gb: number; free_disk_gb: number };
   settings: SettingsRecord;
 };
@@ -77,6 +79,7 @@ type AppData = {
 const navItems: { id: Screen; label: string; icon: typeof Sparkles }[] = [
   { id: 'create', label: 'Create', icon: Sparkles },
   { id: 'characters', label: 'Characters', icon: CircleUserRound },
+  { id: 'poses', label: 'Pose Library', icon: Image },
   { id: 'presets', label: 'Presets', icon: BookOpen },
   { id: 'gallery', label: 'Gallery', icon: Grid3X3 },
   { id: 'engine', label: 'Models & Engine', icon: Gauge },
@@ -262,7 +265,7 @@ export function App() {
     setLoading(true);
     setError('');
     try {
-      const [characters, presets, gallery, components, modelResponse, settings, loras, jobs] =
+      const [characters, presets, gallery, components, modelResponse, settings, loras, jobs, poses] =
         await Promise.all([
           api.get<CharacterRecord[]>('/characters'),
           api.get<PresetRecord[]>('/presets'),
@@ -272,6 +275,7 @@ export function App() {
           api.get<SettingsRecord>('/settings'),
           api.get<LoraRecord[]>('/loras'),
           api.get<GenerationJob[]>('/jobs'),
+          api.get<PoseRecord[]>('/poses'),
         ]);
       setData({
         characters,
@@ -283,6 +287,7 @@ export function App() {
         settings,
         loras,
         jobs,
+        poses,
       });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The local studio could not start.');
@@ -508,6 +513,7 @@ export function App() {
                   notify={notify}
                 />
               )}
+              {screen === 'poses' && <PoseLibraryScreen items={data.poses} refresh={load} notify={notify} />}
               {screen === 'presets' && (
                 <PresetsScreen items={data.presets} refresh={load} notify={notify} />
               )}

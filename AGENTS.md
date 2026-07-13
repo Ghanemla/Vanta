@@ -58,6 +58,16 @@ Use `frontend/design-prototype.html` as the initial art-direction reference, not
 - Documents local paths and recovery behavior.
 - Preserves user data across upgrades.
 
+## Long-running implementation rule
+
+- Do not return progress-only reports while an active feature's acceptance criteria remain incomplete.
+- Continue working through frontend, backend, workflow, persistence, tests, and real integration evidence.
+- Creating one migration, endpoint, service, UI component, test suite, or commit is not a stopping point.
+- After completing a feature, commit it and immediately continue to the next requested independent feature.
+- Return only when every requested feature has been implemented or concretely attempted, or a genuine blocker prevents further code execution.
+- Manual GUI verification pending is not a blocker; record it and continue.
+- A final response must clearly distinguish completed, manually unverified, blocked, and missing work.
+
 ## Safety and rights
 
 Support only original characters or references the user has rights to use. Do not build features intended to impersonate real people, bypass consent, remove provenance, or misrepresent generated media as authentic footage.

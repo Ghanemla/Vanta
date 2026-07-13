@@ -35,6 +35,16 @@ class ReferenceUpdateInput(StrictModel):
     is_primary: bool = False
 
 
+class PoseImportInput(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    source_path: str = Field(min_length=1, max_length=32767)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    favorite: bool = False
+    notes: str = Field(default="", max_length=2000)
+    character_id: str | None = None
+    strength: float = Field(default=0.8, ge=0, le=1)
+
+
 class LoraImportInput(StrictModel):
     source_path: str = Field(min_length=1, max_length=32767)
     name: str = Field(min_length=1, max_length=120)
@@ -120,5 +130,7 @@ class GenerationInput(StrictModel):
     lora_ids: list[str] = Field(default_factory=list, max_length=8)
     source_generation_id: str | None = None
     identity_reference_id: str | None = None
+    pose_id: str | None = None
+    pose_strength: float | None = Field(default=None, ge=0, le=1)
     variation_strength: float = Field(default=0.45, ge=0.05, le=0.95)
     upscale_profile: Literal["realesrgan_x2plus", "ultrasharp_x4"] | None = None
