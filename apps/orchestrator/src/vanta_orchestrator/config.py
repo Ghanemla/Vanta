@@ -82,6 +82,10 @@ class Settings:
         return self.engine_root / "models" / "loras"
 
     @property
+    def text_encoder_root(self) -> Path:
+        return self.engine_root / "models" / "text_encoders"
+
+    @property
     def upscale_root(self) -> Path:
         return self.engine_root / "models" / "upscale_models"
 
@@ -108,6 +112,10 @@ class Settings:
     @property
     def inpaint_root(self) -> Path:
         return self.data_dir / "media" / "inpaint-masks"
+
+    @property
+    def motion_root(self) -> Path:
+        return self.data_dir / "media" / "motion-references"
 
     @property
     def media_root(self) -> Path:
@@ -143,6 +151,7 @@ class Settings:
         self.engine_root.mkdir(parents=True, exist_ok=True)
         self.model_root.mkdir(parents=True, exist_ok=True)
         self.lora_root.mkdir(parents=True, exist_ok=True)
+        self.text_encoder_root.mkdir(parents=True, exist_ok=True)
         self.upscale_root.mkdir(parents=True, exist_ok=True)
         self.controlnet_root.mkdir(parents=True, exist_ok=True)
         self.clip_vision_root.mkdir(parents=True, exist_ok=True)
@@ -150,4 +159,5 @@ class Settings:
         self.reference_root.mkdir(parents=True, exist_ok=True)
         self.pose_root.mkdir(parents=True, exist_ok=True)
         self.inpaint_root.mkdir(parents=True, exist_ok=True)
+        self.motion_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@ from vanta_orchestrator.engine import (
     checkpoint_family,
 )
 from vanta_orchestrator.pose import PoseService
+from vanta_orchestrator.video import LtxVideoWorkflowCompiler, MotionService, encode_mp4
 
 
 def test_prompt_compilation_is_stable_and_workflow_is_local_comfy_api_shape():
@@ -219,3 +220,56 @@ def test_pose_extraction_and_identity_pose_generation_use_managed_nodes():
         == "image-sdxl-identity-pose-v1"
     )
     assert WorkflowCompiler.workflow_version(source_image=True) == "image-sdxl-variation-img2img-v1"
+
+
+def test_ltx_video_workflow_uses_native_distilled_sampling_and_exact_frame_count():
+    workflow = LtxVideoWorkflowCompiler().compile(
+        {
+            "motion_prompt": "subtle breathing and a gentle camera drift",
+            "negative_prompt": "text, identity change",
+            "profile": "safe",
+            "duration_seconds": 2,
+            "seed": 44,
+            "motion_strength": 0.65,
+        },
+        "Vanta/source.png",
+    )
+    assert workflow["7"]["class_type"] == "LTXVImgToVideo"
+    assert workflow["7"]["inputs"]["length"] == 49
+    assert workflow["10"]["inputs"]["sampler_name"] == "euler_ancestral"
+    assert workflow["11"]["inputs"]["sigmas"].endswith(", 0.0")
+    assert workflow["12"]["class_type"] == "SamplerCustomAdvanced"
+    assert workflow["15"]["class_type"] == "SaveImage"
+
+
+def test_managed_mp4_encoder_creates_a_playable_local_video(tmp_path: Path):
+    import imageio_ffmpeg
+    from PIL import Image
+
+    frames = []
+    for index in range(4):
+        path = tmp_path / f"frame-{index}.png"
+        Image.new("RGB", (64, 64), (40 + index * 30, 12, 50)).save(path)
+        frames.append(path)
+    output = tmp_path / "preview.mp4"
+    encode_mp4(frames, output, 8)
+    count, duration = imageio_ffmpeg.count_frames_and_secs(str(output))
+    assert output.is_file() and output.stat().st_size > 1000
+    assert count == 4
+    assert duration == pytest.approx(0.5, abs=0.1)
+
+
+def test_reference_motion_description_is_identity_safe(tmp_path: Path):
+    from PIL import Image, ImageDraw
+
+    paths = []
+    for index, x in enumerate((100, 145, 190)):
+        path = tmp_path / f"pose-{index}.png"
+        image = Image.new("RGB", (512, 512), "black")
+        ImageDraw.Draw(image).rectangle((x, 120, x + 100, 420), fill="white")
+        image.save(path)
+        paths.append(path)
+    prompt = MotionService._describe_motion(paths)
+    assert "right" in prompt
+    assert "exclude any reference-person identity" in prompt
+    assert "face" not in prompt.lower()

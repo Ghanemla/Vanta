@@ -22,6 +22,7 @@ import {
   Eraser,
   FileDown,
   FileUp,
+  Film,
   FolderLock,
   Gauge,
   Grid3X3,
@@ -34,6 +35,7 @@ import {
   MoreHorizontal,
   Plus,
   Paintbrush,
+  Play,
   RotateCcw,
   Search,
   Scan,
@@ -55,6 +57,7 @@ import {
   chooseLocalLoraFile,
   chooseLocalModelFile,
   chooseLocalUpscalerFile,
+  chooseLocalVideoFile,
   exportDiagnostics,
   getLocalServiceInfo,
   repairApplicationRuntime,
@@ -69,12 +72,14 @@ import type {
   GenerationRecord,
   LoraRecord,
   ModelPack,
+  MotionAsset,
   PoseRecord,
   PresetRecord,
   SettingsRecord,
 } from './types';
 
-type Screen = 'create' | 'characters' | 'poses' | 'presets' | 'gallery' | 'engine' | 'settings';
+type Screen =
+  'create' | 'characters' | 'poses' | 'motion' | 'presets' | 'gallery' | 'engine' | 'settings';
 type AppData = {
   characters: CharacterRecord[];
   presets: PresetRecord[];
@@ -84,6 +89,7 @@ type AppData = {
   loras: LoraRecord[];
   jobs: GenerationJob[];
   poses: PoseRecord[];
+  motion: MotionAsset[];
   hardware: { gpu_name: string; vram_gb: number; ram_gb: number; free_disk_gb: number };
   settings: SettingsRecord;
 };
@@ -92,6 +98,7 @@ const navItems: { id: Screen; label: string; icon: typeof Sparkles }[] = [
   { id: 'create', label: 'Create', icon: Sparkles },
   { id: 'characters', label: 'Characters', icon: CircleUserRound },
   { id: 'poses', label: 'Pose Library', icon: Image },
+  { id: 'motion', label: 'Motion Library', icon: Film },
   { id: 'presets', label: 'Presets', icon: BookOpen },
   { id: 'gallery', label: 'Gallery', icon: Grid3X3 },
   { id: 'engine', label: 'Models & Engine', icon: Gauge },
@@ -110,6 +117,14 @@ const stateLabels: Record<string, string> = {
   stopped: 'Stopped',
   starting: 'Starting',
   crashed: 'Crashed',
+  queued: 'Queued',
+  extracting: 'Extracting motion',
+  encoding: 'Encoding MP4',
+  preparing: 'Preparing',
+  generating: 'Generating',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
 };
 const stateTone = (state: string): 'ready' | 'warning' | 'danger' | 'neutral' =>
   state === 'ready'
@@ -287,6 +302,7 @@ export function App() {
         loras,
         jobs,
         poses,
+        motion,
       ] = await Promise.all([
         api.get<CharacterRecord[]>('/characters'),
         api.get<PresetRecord[]>('/presets'),
@@ -297,6 +313,7 @@ export function App() {
         api.get<LoraRecord[]>('/loras'),
         api.get<GenerationJob[]>('/jobs'),
         api.get<PoseRecord[]>('/poses'),
+        api.get<MotionAsset[]>('/motion-assets'),
       ]);
       setData({
         characters,
@@ -309,6 +326,7 @@ export function App() {
         loras,
         jobs,
         poses,
+        motion,
       });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The local studio could not start.');
@@ -543,12 +561,20 @@ export function App() {
                   notify={notify}
                 />
               )}
+              {screen === 'motion' && (
+                <MotionLibraryScreen items={data.motion} refresh={load} notify={notify} />
+              )}
               {screen === 'presets' && (
                 <PresetsScreen items={data.presets} refresh={load} notify={notify} />
               )}
               {screen === 'gallery' && (
                 <GalleryScreen
                   items={data.gallery}
+                  motion={data.motion}
+                  videoReady={
+                    data.components.find((item) => item.id === 'video-generation')?.state ===
+                    'ready'
+                  }
                   editingReady={
                     data.components.find((item) => item.id === 'image-finishing')?.state === 'ready'
                   }
@@ -2045,6 +2071,362 @@ function PoseLibraryScreen({
   );
 }
 
+function LocalMotionMedia({
+  motionId,
+  variant,
+  label,
+}: {
+  motionId: string;
+  variant: 'preview' | 'thumbnail';
+  label: string;
+}) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api
+      .motionMediaUrl(motionId, variant)
+      .then((next) => {
+        objectUrl = next;
+        if (active) setUrl(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [motionId, variant]);
+  if (!url)
+    return (
+      <div className="motion-placeholder">
+        <Film />
+      </div>
+    );
+  return variant === 'thumbnail' ? (
+    <img src={url} alt={label} loading="lazy" />
+  ) : (
+    <video src={url} aria-label={label} controls playsInline preload="metadata" />
+  );
+}
+
+function MotionLibraryScreen({
+  items,
+  refresh,
+  notify,
+}: {
+  items: MotionAsset[];
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [editing, setEditing] = useState<MotionAsset | 'new' | null>(null);
+  const [sourcePath, setSourcePath] = useState('');
+  const [working, setWorking] = useState(false);
+  const [formError, setFormError] = useState('');
+  const filtered = items.filter((item) =>
+    `${item.name} ${item.metadata.broad_motion_prompt ?? ''}`
+      .toLowerCase()
+      .includes(query.toLowerCase()),
+  );
+
+  useEffect(() => {
+    if (!items.some((item) => !['ready', 'failed'].includes(item.status))) return;
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => window.clearInterval(timer);
+  }, [items, refresh]);
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onDragDropEvent((event) => {
+        if (event.payload.type !== 'drop') return;
+        const path = event.payload.paths.find((candidate) =>
+          /\.(mp4|mov|webm|mkv)$/i.test(candidate),
+        );
+        if (path) {
+          setSourcePath(path);
+          setEditing('new');
+          setFormError('');
+        }
+      })
+      .then((stop) => {
+        unlisten = stop;
+      });
+    return () => unlisten?.();
+  }, []);
+
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setWorking(true);
+    setFormError('');
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      name: String(form.get('name')),
+      start_seconds: Number(form.get('start_seconds')),
+      end_seconds: Number(form.get('end_seconds')),
+      fit_mode: String(form.get('fit_mode')),
+      smoothing: Number(form.get('smoothing')),
+      strength: Number(form.get('strength')),
+    };
+    try {
+      if (editing === 'new') {
+        await api.post('/motion-assets', {
+          ...payload,
+          source_path: sourcePath,
+          rights_confirmed: form.get('rights_confirmed') === 'on',
+        });
+        notify('Reference Motion extraction queued locally');
+      } else if (editing) {
+        await api.put(`/motion-assets/${editing.id}`, payload);
+        notify('Reference Motion updated and queued for re-extraction');
+      }
+      setEditing(null);
+      setSourcePath('');
+      await refresh();
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : 'Motion import could not start.');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return (
+    <div className="screen motion-library-screen">
+      <PageTitle
+        eyebrow="Reference Motion"
+        title="Borrow movement, never identity."
+        body="Trim an owned clip to four seconds or less. Vanta extracts broad pose movement locally and excludes face, voice, branding, and reference-person identity."
+        actions={
+          <Button variant="primary" onClick={() => setEditing('new')}>
+            <Plus /> Import motion
+          </Button>
+        }
+      />
+      <div className="library-toolbar">
+        <div className="search-field">
+          <Search />
+          <input
+            aria-label="Search motion references"
+            placeholder="Search motion names and movement"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </div>
+      </div>
+      {filtered.length === 0 ? (
+        <EmptyState
+          title="No motion references yet"
+          body="Import an owned MP4, MOV, WebM, or MKV to create a reusable, identity-safe movement guide."
+          action={<Button onClick={() => setEditing('new')}>Import first motion</Button>}
+        />
+      ) : (
+        <div className="motion-grid">
+          {filtered.map((item) => (
+            <Panel className="motion-card" key={item.id}>
+              <div className="motion-preview">
+                {item.status === 'ready' ? (
+                  <LocalMotionMedia
+                    motionId={item.id}
+                    variant="preview"
+                    label={`${item.name} extracted pose movement preview`}
+                  />
+                ) : (
+                  <div className="motion-placeholder">
+                    <Film />
+                  </div>
+                )}
+              </div>
+              <header>
+                <div>
+                  <span className="eyebrow">
+                    {(item.end_seconds - item.start_seconds).toFixed(1)}s trim
+                  </span>
+                  <h2>{item.name}</h2>
+                </div>
+                <StatusPill
+                  tone={
+                    item.status === 'ready'
+                      ? 'ready'
+                      : item.status === 'failed'
+                        ? 'danger'
+                        : 'warning'
+                  }
+                >
+                  {item.status === 'ready'
+                    ? 'Ready'
+                    : item.status === 'failed'
+                      ? 'Needs attention'
+                      : `${stateLabels[item.status] ?? item.status} ${item.progress}%`}
+                </StatusPill>
+              </header>
+              {!['ready', 'failed'].includes(item.status) && (
+                <div className="progress" role="progressbar" aria-valuenow={item.progress}>
+                  <span style={{ width: `${item.progress}%` }} />
+                </div>
+              )}
+              {item.error_message && <p className="inline-error">{item.error_message}</p>}
+              <p>
+                {item.metadata.broad_motion_prompt ?? 'Extracting broad body movement locally.'}
+              </p>
+              <small className="motion-policy">
+                No face, audio, identity, or branding transfer
+              </small>
+              <footer>
+                <Button variant="ghost" onClick={() => setEditing(item)}>
+                  <Edit3 /> Edit & re-extract
+                </Button>
+                <button
+                  className="icon-button danger"
+                  aria-label={`Delete ${item.name}`}
+                  onClick={async () => {
+                    if (!window.confirm(`Delete ${item.name}?`)) return;
+                    await api.delete(`/motion-assets/${item.id}`);
+                    await refresh();
+                    notify('Motion reference deleted');
+                  }}
+                >
+                  <Trash2 />
+                </button>
+              </footer>
+            </Panel>
+          ))}
+        </div>
+      )}
+      {editing && (
+        <div className="modal-layer">
+          <form className="modal modal--wide motion-form" onSubmit={(event) => void save(event)}>
+            <header>
+              <div>
+                <span className="eyebrow">Identity-safe local extraction</span>
+                <h2>{editing === 'new' ? 'Import motion reference' : editing.name}</h2>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                onClick={() => setEditing(null)}
+              >
+                <X />
+              </button>
+            </header>
+            {editing === 'new' && (
+              <div className="pose-drop-zone">
+                <Film />
+                <strong>{sourcePath || 'Choose or drop a video'}</strong>
+                <span>MP4, MOV, WebM, or MKV · the source stays inside Vanta storage</span>
+                <Button
+                  type="button"
+                  onClick={async () => {
+                    const path = await chooseLocalVideoFile();
+                    if (path) setSourcePath(path);
+                  }}
+                >
+                  Choose video
+                </Button>
+              </div>
+            )}
+            <div className="form-grid">
+              <label>
+                Name
+                <input name="name" required defaultValue={editing === 'new' ? '' : editing.name} />
+              </label>
+              <label>
+                Fit
+                <select
+                  name="fit_mode"
+                  defaultValue={editing === 'new' ? 'crop' : editing.fit_mode}
+                >
+                  <option value="crop">Crop to square</option>
+                  <option value="fit">Fit with letterbox</option>
+                </select>
+              </label>
+              <label>
+                Trim start (seconds)
+                <input
+                  name="start_seconds"
+                  type="number"
+                  min={0}
+                  max={120}
+                  step={0.1}
+                  required
+                  defaultValue={editing === 'new' ? 0 : editing.start_seconds}
+                />
+              </label>
+              <label>
+                Trim end (seconds)
+                <input
+                  name="end_seconds"
+                  type="number"
+                  min={0.1}
+                  max={120}
+                  step={0.1}
+                  required
+                  defaultValue={editing === 'new' ? 2 : editing.end_seconds}
+                />
+                <small>Maximum four-second selection.</small>
+              </label>
+            </div>
+            <label>
+              Temporal smoothing
+              <input
+                name="smoothing"
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                defaultValue={editing === 'new' ? 0.5 : editing.smoothing}
+              />
+            </label>
+            <label>
+              Default motion strength
+              <input
+                name="strength"
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                defaultValue={editing === 'new' ? 0.65 : editing.strength}
+              />
+            </label>
+            {editing === 'new' && (
+              <label className="checkbox-row rights-confirmation">
+                <input name="rights_confirmed" type="checkbox" required />I have the rights and
+                consent needed to use this motion reference.
+              </label>
+            )}
+            <p className="field-help">
+              Only broad pose movement is retained. Face landmarks are disabled and audio is never
+              extracted.
+            </p>
+            {formError && (
+              <p className="inline-error" role="alert">
+                {formError}
+              </p>
+            )}
+            <footer>
+              <Button type="button" variant="ghost" onClick={() => setEditing(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                disabled={working || (editing === 'new' && !sourcePath)}
+              >
+                {working
+                  ? 'Queueing…'
+                  : editing === 'new'
+                    ? 'Extract movement'
+                    : 'Save & re-extract'}
+              </Button>
+            </footer>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const presetCategories = [
   'all',
   'wardrobe',
@@ -2399,6 +2781,256 @@ function LocalGenerationImage({
     <img className="generation-image" src={url} alt={alt} />
   ) : (
     <div className="generated-study" aria-label="Loading local image" />
+  );
+}
+
+function LocalGenerationVideo({ generationId, label }: { generationId: string; label: string }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api
+      .imageUrl(generationId)
+      .then((next) => {
+        objectUrl = next;
+        if (active) setUrl(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [generationId]);
+  return url ? (
+    <video
+      className="generation-video"
+      src={url}
+      aria-label={label}
+      controls
+      playsInline
+      preload="metadata"
+    />
+  ) : (
+    <div className="generated-study" aria-label="Loading local video" />
+  );
+}
+
+function VideoWorkspace({
+  source,
+  motion,
+  videoReady,
+  refresh,
+  notify,
+  onClose,
+}: {
+  source: GenerationRecord;
+  motion: MotionAsset[];
+  videoReady: boolean;
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+  onClose: () => void;
+}) {
+  const [motionPrompt, setMotionPrompt] = useState(
+    'subtle natural breathing, a gentle shift of posture, restrained cinematic camera movement',
+  );
+  const [negativePrompt, setNegativePrompt] = useState(
+    'text, watermark, logo, identity change, face distortion, sudden camera shake',
+  );
+  const [profile, setProfile] = useState<'safe' | 'balanced' | 'quality'>('safe');
+  const [duration, setDuration] = useState<2 | 3 | 4>(2);
+  const [motionAssetId, setMotionAssetId] = useState('');
+  const [strength, setStrength] = useState(0.65);
+  const [job, setJob] = useState<GenerationJob | null>(null);
+  const [error, setError] = useState('');
+  const readyMotion = motion.filter((item) => item.status === 'ready');
+  const active = job && !['completed', 'failed', 'cancelled'].includes(job.status);
+
+  useEffect(() => {
+    if (!job || !active) return;
+    const timer = window.setInterval(() => {
+      void api.get<GenerationJob>(`/generations/${job.id}`).then(async (next) => {
+        setJob(next);
+        if (next.status === 'completed') {
+          notify('Local video saved to Gallery');
+          await refresh();
+        }
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [active, job, notify, refresh]);
+
+  const submit = async () => {
+    setError('');
+    if (!videoReady) {
+      setError('Install and verify Image-to-Video in Models & Engine first.');
+      return;
+    }
+    try {
+      const next = await api.post<GenerationJob>('/videos', {
+        source_generation_id: source.id,
+        motion_prompt: motionPrompt,
+        negative_prompt: negativePrompt,
+        profile,
+        duration_seconds: duration,
+        seed: Math.floor(Math.random() * 2_000_000_000),
+        motion_asset_id: motionAssetId || null,
+        motion_strength: strength,
+      });
+      setJob(next);
+      notify('Image-to-video queued locally');
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Local video could not start.');
+    }
+  };
+
+  return (
+    <div
+      className="inpaint-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Image-to-video workspace"
+    >
+      <div className="video-workspace">
+        <header>
+          <div>
+            <span className="eyebrow">Native local image-to-video</span>
+            <h2>Give this frame a pulse.</h2>
+            <p>Two to four seconds, rendered locally. The source image remains untouched.</p>
+          </div>
+          <Button variant="ghost" onClick={onClose}>
+            <X /> Close
+          </Button>
+        </header>
+        <div className="video-workspace__layout">
+          <section className="video-source-stage">
+            {job?.status === 'completed' && job.result_generation_id ? (
+              <LocalGenerationVideo
+                generationId={job.result_generation_id}
+                label="Completed local generated video"
+              />
+            ) : (
+              <LocalGenerationImage generationId={source.id} alt="Source still for local video" />
+            )}
+            <div className="video-source-caption">
+              <span>{job?.status === 'completed' ? 'Rendered motion' : 'First frame'}</span>
+              <strong>
+                {source.width} × {source.height}
+              </strong>
+            </div>
+          </section>
+          <aside className="video-settings">
+            <label>
+              Movement direction
+              <textarea
+                value={motionPrompt}
+                onChange={(event) => setMotionPrompt(event.target.value)}
+              />
+              <small>
+                Describe body, fabric, hair, environment, and camera movement—not a new identity.
+              </small>
+            </label>
+            <label>
+              Avoid
+              <textarea
+                value={negativePrompt}
+                onChange={(event) => setNegativePrompt(event.target.value)}
+              />
+            </label>
+            <div className="form-grid">
+              <label>
+                Quality profile
+                <select
+                  value={profile}
+                  onChange={(event) => setProfile(event.target.value as typeof profile)}
+                >
+                  <option value="safe">Safe · 512 × 768</option>
+                  <option value="balanced">Balanced · 576 × 768</option>
+                  <option value="quality">Quality · 640 × 832</option>
+                </select>
+              </label>
+              <label>
+                Duration
+                <select
+                  value={duration}
+                  onChange={(event) => setDuration(Number(event.target.value) as 2 | 3 | 4)}
+                >
+                  <option value={2}>2 seconds</option>
+                  <option value={3}>3 seconds</option>
+                  <option value={4}>4 seconds</option>
+                </select>
+              </label>
+            </div>
+            <label>
+              Reference Motion · optional
+              <select
+                value={motionAssetId}
+                onChange={(event) => setMotionAssetId(event.target.value)}
+              >
+                <option value="">Prompt direction only</option>
+                {readyMotion.map((item) => (
+                  <option value={item.id} key={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+              <small>
+                Only the saved broad movement description is applied—never the reference person’s
+                face, voice, or branding.
+              </small>
+            </label>
+            {motionAssetId && (
+              <label>
+                Motion strength <span>{strength.toFixed(2)}</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={strength}
+                  onChange={(event) => setStrength(Number(event.target.value))}
+                />
+              </label>
+            )}
+            {job && (
+              <div className="inpaint-progress" role="status" aria-live="polite">
+                <strong>{stateLabels[job.status] ?? job.status}</strong>
+                <div className="progress">
+                  <span style={{ width: `${job.progress}%` }} />
+                </div>
+                <small>
+                  {job.current_step && job.total_steps
+                    ? `Step ${job.current_step} / ${job.total_steps}`
+                    : `${job.progress}%`}
+                  {job.eta_seconds ? ` · about ${job.eta_seconds}s remaining` : ''}
+                </small>
+              </div>
+            )}
+            {error && (
+              <p className="inline-error" role="alert">
+                {error}
+              </p>
+            )}
+            <Button
+              variant="primary"
+              disabled={!motionPrompt.trim() || job?.status === 'completed'}
+              onClick={() =>
+                void (active && job ? api.post(`/generations/${job.id}/cancel`) : submit())
+              }
+            >
+              {active ? (
+                <>
+                  <X /> Cancel render
+                </>
+              ) : (
+                <>
+                  <Play /> {job?.status === 'completed' ? 'Saved to Gallery' : 'Render local video'}
+                </>
+              )}
+            </Button>
+          </aside>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2794,6 +3426,8 @@ function InpaintWorkspace({
 
 function GalleryScreen({
   items,
+  motion,
+  videoReady,
   editingReady,
   notify,
   refresh,
@@ -2802,6 +3436,8 @@ function GalleryScreen({
   onUpscale,
 }: {
   items: GenerationRecord[];
+  motion: MotionAsset[];
+  videoReady: boolean;
   editingReady: boolean;
   notify: (message: string) => void;
   refresh: () => Promise<void>;
@@ -2812,6 +3448,7 @@ function GalleryScreen({
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState<GenerationRecord | null>(null);
   const [inpaintSource, setInpaintSource] = useState<GenerationRecord | null>(null);
+  const [videoSource, setVideoSource] = useState<GenerationRecord | null>(null);
   const filtered = filter === 'all' ? items : items.filter((item) => item.model_alias === filter);
   return (
     <div className="screen gallery-screen">
@@ -2821,6 +3458,16 @@ function GalleryScreen({
           refresh={refresh}
           notify={notify}
           onClose={() => setInpaintSource(null)}
+        />
+      )}
+      {videoSource && (
+        <VideoWorkspace
+          source={videoSource}
+          motion={motion}
+          videoReady={videoReady}
+          refresh={refresh}
+          notify={notify}
+          onClose={() => setVideoSource(null)}
         />
       )}
       <PageTitle
@@ -2836,6 +3483,8 @@ function GalleryScreen({
               onChange={(event) => setFilter(event.target.value)}
             >
               <option value="all">All generations</option>
+              <option value="photoreal_max">Realistic — Maximum</option>
+              <option value="video_ltx_2b">Local video — LTXV</option>
               <option value="photoreal_balanced">Realistic — Balanced</option>
               <option value="preview_fast">Preview — Fast</option>
             </select>
@@ -2862,7 +3511,8 @@ function GalleryScreen({
                   thumbnail
                 />
                 <span className="disclosure">
-                  <Sparkles /> AI-created
+                  {item.media_type === 'video' ? <Film /> : <Sparkles />} AI-created{' '}
+                  {item.media_type}
                 </span>
                 <span className="tile-seed">#{item.seed}</span>
               </div>
@@ -2870,6 +3520,9 @@ function GalleryScreen({
                 <strong>{item.metadata.recipe ?? 'Local generation'}</strong>
                 <span>
                   {item.width} × {item.height} · {item.model_alias}
+                  {item.media_type === 'video' && item.metadata.duration_seconds
+                    ? ` · ${item.metadata.duration_seconds}s`
+                    : ''}
                 </span>
               </div>
             </button>
@@ -2884,11 +3537,19 @@ function GalleryScreen({
         {selected && (
           <div className="metadata-drawer">
             <div className="drawer-preview generated-study">
-              <LocalGenerationImage generationId={selected.id} alt="Selected generated image" />
+              {selected.media_type === 'video' ? (
+                <LocalGenerationVideo generationId={selected.id} label="Selected generated video" />
+              ) : (
+                <LocalGenerationImage generationId={selected.id} alt="Selected generated image" />
+              )}
             </div>
             <div className="metadata-section">
               <span className="eyebrow">Reproducible metadata</span>
               <dl>
+                <div>
+                  <dt>Media</dt>
+                  <dd>{selected.media_type === 'video' ? 'Generated video' : 'Generated image'}</dd>
+                </div>
                 <div>
                   <dt>Model profile</dt>
                   <dd>{selected.model_alias}</dd>
@@ -2951,6 +3612,21 @@ function GalleryScreen({
                     </dd>
                   </div>
                 )}
+                {selected.media_type === 'video' && (
+                  <div>
+                    <dt>Playback</dt>
+                    <dd>
+                      {selected.metadata.duration_seconds}s · {selected.metadata.fps} fps ·{' '}
+                      {selected.metadata.frame_count} frames
+                    </dd>
+                  </div>
+                )}
+                {selected.metadata.motion_reference && (
+                  <div>
+                    <dt>Reference Motion</dt>
+                    <dd>{selected.metadata.motion_reference.name} · broad movement only</dd>
+                  </div>
+                )}
                 <div>
                   <dt>Disclosure</dt>
                   <dd>
@@ -2971,44 +3647,58 @@ function GalleryScreen({
                 <small>SHA-256 {selected.metadata.inpaint.mask_sha256}</small>
               </div>
             )}
-            <Button
-              variant="primary"
-              onClick={async () => {
-                const draft = await api.get<Record<string, unknown>>(
-                  `/generations/${selected.id}/similar`,
-                );
-                onGenerateSimilar(draft);
-                notify('Original settings restored in Create');
-              }}
-            >
-              <Copy /> Generate similar
-            </Button>
-            <Button variant="ghost" onClick={() => onCreateVariation(selected)}>
-              <Sparkles /> Create variation
-            </Button>
-            <Button
-              variant="ghost"
-              disabled={!editingReady}
-              title={
-                editingReady
-                  ? 'Paint a local edit mask'
-                  : 'Start and verify Image Editing in Models & Engine first'
-              }
-              onClick={() => {
-                setInpaintSource(selected);
-                setSelected(null);
-              }}
-            >
-              <Paintbrush /> Inpaint selected region
-            </Button>
-            <Button
-              variant="ghost"
-              onClick={() => {
-                void onUpscale(selected);
-              }}
-            >
-              <Sparkles /> Upscale 2×
-            </Button>
+            {selected.media_type === 'image' && (
+              <>
+                <Button
+                  variant="primary"
+                  onClick={async () => {
+                    const draft = await api.get<Record<string, unknown>>(
+                      `/generations/${selected.id}/similar`,
+                    );
+                    onGenerateSimilar(draft);
+                    notify('Original settings restored in Create');
+                  }}
+                >
+                  <Copy /> Generate similar
+                </Button>
+                <Button
+                  variant="ghost"
+                  disabled={!videoReady}
+                  title={
+                    videoReady
+                      ? 'Animate this image locally'
+                      : 'Install Image-to-Video in Models & Engine first'
+                  }
+                  onClick={() => {
+                    setVideoSource(selected);
+                    setSelected(null);
+                  }}
+                >
+                  <Film /> Animate image
+                </Button>
+                <Button variant="ghost" onClick={() => onCreateVariation(selected)}>
+                  <Sparkles /> Create variation
+                </Button>
+                <Button
+                  variant="ghost"
+                  disabled={!editingReady}
+                  title={
+                    editingReady
+                      ? 'Paint a local edit mask'
+                      : 'Start and verify Image Editing in Models & Engine first'
+                  }
+                  onClick={() => {
+                    setInpaintSource(selected);
+                    setSelected(null);
+                  }}
+                >
+                  <Paintbrush /> Inpaint selected region
+                </Button>
+                <Button variant="ghost" onClick={() => void onUpscale(selected)}>
+                  <Sparkles /> Upscale 2×
+                </Button>
+              </>
+            )}
             <Button
               variant="ghost"
               onClick={async () => {

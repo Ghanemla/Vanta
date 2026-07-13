@@ -13,6 +13,7 @@ import uuid
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -30,6 +31,17 @@ from .comfy_runtime import (
 )
 from .config import Settings
 from .database import Database, utc_now
+from .video import (
+    VIDEO_FFMPEG_BYTES,
+    VIDEO_FFMPEG_FILENAME,
+    VIDEO_FFMPEG_SHA256,
+    VIDEO_MODEL_ALIAS,
+    VIDEO_MODEL_FILENAME,
+    VIDEO_PROFILES,
+    VIDEO_TEXT_ENCODER_FILENAME,
+    LtxVideoWorkflowCompiler,
+    encode_mp4,
+)
 
 logger = logging.getLogger("vanta.orchestrator.engine")
 
@@ -614,6 +626,7 @@ class EngineService:
         self._sync_pose_component()
         self._sync_identity_component()
         self._sync_image_finishing_component()
+        self._sync_video_components()
 
     def close(self) -> None:
         self.runtime.stop()
@@ -624,7 +637,14 @@ class EngineService:
             state = (
                 "not_installed"
                 if component.id
-                in {"workflow-runtime", "pose-control", "identity-lock", "image-finishing"}
+                in {
+                    "workflow-runtime",
+                    "pose-control",
+                    "identity-lock",
+                    "image-finishing",
+                    "video-generation",
+                    "reference-motion",
+                }
                 else "unsupported"
             )
             message = (
@@ -636,6 +656,10 @@ class EngineService:
                 if component.id == "identity-lock"
                 else "Install the managed Image Workflow Engine to enable local editing"
                 if component.id == "image-finishing"
+                else "Install and verify the optional LTX-Video model pack"
+                if component.id == "video-generation"
+                else "Install Pose Control and Image-to-Video to extract broad motion"
+                if component.id == "reference-motion"
                 else "Coming later; this capability is not included in the current image release"
             )
             self.db.execute(
@@ -697,6 +721,7 @@ class EngineService:
         self._sync_pose_component()
         self._sync_identity_component()
         self._sync_image_finishing_component()
+        self._sync_video_components()
         manifests = {item.id: item for item in self.core.components}
         return [
             {
@@ -758,6 +783,30 @@ class EngineService:
             else:
                 raise ValueError("Use Install, Verify, Repair, Start, or Stop for Image Editing")
             return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
+        if item_id in {"video-generation", "reference-motion"}:
+            pack = self._pack_row(VIDEO_MODEL_ALIAS)
+            if action in {"install", "repair"} and not (pack["installed"] and pack["verified"]):
+                self.pack_action(pack["id"], action)
+                self.db.execute(
+                    "UPDATE engine_components SET state='installing', progress=1, last_health_message=?, updated_at=? WHERE id=?",
+                    (
+                        "Downloading and verifying the optional local LTX-Video model pack",
+                        utc_now(),
+                        item_id,
+                    ),
+                )
+            elif action in {"install", "repair", "health_check", "start"}:
+                self._verify_video_components()
+            elif action == "stop":
+                self.runtime.stop()
+                self._sync_video_components()
+            elif action == "remove":
+                raise ValueError(
+                    "Remove the optional LTX-Video model pack; shared local runtime nodes remain installed"
+                )
+            else:
+                raise ValueError("Use Install, Verify, Repair, Start, or Stop for local video")
+            return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
         if item_id != "workflow-runtime":
             raise ValueError(
                 "This capability is coming later and is not available in the image release"
@@ -784,6 +833,81 @@ class EngineService:
 
     def _identity_manifest(self) -> ComponentManifest:
         return next(item for item in self.core.components if item.id == "identity-lock")
+
+    @staticmethod
+    def _video_required_nodes() -> set[str]:
+        return {
+            "CheckpointLoaderSimple",
+            "CLIPLoader",
+            "CLIPTextEncode",
+            "LTXVConditioning",
+            "LTXVImgToVideo",
+            "ManualSigmas",
+            "SamplerCustomAdvanced",
+            "VAEDecode",
+            "SaveImage",
+        }
+
+    def _sync_video_components(self) -> None:
+        snapshot = self.runtime.snapshot()
+        video_state = "not_installed"
+        video_message = "Install and verify the optional LTX-Video model pack"
+        if snapshot.state == "ready":
+            try:
+                import imageio_ffmpeg
+
+                nodes = self.runtime._request_json("/object_info")
+                missing = self._video_required_nodes().difference(nodes)
+                pack = self._pack_row(VIDEO_MODEL_ALIAS)
+                encoder_path = Path(imageio_ffmpeg.get_ffmpeg_exe())
+                encoder_ready = (
+                    encoder_path.name == VIDEO_FFMPEG_FILENAME
+                    and encoder_path.is_file()
+                    and encoder_path.stat().st_size == VIDEO_FFMPEG_BYTES
+                    and sha256_file(encoder_path) == VIDEO_FFMPEG_SHA256
+                )
+                if missing:
+                    video_state = "repair_needed"
+                    video_message = f"Video runtime is missing: {', '.join(sorted(missing))}"
+                elif not encoder_ready:
+                    video_state = "repair_needed"
+                    video_message = "The managed local MP4 encoder is unavailable"
+                elif pack["installed"] and pack["verified"]:
+                    video_state = "ready"
+                    video_message = "Native LTXV sampling and local MP4 encoding are verified"
+            except Exception:
+                video_state = "repair_needed"
+                video_message = "Video runtime verification did not complete; use Verify or Repair"
+        self.db.execute(
+            "UPDATE engine_components SET state=?, progress=?, last_health_message=?, updated_at=? WHERE id='video-generation'",
+            (video_state, 100 if video_state == "ready" else 0, video_message, utc_now()),
+        )
+        pose = self.db.query_one("SELECT state FROM engine_components WHERE id='pose-control'")
+        motion_state = (
+            "ready"
+            if video_state == "ready" and pose and pose["state"] == "ready"
+            else "not_installed"
+        )
+        motion_message = (
+            "Broad-motion trim, DWPose extraction, smoothing, and preview are available"
+            if motion_state == "ready"
+            else "Verify Pose Control and Image-to-Video to enable Reference Motion"
+        )
+        self.db.execute(
+            "UPDATE engine_components SET state=?, progress=?, last_health_message=?, updated_at=? WHERE id='reference-motion'",
+            (motion_state, 100 if motion_state == "ready" else 0, motion_message, utc_now()),
+        )
+
+    def _verify_video_components(self) -> None:
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=45):
+            raise ValueError("Start the Local Generation Engine before verifying local video")
+        nodes = self.runtime._request_json("/object_info")
+        missing = self._video_required_nodes().difference(nodes)
+        if missing:
+            raise ValueError(f"The local video runtime is missing: {', '.join(sorted(missing))}")
+        self.verify_video_pack()
+        self._sync_video_components()
 
     def _sync_image_finishing_component(self) -> None:
         snapshot = self.runtime.snapshot()
@@ -1018,19 +1142,33 @@ class EngineService:
         existing = destination.stat().st_size if destination.exists() else 0
         if existing == expected_size and sha256_file(destination) == expected_hash:
             return destination
-        request = Request(url, headers={"User-Agent": "Vanta/0.1", "Range": f"bytes={existing}-"})
-        try:
-            with urlopen(request, timeout=45) as response:
-                resumed = existing > 0 and response.status == 206
-                written = existing if resumed else 0
-                with destination.open("ab" if resumed else "wb") as target:
-                    while chunk := response.read(1024 * 1024):
-                        target.write(chunk)
-                        written += len(chunk)
-                        if progress:
-                            progress(min(95, round(100 * written / expected_size)))
-        except URLError as error:
-            raise RuntimeError("Vanta could not download the reviewed component") from error
+        if existing >= expected_size:
+            destination.unlink(missing_ok=True)
+        last_error: URLError | None = None
+        for attempt in range(4):
+            existing = destination.stat().st_size if destination.exists() else 0
+            headers = {"User-Agent": "Vanta/0.1"}
+            if existing:
+                headers["Range"] = f"bytes={existing}-"
+            request = Request(url, headers=headers)
+            try:
+                with urlopen(request, timeout=45) as response:
+                    resumed = existing > 0 and response.status == 206
+                    written = existing if resumed else 0
+                    with destination.open("ab" if resumed else "wb") as target:
+                        while chunk := response.read(1024 * 1024):
+                            target.write(chunk)
+                            written += len(chunk)
+                            if progress:
+                                progress(min(95, round(100 * written / expected_size)))
+                last_error = None
+                break
+            except URLError as error:
+                last_error = error
+                if attempt < 3:
+                    time.sleep(2**attempt)
+        if last_error is not None:
+            raise RuntimeError("Vanta could not download the reviewed component") from last_error
         if destination.stat().st_size != expected_size or sha256_file(destination) != expected_hash:
             destination.unlink(missing_ok=True)
             raise RuntimeError("The managed component download failed verification")
@@ -1613,6 +1751,113 @@ class EngineService:
                 (utc_now(), item_id),
             )
 
+    def _install_video_pack(self, item_id: str) -> None:
+        try:
+            row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
+            if row is None:
+                raise KeyError(item_id)
+            metadata = json.loads(row["metadata"])
+            download = metadata["download"]
+            encoder = download["text_encoder"]
+            model_path = self.settings.model_root / VIDEO_MODEL_FILENAME
+            encoder_path = self.settings.text_encoder_root / VIDEO_TEXT_ENCODER_FILENAME
+            self._download_verified(
+                str(download["url"]),
+                model_path,
+                int(download["bytes"]),
+                str(metadata["sha256"]),
+                lambda value: self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
+                    (min(48, round(value * 0.48)), utc_now(), item_id),
+                ),
+            )
+            self._download_verified(
+                str(encoder["url"]),
+                encoder_path,
+                int(encoder["bytes"]),
+                str(encoder["sha256"]),
+                lambda value: self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
+                    (min(96, 48 + round(value * 0.48)), utc_now(), item_id),
+                ),
+            )
+            self.db.execute(
+                """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
+                installed_path=?, original_path=?, file_size=?, license_notes=?, imported_at=?, updated_at=? WHERE id=?""",
+                (
+                    str(model_path),
+                    str(download["url"]),
+                    model_path.stat().st_size + encoder_path.stat().st_size,
+                    metadata["license"]["name"],
+                    utc_now(),
+                    utc_now(),
+                    item_id,
+                ),
+            )
+            self.verify_video_pack()
+        except Exception:
+            logger.exception("managed video model installation failed")
+            self.db.execute(
+                "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
+                (utc_now(), item_id),
+            )
+
+    def verify_video_pack(self) -> dict[str, Any]:
+        manifest = next(
+            item for item in self.pack_collection.packs if item.alias == VIDEO_MODEL_ALIAS
+        )
+        metadata = json.loads(manifest.model_dump_json())
+        download = metadata["download"]
+        encoder = download["text_encoder"]
+        model_path = self.settings.model_root / VIDEO_MODEL_FILENAME
+        encoder_path = self.settings.text_encoder_root / VIDEO_TEXT_ENCODER_FILENAME
+        checks = (
+            (model_path, int(download["bytes"]), str(metadata["sha256"])),
+            (encoder_path, int(encoder["bytes"]), str(encoder["sha256"])),
+        )
+        for path, expected_size, expected_hash in checks:
+            if not path.is_file() or path.stat().st_size != expected_size:
+                raise ValueError(f"{path.name} is missing or incomplete; use Repair")
+            if sha256_file(path) != expected_hash:
+                raise ValueError(f"{path.name} failed hash verification; use Repair")
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=45):
+            raise ValueError("Start the Local Generation Engine before verifying local video")
+        nodes = self.runtime._request_json("/object_info")
+        missing = self._video_required_nodes().difference(nodes)
+        if missing:
+            raise ValueError(f"The local video runtime is missing: {', '.join(sorted(missing))}")
+        checkpoint_names = (
+            nodes.get("CheckpointLoaderSimple", {})
+            .get("input", {})
+            .get("required", {})
+            .get("ckpt_name", [[]])[0]
+        )
+        encoder_names = (
+            nodes.get("CLIPLoader", {})
+            .get("input", {})
+            .get("required", {})
+            .get("clip_name", [[]])[0]
+        )
+        if (
+            VIDEO_MODEL_FILENAME not in checkpoint_names
+            or VIDEO_TEXT_ENCODER_FILENAME not in encoder_names
+        ):
+            raise ValueError("The Local Generation Engine cannot see the verified LTXV assets")
+        metadata.update(
+            {
+                "filename": VIDEO_MODEL_FILENAME,
+                "text_encoder_filename": VIDEO_TEXT_ENCODER_FILENAME,
+                "text_encoder_sha256": encoder["sha256"],
+                "verification": "exact files and native runtime node registration verified",
+            }
+        )
+        self.db.execute(
+            "UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100, metadata=?, updated_at=? WHERE alias=?",
+            (json.dumps(metadata), utc_now(), VIDEO_MODEL_ALIAS),
+        )
+        return self._pack_row(VIDEO_MODEL_ALIAS)
+
     def pack_action(self, item_id: str, action: str) -> dict[str, Any]:
         if action not in self.allowed_pack_actions:
             raise ValueError("Unsupported model-pack action")
@@ -1645,11 +1890,26 @@ class EngineService:
                 self._pack_threads[item_id] = thread
                 thread.start()
             return self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,)) or {}
+        if row["alias"] == VIDEO_MODEL_ALIAS and action in {"install", "repair"}:
+            thread = self._pack_threads.get(item_id)
+            if thread is None or not thread.is_alive():
+                self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
+                    (utc_now(), item_id),
+                )
+                thread = threading.Thread(
+                    target=self._install_video_pack, args=(item_id,), daemon=True
+                )
+                self._pack_threads[item_id] = thread
+                thread.start()
+            return self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,)) or {}
         if action in {"verify", "repair"}:
             if row["alias"] == POSE_PACK_ALIAS:
                 return self.verify_pose_pack()
             if row["alias"] == IDENTITY_PACK_ALIAS:
                 return self.verify_identity_adapter()
+            if row["alias"] == VIDEO_MODEL_ALIAS:
+                return self.verify_video_pack()
             if row["alias"] in {"realesrgan_x2plus", "ultrasharp_x4"}:
                 return self.verify_upscaler(row["alias"])
             return self.verify_model(row["alias"])
@@ -1661,6 +1921,10 @@ class EngineService:
             Path(row.get("installed_path") or "").unlink(missing_ok=True)
             if row["alias"] == IDENTITY_PACK_ALIAS:
                 (self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME).unlink(missing_ok=True)
+            if row["alias"] == VIDEO_MODEL_ALIAS:
+                (self.settings.text_encoder_root / VIDEO_TEXT_ENCODER_FILENAME).unlink(
+                    missing_ok=True
+                )
             self.db.execute(
                 "UPDATE model_packs SET state='not_installed', installed=0, verified=0, progress=0, installed_path=NULL, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
@@ -1728,7 +1992,7 @@ class GenerationService:
 
     def recover(self) -> None:
         self.db.execute(
-            "UPDATE generation_jobs SET status='failed', error_message='Vanta closed before this generation finished', updated_at=? WHERE status IN ('checking_engine', 'preparing', 'loading_model', 'generating', 'decoding', 'saving', 'cancelling')",
+            "UPDATE generation_jobs SET status='failed', error_message='Vanta closed before this generation finished', updated_at=? WHERE status IN ('checking_engine', 'preparing', 'loading_model', 'generating', 'decoding', 'encoding', 'saving', 'cancelling')",
             (utc_now(),),
         )
         if self.db.query_one("SELECT id FROM generation_jobs WHERE status='queued' LIMIT 1"):
@@ -1793,6 +2057,9 @@ class GenerationService:
             self.engine.runtime.start()
             if not self.engine.runtime.wait_healthy(timeout=45):
                 raise RuntimeError("The Local Generation Engine is not ready")
+            if request.get("operation") == "video":
+                self._run_video(job_id, request, started)
+                return
             if request.get("operation") == "upscale":
                 self._run_upscale(job_id, request, started)
                 return
@@ -1849,6 +2116,8 @@ class GenerationService:
                 )
 
             def progress(value: int, maximum: int) -> None:
+                if self.get(job_id)["status"] == "cancelling":
+                    return
                 percentage = min(88, 20 + round(68 * value / maximum))
                 self._update(
                     job_id,
@@ -1859,6 +2128,8 @@ class GenerationService:
                 )
 
             prompt_id, history = self.engine.runtime.submit(workflow, progress)
+            if self.get(job_id)["status"] == "cancelling":
+                raise RuntimeError("Generation cancelled")
             self._update(job_id, "decoding", 90, prompt_id=prompt_id)
             output_node = "8" if model_family == "FLUX" else "7"
             output = history.get("outputs", {}).get(output_node, {}).get("images", [])
@@ -1964,6 +2235,143 @@ class GenerationService:
                     job_id, "failed", current["progress"], str(error), completed_at=utc_now()
                 )
 
+    def _run_video(self, job_id: str, request: dict[str, Any], started: float) -> None:
+        source_id = str(request.get("source_generation_id") or "")
+        source = self.db.query_one(
+            "SELECT * FROM generations WHERE id=? AND media_type='image'", (source_id,)
+        )
+        if source is None or not Path(source["image_path"]).is_file():
+            raise ValueError("Choose an available Gallery image as the first video frame")
+        pack = self.engine.model_for_alias(VIDEO_MODEL_ALIAS)
+        pack_metadata = json.loads(pack["metadata"])
+        profile = VIDEO_PROFILES[request["profile"]]
+        motion_reference: dict[str, Any] | None = None
+        motion_prompt = str(request["motion_prompt"]).strip()
+        if request.get("motion_asset_id"):
+            motion = self.db.query_one(
+                "SELECT * FROM motion_assets WHERE id=?", (request["motion_asset_id"],)
+            )
+            if motion is None or motion["status"] != "ready":
+                raise ValueError("The selected Reference Motion asset is not ready")
+            motion_metadata = json.loads(motion["metadata"])
+            broad_prompt = str(motion_metadata.get("broad_motion_prompt") or "").strip()
+            if broad_prompt:
+                motion_prompt = f"{motion_prompt} {broad_prompt}"
+            motion_reference = {
+                "id": motion["id"],
+                "name": motion["name"],
+                "trim": [motion["start_seconds"], motion["end_seconds"]],
+                "fit_mode": motion["fit_mode"],
+                "smoothing": motion["smoothing"],
+                "strength": request["motion_strength"],
+                "broad_motion_prompt": broad_prompt,
+                "identity_transfer": False,
+                "audio_transfer": False,
+                "branding_transfer": False,
+            }
+        request = {**request, "motion_prompt": motion_prompt}
+        layout = self.engine.runtime.installed_layout()
+        if layout is None:
+            raise RuntimeError("The Local Generation Engine is not installed")
+        input_dir = layout[0].parent / "input" / "Vanta"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        source_name = f"{job_id}-video-source.png"
+        with Image.open(source["image_path"]) as image:
+            image.convert("RGB").save(input_dir / source_name, "PNG")
+        self._update(job_id, "preparing", 12)
+        workflow = LtxVideoWorkflowCompiler().compile(request, f"Vanta/{source_name}")
+
+        def progress(value: int, maximum: int) -> None:
+            if self.get(job_id)["status"] == "cancelling":
+                return
+            percentage = min(88, 18 + round(70 * value / max(maximum, 1)))
+            self._update(
+                job_id,
+                "generating",
+                percentage,
+                current_step=value,
+                total_steps=maximum,
+            )
+
+        prompt_id, history = self.engine.runtime.submit(workflow, progress)
+        if self.get(job_id)["status"] == "cancelling":
+            raise RuntimeError("Generation cancelled")
+        self._update(job_id, "encoding", 90, prompt_id=prompt_id)
+        outputs = history.get("outputs", {}).get("15", {}).get("images", [])
+        frame_paths = [
+            self.engine.runtime.root / "output" / item.get("subfolder", "") / item["filename"]
+            for item in outputs
+        ]
+        if not frame_paths or not all(path.is_file() for path in frame_paths):
+            raise RuntimeError("The local video workflow completed without all output frames")
+        generation_id = f"generation-{uuid.uuid4().hex}"
+        destination = self.engine.settings.media_root / f"{generation_id}.mp4"
+        thumbnail = self.engine.settings.media_root / f"{generation_id}.thumb.jpg"
+        encode_mp4(frame_paths, destination, profile["fps"])
+        with Image.open(frame_paths[0]) as first:
+            first.thumbnail((480, 480))
+            first.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
+        if self.get(job_id)["status"] == "cancelling":
+            destination.unlink(missing_ok=True)
+            thumbnail.unlink(missing_ok=True)
+            raise RuntimeError("Generation cancelled")
+        duration = request["duration_seconds"]
+        metadata = {
+            "workflow_version": (
+                "video-ltxv-reference-motion-v1"
+                if motion_reference
+                else LtxVideoWorkflowCompiler.version
+            ),
+            "operation": "video",
+            "media_type": "video",
+            "derivative_of": source_id,
+            "source_generation_id": source_id,
+            "motion_prompt": motion_prompt,
+            "negative_prompt": request.get("negative_prompt", ""),
+            "model_filename": VIDEO_MODEL_FILENAME,
+            "model_sha256": pack_metadata.get("sha256"),
+            "text_encoder_filename": VIDEO_TEXT_ENCODER_FILENAME,
+            "text_encoder_sha256": pack_metadata.get("text_encoder_sha256"),
+            "profile": request["profile"],
+            "steps": profile["steps"],
+            "guidance": 1.0,
+            "fps": profile["fps"],
+            "frame_count": len(frame_paths),
+            "duration_seconds": duration,
+            "motion_reference": motion_reference,
+            "ffmpeg_version": __import__("imageio_ffmpeg").get_ffmpeg_version(),
+            "ffmpeg_sha256": VIDEO_FFMPEG_SHA256,
+            "comfyui_revision": self.engine.runtime.revision,
+            "disclosure": True,
+            "duration_render_seconds": round(time.monotonic() - started, 2),
+            "request": request,
+        }
+        self.db.execute(
+            """INSERT INTO generations(id, character_id, recipe_id, image_path, thumbnail_path, prompt, negative_prompt, seed, model_alias, width, height, metadata, created_at, media_type)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'video')""",
+            (
+                generation_id,
+                source.get("character_id"),
+                str(destination),
+                str(thumbnail),
+                motion_prompt,
+                request.get("negative_prompt", ""),
+                request["seed"],
+                VIDEO_MODEL_ALIAS,
+                profile["width"],
+                profile["height"],
+                json.dumps(metadata),
+                utc_now(),
+            ),
+        )
+        self._update(
+            job_id,
+            "completed",
+            100,
+            completed_at=utc_now(),
+            result_generation_id=generation_id,
+        )
+
     def _run_upscale(self, job_id: str, request: dict[str, Any], started: float) -> None:
         source_id = str(request.get("source_generation_id") or "")
         source_row = self.db.query_one(
@@ -1995,10 +2403,14 @@ class GenerationService:
         workflow = WorkflowCompiler.upscale(f"Vanta/{source_name}", model_name)
 
         def progress(value: int, maximum: int) -> None:
+            if self.get(job_id)["status"] == "cancelling":
+                return
             percentage = min(90, 20 + round(70 * value / max(maximum, 1)))
             self._update(job_id, "generating", percentage, current_step=value, total_steps=maximum)
 
         prompt_id, history = self.engine.runtime.submit(workflow, progress)
+        if self.get(job_id)["status"] == "cancelling":
+            raise RuntimeError("Generation cancelled")
         self._update(job_id, "saving", 94, prompt_id=prompt_id)
         output = history.get("outputs", {}).get("4", {}).get("images", [])
         if not output:
@@ -2314,4 +2726,17 @@ class GenerationService:
             )
         else:
             result["queue_position"] = None
+        result["eta_seconds"] = None
+        if (
+            result.get("started_at")
+            and result.get("current_step")
+            and result.get("total_steps")
+            and 0 < result["current_step"] < result["total_steps"]
+        ):
+            elapsed = (
+                datetime.now(UTC) - datetime.fromisoformat(result["started_at"])
+            ).total_seconds()
+            result["eta_seconds"] = round(
+                elapsed * (result["total_steps"] - result["current_step"]) / result["current_step"]
+            )
         return result

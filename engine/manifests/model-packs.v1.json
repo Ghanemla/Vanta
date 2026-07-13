@@ -48,6 +48,43 @@
       "active_default": false
     },
     {
+      "id": "vanta-ltxv-2b-safe-v1",
+      "alias": "video_ltx_2b",
+      "display_name": "Motion — LTXV 2B Safe",
+      "model_family": "LTX-Video 2B distilled FP8",
+      "capabilities": ["Image-to-Video", "2–4 Second Clips", "12 GB Safe Offload"],
+      "hardware": { "minimum_vram_gb": 8, "recommended_vram_gb": 12, "minimum_ram_gb": 32 },
+      "disk_gb": 9.4,
+      "download": {
+        "source_name": "Lightricks LTX-Video official model repository",
+        "url": "https://huggingface.co/Lightricks/LTX-Video/resolve/17037c8743450dc873046790dd96fa805ccfaf8d/ltxv-2b-0.9.8-distilled-fp8.safetensors?download=true",
+        "bytes": 4461695684,
+        "authentication": "none",
+        "source_revision": "17037c8743450dc873046790dd96fa805ccfaf8d",
+        "text_encoder": {
+          "filename": "t5xxl_fp8_e4m3fn.safetensors",
+          "source_name": "ComfyUI official author text-encoder repository",
+          "url": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/2f74b39c0606dae3b2196d79c18c2a40b71f3250/t5xxl_fp8_e4m3fn.safetensors?download=true",
+          "bytes": 4893934904,
+          "sha256": "7d330da4816157540d6bb7838bf63a0f02f573fc48ca4d8de34bb0cbfd514f09",
+          "source_revision": "2f74b39c0606dae3b2196d79c18c2a40b71f3250",
+          "license": {
+            "name": "Apache-2.0",
+            "source_url": "https://huggingface.co/comfyanonymous/flux_text_encoders"
+          }
+        }
+      },
+      "license": {
+        "name": "LTX-Video OpenRail-M and T5 source license review required",
+        "acceptance_required": true,
+        "source_url": "https://huggingface.co/Lightricks/LTX-Video"
+      },
+      "sha256": "d6d8fa8ed3a98346787c2503ac80fb5d7cebcf80e356b79a2ba361fbadf97e15",
+      "target_path": "models/checkpoints/ltxv-2b-0.9.8-distilled-fp8.safetensors",
+      "compatible_workflows": ["video-ltxv-i2v-v1", "video-ltxv-reference-motion-v1"],
+      "active_default": false
+    },
+    {
       "id": "vanta-sdxl-preview-v1",
       "alias": "preview_fast",
       "display_name": "Preview — Fast",

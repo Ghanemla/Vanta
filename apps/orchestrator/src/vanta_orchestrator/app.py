@@ -32,6 +32,8 @@ from .schemas import (
     IdentityAdapterImportInput,
     LoraImportInput,
     ModelImportInput,
+    MotionImportInput,
+    MotionUpdateInput,
     PoseImportInput,
     PoseUpdateInput,
     PresetInput,
@@ -40,7 +42,9 @@ from .schemas import (
     ReferenceUpdateInput,
     SettingInput,
     UpscalerImportInput,
+    VideoGenerationInput,
 )
+from .video import MotionService
 
 AUTH_HEADER = "X-Vanta-Token"
 ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
@@ -115,7 +119,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = EngineService(db, settings)
     generation_jobs = GenerationService(db, engine)
     poses = PoseService(db, settings, engine)
+    motion = MotionService(db, settings, engine)
     generation_jobs.recover()
+    motion.recover()
 
     app = FastAPI(title="Vanta Local Orchestrator", version="0.1.0", docs_url="/api/docs")
     # Starlette applies the most recently added middleware first. CORS must be
@@ -391,6 +397,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["metadata"] = json.loads(row["metadata"])
         return rows
 
+    @app.get("/api/motion-assets")
+    def list_motion_assets() -> list[dict]:
+        return motion.list()
+
+    @app.post("/api/motion-assets", status_code=201)
+    def import_motion_asset(payload: MotionImportInput) -> dict:
+        try:
+            return motion.import_video(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.put("/api/motion-assets/{asset_id}")
+    def update_motion_asset(asset_id: str, payload: MotionUpdateInput) -> dict:
+        try:
+            return motion.update(asset_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.delete("/api/motion-assets/{asset_id}", status_code=204)
+    def delete_motion_asset(asset_id: str) -> None:
+        try:
+            motion.remove(asset_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/motion-assets/{asset_id}/{variant}")
+    def motion_asset_media(asset_id: str, variant: str) -> FileResponse:
+        field = {
+            "source": "source_path",
+            "preview": "preview_path",
+            "thumbnail": "thumbnail_path",
+        }.get(variant)
+        if field is None:
+            raise HTTPException(status_code=404, detail="Motion media variant was not found")
+        try:
+            item = motion.get(asset_id)
+        except KeyError as error:
+            raise missing(error) from error
+        path = Path(item.get(field) or "")
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Motion media is not ready")
+        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "video/mp4")
+
+    @app.post("/api/videos", status_code=202)
+    def create_video(payload: VideoGenerationInput) -> dict:
+        request = {
+            **payload.model_dump(),
+            "operation": "video",
+            "model_alias": "video_ltx_2b",
+        }
+        return generation_jobs.queue(request)
+
     @app.post("/api/generations", status_code=202)
     def create_generation(payload: GenerationInput) -> dict:
         try:
@@ -464,10 +524,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/generations/{generation_id}/repair-media")
     def repair_generation_media(generation_id: str) -> dict:
         row = db.query_one(
-            "SELECT image_path, thumbnail_path FROM generations WHERE id=?", (generation_id,)
+            "SELECT image_path, thumbnail_path, media_type FROM generations WHERE id=?",
+            (generation_id,),
         )
         if row is None:
             raise HTTPException(status_code=404, detail="Generation was not found")
+        if row["media_type"] != "image":
+            raise HTTPException(
+                status_code=409, detail="Video thumbnails are repaired by rerunning the video job"
+            )
         image = Path(row["image_path"])
         if not image.is_file():
             candidate = settings.media_root / f"{generation_id}.png"

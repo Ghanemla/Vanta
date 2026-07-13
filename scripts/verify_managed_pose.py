@@ -14,6 +14,7 @@ from vanta_orchestrator.config import Settings
 from vanta_orchestrator.database import Database
 from vanta_orchestrator.engine import (
     IDENTITY_PACK_ALIAS,
+    VIDEO_MODEL_ALIAS,
     EngineService,
     GenerationService,
     POSE_PACK_ALIAS,
@@ -21,6 +22,8 @@ from vanta_orchestrator.engine import (
 from vanta_orchestrator.pose import PoseService
 from vanta_orchestrator.repositories import CharacterRepository, ReferenceRepository
 from vanta_orchestrator.schemas import CharacterInput, PoseImportInput
+from vanta_orchestrator.schemas import MotionImportInput
+from vanta_orchestrator.video import MotionService
 
 
 def settings_for(data_dir: Path) -> Settings:
@@ -80,6 +83,11 @@ def main() -> int:
             "variation-lighting",
             "import-flux",
             "generate-flux",
+            "video-nodes",
+            "install-video-model",
+            "generate-video",
+            "import-motion",
+            "generate-reference-video",
         ],
     )
     parser.add_argument(
@@ -91,6 +99,7 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--pose-id")
     parser.add_argument("--source-generation-id")
+    parser.add_argument("--motion-id")
     args = parser.parse_args()
 
     settings = settings_for(args.data_dir.resolve())
@@ -517,6 +526,103 @@ def main() -> int:
                         (row["result_generation_id"],),
                     ),
                 }
+        elif args.action == "video-nodes":
+            engine.runtime.start()
+            if not engine.runtime.wait_healthy(timeout=45):
+                raise RuntimeError("The managed runtime did not become healthy")
+            nodes = engine.runtime._request_json("/object_info")
+            row = {
+                name: nodes.get(name)
+                for name in (
+                    "CheckpointLoaderSimple",
+                    "CLIPLoader",
+                    "LTXVConditioning",
+                    "LTXVImgToVideo",
+                    "ManualSigmas",
+                    "SamplerCustomAdvanced",
+                )
+            }
+            success = all(row.values())
+        elif args.action == "install-video-model":
+            row = engine._pack_row(VIDEO_MODEL_ALIAS)
+            engine.pack_action(row["id"], "install")
+            row = wait_for_row(
+                db,
+                "SELECT * FROM model_packs WHERE id=?",
+                (str(row["id"]),),
+                {"installing", "verifying"},
+                args.timeout,
+            )
+            engine._sync_video_components()
+            success = row["state"] == "ready" and bool(row["verified"])
+        elif args.action in {"generate-video", "generate-reference-video"}:
+            if not args.source_generation_id:
+                parser.error(f"{args.action} requires --source-generation-id")
+            if args.action == "generate-reference-video" and not args.motion_id:
+                parser.error("generate-reference-video requires --motion-id")
+            generations = GenerationService(db, engine)
+            row = generations.queue(
+                {
+                    "operation": "video",
+                    "source_generation_id": args.source_generation_id,
+                    "motion_prompt": (
+                        "subtle natural breathing, a gentle posture shift, soft fabric movement, "
+                        "restrained cinematic camera drift, preserve the original character"
+                    ),
+                    "negative_prompt": (
+                        "text, watermark, logo, identity change, face distortion, camera shake"
+                    ),
+                    "profile": "safe",
+                    "duration_seconds": 2,
+                    "seed": 14072032 if args.action == "generate-video" else 14072033,
+                    "motion_asset_id": args.motion_id
+                    if args.action == "generate-reference-video"
+                    else None,
+                    "motion_strength": 0.65,
+                    "model_alias": VIDEO_MODEL_ALIAS,
+                }
+            )
+            deadline = time.monotonic() + args.timeout
+            while (
+                row["status"] not in {"completed", "failed", "cancelled"}
+                and time.monotonic() < deadline
+            ):
+                print(f"{row['status']} {row['progress']}%", flush=True)
+                time.sleep(1)
+                row = generations.get(row["id"])
+            success = row["status"] == "completed"
+            if success:
+                row = {
+                    "job": row,
+                    "generation": db.query_one(
+                        "SELECT * FROM generations WHERE id=?",
+                        (row["result_generation_id"],),
+                    ),
+                }
+        elif args.action == "import-motion":
+            if args.source is None:
+                parser.error("import-motion requires --source")
+            motion = MotionService(db, settings, engine)
+            row = motion.import_video(
+                MotionImportInput(
+                    name="Essential V1 broad motion evidence",
+                    source_path=str(args.source.resolve()),
+                    start_seconds=0,
+                    end_seconds=2,
+                    fit_mode="crop",
+                    smoothing=0.5,
+                    strength=0.65,
+                    rights_confirmed=True,
+                )
+            )
+            deadline = time.monotonic() + args.timeout
+            while (
+                row["status"] not in {"ready", "failed"} and time.monotonic() < deadline
+            ):
+                print(f"{row['status']} {row['progress']}%", flush=True)
+                time.sleep(1)
+                row = motion.get(row["id"])
+            success = row["status"] == "ready"
         else:
             row = {
                 "component": db.query_one(

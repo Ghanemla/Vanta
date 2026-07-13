@@ -12,6 +12,7 @@ $target = Join-Path $root 'apps\desktop\src-tauri\binaries\vanta-orchestrator-x8
 
 New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
 & $pythonPath -m PyInstaller --noconfirm --clean --onefile --noconsole --name vanta-orchestrator `
+    --collect-binaries imageio_ffmpeg `
   --paths (Join-Path $root 'apps\orchestrator\src') `
   --add-data "$(Join-Path $root 'apps\orchestrator\migrations');migrations" `
   --add-data "$(Join-Path $root 'data\starter_presets.json');data" `

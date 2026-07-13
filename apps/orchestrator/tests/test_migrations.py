@@ -25,6 +25,7 @@ def test_migrations_create_all_required_tables(client):
         "lora_packs",
         "character_loras",
         "pose_assets",
+        "motion_assets",
         "schema_migrations",
     }
     assert required.issubset(tables)
@@ -40,4 +41,10 @@ def test_migrations_create_all_required_tables(client):
     assert {"hair", "eyes", "style_notes", "default_negative_prompt"}.issubset(character_columns)
     pose_columns = {row[1] for row in connection.execute("PRAGMA table_info(pose_assets)")}
     assert {"status", "progress", "error_message"}.issubset(pose_columns)
+    generation_columns = {row[1] for row in connection.execute("PRAGMA table_info(generations)")}
+    assert "media_type" in generation_columns
+    motion_columns = {row[1] for row in connection.execute("PRAGMA table_info(motion_assets)")}
+    assert {"preview_path", "start_seconds", "fit_mode", "smoothing", "strength"}.issubset(
+        motion_columns
+    )
     connection.close()

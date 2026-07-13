@@ -39,11 +39,10 @@ Last updated: 2026-07-13
 
 ## Current feature
 
-The separate native FLUX-family adapter is **implemented with current-code production evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is local image-to-video and reference motion.
+Local image-to-video and identity-safe Reference Motion are **implemented with current-code production evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is local LoRA training and dataset preparation.
 
 Remaining V1 work:
 
-- Local image-to-video, reference motion and video adapter.
 - Local LoRA training, dataset checks and resumable run evidence.
 - Preset/recipe mode completion and remaining Models & Engine diagnostics polish.
 - Complete verification matrix, manual acceptance update and final NSIS installer evidence.
@@ -100,6 +99,34 @@ Remaining V1 work:
 - `docs/ESSENTIAL_V1_RUNBOOK.md`
 - `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
 
+## Video and Reference Motion files changed
+
+- `apps/orchestrator/migrations/008_video_motion.sql`
+- `apps/orchestrator/src/vanta_orchestrator/video.py`
+- `apps/orchestrator/src/vanta_orchestrator/config.py`
+- `apps/orchestrator/src/vanta_orchestrator/comfy_runtime.py`
+- `apps/orchestrator/src/vanta_orchestrator/schemas.py`
+- `apps/orchestrator/src/vanta_orchestrator/engine.py`
+- `apps/orchestrator/src/vanta_orchestrator/app.py`
+- `apps/orchestrator/pyproject.toml`
+- `apps/orchestrator/tests/test_api.py`
+- `apps/orchestrator/tests/test_migrations.py`
+- `apps/orchestrator/tests/test_real_generation_domain.py`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/desktop/src/App.tsx`
+- `apps/desktop/src/App.test.tsx`
+- `apps/desktop/src/api.ts`
+- `apps/desktop/src/types.ts`
+- `apps/desktop/src/styles.css`
+- `engine/manifests/core-components.v1.json`
+- `engine/manifests/model-packs.v1.json`
+- `engine/workflows/video-ltxv-i2v-v1.json`
+- `scripts/build-orchestrator-sidecar.ps1`
+- `scripts/verify_managed_pose.py`
+- `docs/ESSENTIAL_V1_RUNBOOK.md`
+- `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
+- `docs/CAPABILITY_EVIDENCE.md`
+
 ## Tests run
 
 - Baseline Python suite: **21 passed**, 29 deprecation warnings.
@@ -132,6 +159,11 @@ Remaining V1 work:
 - Changed-file Prettier and manifest UTF-8 JSON validation: **passed**.
 - Desktop production renderer build: **passed**, 1,656 modules, 293.75 kB JS / 42.76 kB CSS before gzip.
 - Tauri `cargo check`: **passed**.
+
+- Full Python suite after video and Reference Motion integration: **32 passed**, 37 deprecation warnings.
+- Video domain coverage proves native LTXV graph shape, exact 49-frame two-second profile, distilled sigma schedule, playable managed MP4 encoding, identity-safe broad-motion description, rights enforcement, persistence migration and API job routing.
+- Desktop strict TypeScript and focused ESLint: **passed**; desktop Vitest with jsdom: **1 passed**.
+- Video-integrated renderer production build: **passed**, 1,656 modules, 309.08 kB JS / 45.66 kB CSS before gzip; Tauri `cargo check`: **passed**.
 
 ## Real evidence produced
 
@@ -170,6 +202,18 @@ Remaining V1 work:
   - Visual review accepted a coherent original editorial portrait with natural anatomy, controlled studio lighting and no visible text or watermark artifacts. Full reproducibility and AI-disclosure metadata are persisted in Gallery.
   - The Create screen exposes verified model profiles and applies FLUX-safe defaults. SDXL-only identity, pose, variation and inpainting controls are explicitly routed to Balanced instead of being compiled into an invalid FLUX graph.
 
+- Real native local image-to-video:
+  - LTX-Video 2B distilled FP8 revision `17037c8743450dc873046790dd96fa805ccfaf8d`, 4,461,695,684 bytes, SHA-256 `d6d8fa8ed3a98346787c2503ac80fb5d7cebcf80e356b79a2ba361fbadf97e15`, is installed and verified under `video_ltx_2b`.
+  - T5 XXL FP8 revision `2f74b39c0606dae3b2196d79c18c2a40b71f3250`, 4,893,934,904 bytes, SHA-256 `7d330da4816157540d6bb7838bf63a0f02f573fc48ca4d8de34bb0cbfd514f09`, is installed and registered through native `CLIPLoader` type `ltxv`.
+  - Managed MP4 encoding is pinned to imageio-ffmpeg 0.6.0 / FFmpeg 7.1, 87,638,016 bytes, SHA-256 `2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3`.
+  - Job `job-71bf2fbb460c4f4284cc6bdb290397d7`, generation `generation-c8090eca693848409d33b5e12b73372b`: source `generation-e91bd1d704bf4ebda45d4f44bf1d333d`, 512x768, 8 distilled steps, 49 frames at 24 fps, 2.04-second playable H.264 MP4, 35.34 seconds total.
+  - Three-frame visual review accepted coherent posture/camera movement, clean anatomy, stable fictional-subject appearance, and no visible text or watermark.
+- Real identity-safe Reference Motion:
+  - Owned synthetic motion asset `motion-89a989a461624f62a14b24aee54d4538` trims 0.0–2.0 seconds, crop fit, smoothing 0.5 and strength 0.65.
+  - Face-disabled DWPose produced a verified 16-frame / 2.0-second / 8 fps skeleton preview. Metadata explicitly records `face_extraction=false`, `audio_transfer=false`, and `source_branding_transfer=false`; the broad description excludes reference-person identity.
+  - Job `job-1e0be3d9d98b41acb197aaffdb57ece0`, generation `generation-ee3f72d06504438da0cff49114d903a3`: 49 frames, 2.04 seconds, 24.09-second render, workflow `video-ltxv-reference-motion-v1`.
+  - Three-frame visual review accepted a notably stable face, coat, silhouette and restrained leftward movement. Gallery metadata preserves the source image, motion asset, trim, smoothing, strength, model hashes, FFmpeg hash and AI disclosure.
+
 ## Blockers
 
 - None currently.
@@ -177,7 +221,7 @@ Remaining V1 work:
 
 ## Exact next action
 
-Commit the verified native FLUX slice, then implement and prove local image-to-video and reference motion.
+Commit the verified video and Reference Motion slice, then implement and prove local LoRA training.
 
 ## Final acceptance status
 

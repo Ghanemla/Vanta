@@ -246,6 +246,7 @@ class ManagedComfyRuntime:
             f"  base_path: {self.settings.engine_root.as_posix()}\n"
             "  checkpoints: models/checkpoints\n"
             "  loras: models/loras\n"
+            "  text_encoders: models/text_encoders\n"
             "  controlnet: models/controlnet\n"
             "  clip_vision: models/clip_vision\n"
             "  ipadapter: models/ipadapter\n"

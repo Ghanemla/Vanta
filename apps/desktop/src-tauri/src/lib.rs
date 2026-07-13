@@ -523,6 +523,14 @@ fn choose_local_image_file() -> Option<String> {
 }
 
 #[tauri::command]
+fn choose_local_video_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Motion references", &["mp4", "mov", "webm", "mkv"])
+        .pick_file()
+        .map(|path| path.display().to_string())
+}
+
+#[tauri::command]
 fn choose_local_lora_file() -> Option<String> {
     rfd::FileDialog::new()
         .add_filter("SafeTensors LoRAs", &["safetensors"])
@@ -625,6 +633,7 @@ pub fn run() {
             repair_application_runtime,
             choose_local_model_file,
             choose_local_image_file,
+            choose_local_video_file,
             choose_local_lora_file,
             choose_local_upscaler_file
         ]);

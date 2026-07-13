@@ -123,6 +123,7 @@ export interface GenerationRecord {
   character_id?: string | null;
   recipe_id?: string | null;
   image_path: string;
+  media_type: 'image' | 'video';
   prompt: string;
   negative_prompt: string;
   seed: number;
@@ -161,6 +162,22 @@ export interface GenerationRecord {
       denoise_strength: number;
       outside_mask_composite: boolean;
     } | null;
+    fps?: number;
+    frame_count?: number;
+    duration_seconds?: number;
+    motion_prompt?: string;
+    motion_reference?: {
+      id: string;
+      name: string;
+      trim: [number, number];
+      fit_mode: 'crop' | 'fit';
+      smoothing: number;
+      strength: number;
+      broad_motion_prompt: string;
+      identity_transfer: false;
+      audio_transfer: false;
+      branding_transfer: false;
+    } | null;
     pose_control?: {
       id: string;
       name: string;
@@ -181,8 +198,37 @@ export interface GenerationJob {
   current_step?: number | null;
   total_steps?: number | null;
   queue_position?: number | null;
+  eta_seconds?: number | null;
   result_generation_id?: string | null;
   created_at?: string;
+}
+export interface MotionAsset {
+  id: string;
+  name: string;
+  source_path: string;
+  preview_path: string | null;
+  thumbnail_path: string | null;
+  start_seconds: number;
+  end_seconds: number;
+  fit_mode: 'crop' | 'fit';
+  smoothing: number;
+  strength: number;
+  status: 'queued' | 'extracting' | 'encoding' | 'ready' | 'failed';
+  progress: number;
+  error_message: string | null;
+  metadata: {
+    source_duration_seconds: number;
+    rights_confirmed: boolean;
+    broad_motion_prompt?: string;
+    extracted_frames?: number;
+    sample_fps?: number;
+    face_extraction?: false;
+    audio_transfer?: false;
+    source_branding_transfer?: false;
+    transfer_policy: string;
+  };
+  created_at: string;
+  updated_at: string;
 }
 export interface SettingsRecord {
   values: Record<string, string>;

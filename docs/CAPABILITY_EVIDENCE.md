@@ -1,5 +1,17 @@
 # Capability evidence
 
+## Native local image-to-video
+
+- Pack: `Motion — LTXV 2B Safe` (`video_ltx_2b`), pinned to the LTXV 2B distilled FP8 checkpoint and separate T5 XXL FP8 encoder with exact revisions, byte sizes and SHA-256 values.
+- Workflow `video-ltxv-i2v-v1` uses native `LTXVConditioning`, `LTXVImgToVideo`, `ManualSigmas`, `SamplerCustomAdvanced` and local H.264 MP4 encoding. Normal users never see ComfyUI nodes.
+- Evidence on 2026-07-13: job `job-71bf2fbb460c4f4284cc6bdb290397d7` produced Gallery video `generation-c8090eca693848409d33b5e12b73372b`, a playable 49-frame, 24 fps, 2.04-second MP4 from the accepted local FLUX portrait in 35.34 seconds.
+
+## Identity-safe Reference Motion
+
+- Motion asset `motion-89a989a461624f62a14b24aee54d4538` was imported from Vanta's owned synthetic MP4. Local extraction sampled 16 frames at 8 fps, disabled face landmarks, applied temporal smoothing and persisted a playable pose preview.
+- The transfer policy excludes reference identity, face, voice, name, branding and watermarks. The generation graph consumes only Vanta's broad movement description; metadata records all exclusion flags.
+- Evidence on 2026-07-13: job `job-1e0be3d9d98b41acb197aaffdb57ece0` produced `generation-ee3f72d06504438da0cff49114d903a3`, a playable 49-frame, 2.04-second MP4 with workflow `video-ltxv-reference-motion-v1` and complete source/motion/model/encoder provenance.
+
 ## 2× local upscaling
 
 - Pack: `Finish — RealESRGAN 2×` (`realesrgan_x2plus`).

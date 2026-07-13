@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "workflow_id": "video-ltxv-i2v-v1",
+  "engine_adapter": "comfyui-plus-local-ffmpeg",
+  "model_alias": "video_ltx_2b",
+  "required_capabilities": ["LTXV Image Conditioning", "Native Sampling", "Local MP4 Encoding"],
+  "profiles": {
+    "safe": { "width": 512, "height": 768, "steps": 8, "fps": 24 },
+    "balanced": { "width": 576, "height": 768, "steps": 8, "fps": 24 },
+    "quality": { "width": 640, "height": 832, "steps": 8, "fps": 24 }
+  },
+  "duration_seconds": [2, 3, 4],
+  "internal_template": "Native LTXV conditioning and distilled sigma schedule with Vanta-owned MP4 persistence."
+}

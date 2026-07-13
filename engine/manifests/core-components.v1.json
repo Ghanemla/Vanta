@@ -153,6 +153,77 @@
       "repair_strategy": "reverify_and_restore",
       "dependencies": ["workflow-runtime"],
       "provided_capabilities": ["Inpainting", "Upscaling", "Image I/O"]
+    },
+    {
+      "id": "video-generation",
+      "display_name": "Image-to-Video",
+      "version": "ltxv-2b-0.9.8-fp8-native-1",
+      "pinned_revision": "17037c8743450dc873046790dd96fa805ccfaf8d",
+      "source": {
+        "type": "bundled_runtime",
+        "url": "https://github.com/Comfy-Org/ComfyUI/tree/v0.27.0",
+        "nodes": [
+          "LTXVImgToVideo",
+          "LTXVConditioning",
+          "ManualSigmas",
+          "SamplerCustomAdvanced",
+          "VAEDecode",
+          "SaveImage"
+        ],
+        "encoder": {
+          "package": "imageio-ffmpeg",
+          "version": "0.6.0",
+          "license": "BSD-2-Clause; bundled Gyan FFmpeg binary is GPLv3",
+          "binary_filename": "ffmpeg-win-x86_64-v7.1.exe",
+          "binary_version": "7.1-essentials_build-www.gyan.dev",
+          "binary_bytes": 87638016,
+          "binary_sha256": "2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3",
+          "binary_source_url": "https://www.gyan.dev/ffmpeg/builds/"
+        }
+      },
+      "license": {
+        "name": "ComfyUI GPL-3.0; imageio-ffmpeg BSD-2-Clause; bundled FFmpeg GPLv3",
+        "source_url": "https://github.com/imageio/imageio-ffmpeg/tree/v0.6.0",
+        "redistribution_reviewed": false
+      },
+      "install_strategy": "bundled_runtime",
+      "health_checks": [
+        {
+          "type": "capability_probe",
+          "target": "ltxv_i2v",
+          "description": "Native image-to-video nodes and local MP4 encoder are available"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime"],
+      "provided_capabilities": ["Image-to-Video", "MP4 Encoding", "Video Metadata"]
+    },
+    {
+      "id": "reference-motion",
+      "display_name": "Reference Motion",
+      "version": "broad-motion-1.0.0",
+      "pinned_revision": "vanta-broad-motion-001",
+      "source": {
+        "type": "bundled_runtime",
+        "url": "https://github.com/Comfy-Org/ComfyUI/tree/v0.27.0",
+        "policy": "Broad pose and movement only; identity, face, voice, names, branding, and watermarks are excluded"
+      },
+      "license": {
+        "name": "Vanta application code; imported references require user rights",
+        "source_url": null,
+        "redistribution_reviewed": true
+      },
+      "install_strategy": "bundled_runtime",
+      "health_checks": [
+        {
+          "type": "capability_probe",
+          "target": "broad_motion",
+          "description": "Local trim, fit, pose extraction, smoothing, and preview are available"
+        }
+      ],
+      "repair_strategy": "reverify_and_restore",
+      "dependencies": ["workflow-runtime", "pose-control", "video-generation"],
+      "provided_capabilities": ["Video Import", "Broad Motion Extraction", "Motion Preview"]
     }
   ]
 }

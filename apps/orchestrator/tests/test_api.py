@@ -261,3 +261,63 @@ def test_inpaint_request_persists_a_validated_mask_outside_job_json(client, tmp_
     assert "inpaint_mask_data_url" not in request
     assert request["inpaint_mask_path"].endswith(".png")
     assert Image.open(request["inpaint_mask_path"]).getbbox() is not None
+
+
+def test_motion_import_requires_explicit_rights_confirmation(client):
+    response = client.post(
+        "/api/motion-assets",
+        json={
+            "name": "Unconfirmed motion",
+            "source_path": "missing.mp4",
+            "start_seconds": 0,
+            "end_seconds": 2,
+            "fit_mode": "crop",
+            "smoothing": 0.5,
+            "strength": 0.65,
+            "rights_confirmed": False,
+        },
+    )
+    assert response.status_code == 422
+    assert "rights" in response.json()["detail"].lower()
+    assert client.get("/api/motion-assets").json() == []
+
+
+def test_video_request_is_persisted_as_a_local_generation_job(client, tmp_path):
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from PIL import Image
+
+    database_path = client.get("/api/settings").json()["paths"]["database"]
+    source = tmp_path / "video-source.png"
+    Image.new("RGB", (512, 768), "navy").save(source)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO generations
+            (id, image_path, prompt, seed, model_alias, width, height, metadata, created_at)
+            VALUES ('generation-video-source', ?, 'owned fictional character', 1,
+            'photoreal_balanced', 512, 768, '{}', ?)""",
+            (str(source), datetime.now(UTC).isoformat()),
+        )
+    response = client.post(
+        "/api/videos",
+        json={
+            "source_generation_id": "generation-video-source",
+            "motion_prompt": "subtle breathing and a gentle posture shift",
+            "profile": "safe",
+            "duration_seconds": 2,
+            "seed": 99,
+            "motion_strength": 0.65,
+        },
+    )
+    assert response.status_code == 202
+    with sqlite3.connect(database_path) as connection:
+        request = json.loads(
+            connection.execute(
+                "SELECT request_json FROM generation_jobs WHERE id=?", (response.json()["id"],)
+            ).fetchone()[0]
+        )
+    assert request["operation"] == "video"
+    assert request["model_alias"] == "video_ltx_2b"
+    assert request["duration_seconds"] == 2

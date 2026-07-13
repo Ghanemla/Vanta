@@ -97,9 +97,7 @@ class SettingInput(StrictModel):
 
 class ModelImportInput(StrictModel):
     source_path: str = Field(min_length=1, max_length=32767)
-    alias: Literal["photoreal_balanced", "preview_fast", "photoreal_max"] = (
-        "photoreal_balanced"
-    )
+    alias: Literal["photoreal_balanced", "preview_fast", "photoreal_max"] = "photoreal_balanced"
     license_notes: str = Field(default="", max_length=2000)
 
 
@@ -161,3 +159,37 @@ class GenerationInput(StrictModel):
     inpaint_mask_data_url: str | None = Field(default=None, max_length=16_000_000)
     inpaint_strength: float = Field(default=0.62, ge=0.05, le=1)
     upscale_profile: Literal["realesrgan_x2plus", "ultrasharp_x4"] | None = None
+
+
+class VideoGenerationInput(StrictModel):
+    source_generation_id: str = Field(min_length=1)
+    motion_prompt: str = Field(min_length=1, max_length=4000)
+    negative_prompt: str = Field(
+        default="text, watermark, logo, identity change, face distortion",
+        max_length=4000,
+    )
+    profile: Literal["safe", "balanced", "quality"] = "safe"
+    duration_seconds: Literal[2, 3, 4] = 2
+    seed: int = Field(ge=0, le=2**63 - 1)
+    motion_asset_id: str | None = None
+    motion_strength: float = Field(default=0.65, ge=0, le=1)
+
+
+class MotionImportInput(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    source_path: str = Field(min_length=1, max_length=32767)
+    start_seconds: float = Field(default=0, ge=0, le=120)
+    end_seconds: float = Field(gt=0, le=120)
+    fit_mode: Literal["crop", "fit"] = "crop"
+    smoothing: float = Field(default=0.5, ge=0, le=1)
+    strength: float = Field(default=0.65, ge=0, le=1)
+    rights_confirmed: bool
+
+
+class MotionUpdateInput(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    start_seconds: float = Field(ge=0, le=120)
+    end_seconds: float = Field(gt=0, le=120)
+    fit_mode: Literal["crop", "fit"]
+    smoothing: float = Field(ge=0, le=1)
+    strength: float = Field(ge=0, le=1)
