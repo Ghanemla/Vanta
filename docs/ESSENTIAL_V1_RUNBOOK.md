@@ -39,12 +39,12 @@ Last updated: 2026-07-13
 
 ## Current feature
 
-Local LoRA training and dataset preparation are **implemented with current-code production evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is preset/recipe mode completion and Models & Engine diagnostics polish.
+All Essential V1 feature slices are implemented. The active work is the complete verification matrix and final NSIS installer evidence.
 
 Remaining V1 work:
 
-- Preset/recipe mode completion and remaining Models & Engine diagnostics polish.
-- Complete verification matrix, manual acceptance update and final NSIS installer evidence.
+- Run the full Python, TypeScript, ESLint, Vitest, formatter, renderer, Rust and package gates.
+- Build and inspect the final NSIS installer; retain native GUI acceptance items as explicitly manual rather than simulated evidence.
 
 ## Pose and Identity files changed
 
@@ -150,6 +150,29 @@ Remaining V1 work:
 - `docs/ENGINE_PACKS.md`
 - `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
 
+## Preset, recipe, Studio mode and engine-management files changed
+
+- `apps/orchestrator/migrations/010_recipe_library.sql`
+- `apps/orchestrator/src/vanta_orchestrator/schemas.py`
+- `apps/orchestrator/src/vanta_orchestrator/repositories.py`
+- `apps/orchestrator/src/vanta_orchestrator/app.py`
+- `apps/orchestrator/src/vanta_orchestrator/engine.py`
+- `apps/orchestrator/src/vanta_orchestrator/comfy_runtime.py`
+- `apps/orchestrator/src/vanta_orchestrator/training.py`
+- `apps/orchestrator/tests/test_api.py`
+- `apps/orchestrator/tests/test_migrations.py`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/desktop/src/App.tsx`
+- `apps/desktop/src/App.test.tsx`
+- `apps/desktop/src/api.ts`
+- `apps/desktop/src/types.ts`
+- `apps/desktop/src/styles.css`
+- `data/starter_presets.json`
+- `scripts/verify_recipe_library.py`
+- `docs/ESSENTIAL_V1_RUNBOOK.md`
+- `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
+- `docs/CAPABILITY_EVIDENCE.md`
+
 ## Tests run
 
 - Baseline Python suite: **21 passed**, 29 deprecation warnings.
@@ -192,6 +215,9 @@ Remaining V1 work:
 - Ruff and Python compilation: **passed**; desktop/domain/UI strict TypeScript and ESLint zero-warning gates: **passed**.
 - Desktop Vitest: **2 files / 2 tests passed**; Rust formatting: **passed**.
 - Training-integrated renderer production build: **passed**, 1,656 modules, 322.29 kB JS / 51.48 kB CSS before gzip.
+- Preset/recipe focused API and migration suite: **15 passed** after diagnostics, LoRA repair and atomic recipe validation were added.
+- Strict TypeScript and ESLint zero-warning gates after the complete Simple/Studio, recipe library, Models & Engine, diagnostics, About and path-control integration: **passed**.
+- Automated coverage now proves all ten starter categories, scoped preset CRUD, immutable built-ins with user-owned copies, full recipe round trips, duplicate/favorite/delete/import/export, failure preflight, component provenance, sanitized diagnostics ZIPs and LoRA verify/repair.
 
 ## Real evidence produced
 
@@ -249,6 +275,10 @@ Remaining V1 work:
   - Safe 12 GB run `training-run-75c5fa580bde4e75b0437c55d452a350` completed 12/12 steps and one epoch in 88 seconds. Resumable state, per-run logs, ETA/progress, and a visually inspected 512x512 validation sample were persisted.
   - Checkpoint `checkpoint-f2457c86442a40dc9d714622f9461535` is 21,588,484 bytes with SHA-256 `afb044d73ad6991a5d2e31a710b05625e043da147c54d56a4b86fb3c794de428`; it was installed as LoRA `lora-c618cb1c3a9d44e6b776a47c437c0845` and assigned to the linked fictional character.
   - Job `job-cef676781b5d401a8988569c42602e46`, generation `generation-29d6980da0244ed08937f10d8f3bbd2c`: 512x768, 16 steps, 26.28 seconds. Visual review accepted the coherent plum-coat portrait; Gallery metadata records the trained LoRA ID, filename, exact hash, strength and disclosure.
+- Real complete recipe persistence:
+  - Recipe `recipe-0c901773225947c8abd3de25f5618015` is persisted in the existing Vanta AppData database for character `character-76fdae0a265548258caf6c2184064b10` and the preserved `juggernautXL_version6Rundiffusion.safetensors` model.
+  - It round-trips all ten starter preset categories, trained LoRA `lora-c618cb1c3a9d44e6b776a47c437c0845`, identity reference `reference-471eea7826ea43808d31ad8ce5292d49`, pose `pose-14dd2ca6615b4832aed84052fa39e1c7`, reference motion `motion-89a989a461624f62a14b24aee54d4538`, variation controls and Studio sampling settings.
+  - The verification script deletes only its own prior acceptance recipe, recreates it through the production repository and reads it back from SQLite. Existing models and user media remain untouched.
 
 ## Blockers
 
@@ -257,7 +287,7 @@ Remaining V1 work:
 
 ## Exact next action
 
-Commit the verified local LoRA training slice, then complete preset/recipe modes and Models & Engine diagnostics.
+Commit the completed preset/recipe and engine-management slice, then run the final verification and NSIS packaging gate.
 
 ## Final acceptance status
 

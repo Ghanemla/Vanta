@@ -46,5 +46,68 @@
       "tags": ["daylight"],
       "builtin": true
     }
+  ],
+  "identity_modifier": [
+    {
+      "id": "identity-natural-detail",
+      "name": "Natural Detail",
+      "prompt": "natural facial detail, coherent adult features, realistic skin texture",
+      "tags": ["identity", "realistic"],
+      "builtin": true
+    }
+  ],
+  "pose": [
+    {
+      "id": "pose-editorial-three-quarter",
+      "name": "Editorial Three-Quarter",
+      "prompt": "relaxed three-quarter stance, balanced posture, natural hands",
+      "tags": ["editorial", "standing"],
+      "builtin": true
+    }
+  ],
+  "location": [
+    {
+      "id": "location-charcoal-studio",
+      "name": "Charcoal Studio",
+      "prompt": "restrained charcoal editorial studio, seamless background",
+      "tags": ["studio", "minimal"],
+      "builtin": true
+    }
+  ],
+  "camera": [
+    {
+      "id": "camera-85mm-portrait",
+      "name": "85mm Portrait",
+      "prompt": "85mm portrait photograph, shallow depth of field, natural perspective",
+      "tags": ["portrait", "photographic"],
+      "builtin": true
+    }
+  ],
+  "quality": [
+    {
+      "id": "quality-premium-natural",
+      "name": "Premium Natural",
+      "prompt": "premium realistic detail, controlled texture, coherent anatomy",
+      "tags": ["realistic", "premium"],
+      "builtin": true
+    }
+  ],
+  "negative": [
+    {
+      "id": "negative-clean-photograph",
+      "name": "Clean Photograph",
+      "prompt": "text, watermark, malformed anatomy, plastic skin, low quality",
+      "tags": ["photographic", "clean"],
+      "builtin": true
+    }
+  ],
+  "motion": [
+    {
+      "id": "motion-subtle-editorial",
+      "name": "Subtle Editorial Motion",
+      "prompt": "subtle breathing, gentle posture shift, restrained fabric movement",
+      "tags": ["subtle", "editorial"],
+      "builtin": true
+    }
   ]
 }

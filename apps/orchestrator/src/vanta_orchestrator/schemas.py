@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -73,22 +73,48 @@ class CharacterLoraInput(StrictModel):
 
 
 class PresetInput(StrictModel):
-    category: str
+    category: Literal[
+        "identity_modifier",
+        "wardrobe",
+        "expression",
+        "pose",
+        "location",
+        "lighting",
+        "camera",
+        "quality",
+        "negative",
+        "motion",
+    ]
     name: str = Field(min_length=1, max_length=100)
     prompt: str = Field(max_length=8000)
     negative_prompt: str = Field(default="", max_length=8000)
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list, max_length=20)
     favorite: bool = False
     scope: Literal["global", "character", "project"] = "global"
+    scope_id: str | None = Field(default=None, max_length=120)
 
 
 class RecipeInput(StrictModel):
     name: str = Field(min_length=1, max_length=100)
     character_id: str | None = None
-    freeform_prompt: str = ""
-    negative_prompt: str = ""
-    model_profile: str = "photoreal_balanced"
-    preset_ids: list[str] = []
+    freeform_prompt: str = Field(default="", max_length=8000)
+    negative_prompt: str = Field(default="", max_length=8000)
+    model_profile: Literal["photoreal_balanced", "preview_fast", "photoreal_max"] = (
+        "photoreal_balanced"
+    )
+    preset_ids: list[str] = Field(default_factory=list, max_length=20)
+    scope: Literal["global", "character", "project"] = "global"
+    scope_id: str | None = Field(default=None, max_length=120)
+    favorite: bool = False
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    model_family: Literal["SDXL", "FLUX"] = "SDXL"
+    model_file: str = Field(default="", max_length=500)
+    lora_stack: list[dict[str, Any]] = Field(default_factory=list, max_length=8)
+    identity_settings: dict[str, Any] = Field(default_factory=dict)
+    pose_settings: dict[str, Any] = Field(default_factory=dict)
+    variation_settings: dict[str, Any] = Field(default_factory=dict)
+    video_settings: dict[str, Any] = Field(default_factory=dict)
+    generation_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class SettingInput(StrictModel):
@@ -136,9 +162,14 @@ class GenerationInput(StrictModel):
     height: int = Field(default=1216, ge=512, le=1536, multiple_of=64)
     steps: int = Field(default=30, ge=1, le=60)
     guidance: float = Field(default=5.5, ge=1, le=15)
+    sampler: Literal["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"] = "euler"
+    scheduler: Literal["normal", "karras", "simple"] = "normal"
     lora_ids: list[str] = Field(default_factory=list, max_length=8)
+    lora_weights: dict[str, float] = Field(default_factory=dict)
+    lora_clip_weights: dict[str, float] = Field(default_factory=dict)
     source_generation_id: str | None = None
     identity_reference_id: str | None = None
+    identity_strength: float = Field(default=0.6, ge=0, le=1)
     pose_id: str | None = None
     pose_strength: float | None = Field(default=None, ge=0, le=1)
     variation_strength: float = Field(default=0.45, ge=0.05, le=0.95)

@@ -557,6 +557,30 @@ fn choose_local_upscaler_file() -> Option<String> {
         .map(|path| path.display().to_string())
 }
 
+#[tauri::command]
+fn open_local_path(kind: String, manager: State<'_, RuntimeManager>) -> Result<(), String> {
+    let inner = manager
+        .inner
+        .lock()
+        .map_err(|_| "Runtime state is unavailable")?;
+    let path = match kind.as_str() {
+        "data" => inner.data_dir.clone(),
+        "models" => inner.data_dir.join("engine").join("models"),
+        "logs" => inner.logs_dir.clone(),
+        "database" => inner.data_dir.clone(),
+        _ => return Err("Unsupported local path".into()),
+    };
+    fs::create_dir_all(&path).map_err(|error| format!("Unable to open local path: {error}"))?;
+    drop(inner);
+    let mut command = Command::new("explorer.exe");
+    command.arg(&path);
+    hide_console(&mut command);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open Windows Explorer: {error}"))
+}
+
 fn acquire_desktop_lock(data_dir: &Path) -> Result<DesktopLock, String> {
     let path = data_dir.join("desktop-instance.lock");
     let open_lock = || OpenOptions::new().write(true).create_new(true).open(&path);
@@ -647,7 +671,8 @@ pub fn run() {
             choose_local_training_images,
             choose_local_video_file,
             choose_local_lora_file,
-            choose_local_upscaler_file
+            choose_local_upscaler_file,
+            open_local_path
         ]);
 
     let app = builder

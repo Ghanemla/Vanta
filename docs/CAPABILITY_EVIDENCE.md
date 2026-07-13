@@ -1,5 +1,12 @@
 # Capability evidence
 
+## Complete local recipe and engine management
+
+- Presets cover identity modifiers, wardrobe, expression, pose, location, lighting, camera, quality, negative direction and motion. Built-ins remain immutable/restorable; edits create user-owned copies, while user entries support global/character/project scopes, tags, favorites, search, duplication, deletion and portable JSON.
+- Recipes persist the selected character, positive/negative direction, ordered presets, verified model profile/file, weighted LoRA stack, identity, pose, variation, video/reference-motion and Studio generation controls. Normal UI and exported data never expose ComfyUI node IDs.
+- Evidence on 2026-07-13: `recipe-0c901773225947c8abd3de25f5618015` round-tripped all ten preset categories plus the real trained LoRA, owned identity reference, extracted pose and reference-motion asset in the existing local SQLite database.
+- Models & Engine reports local hardware/resources, loopback ports and processes, active jobs, component/model provenance and sanitized logs. Applicable component and pack controls include install, verify, repair/update, pause/resume, restart and remove; owned LoRAs retain exact hashes and repair from their retained original when available.
+
 ## Managed local LoRA training
 
 - Vanta manages pinned `sd-scripts` v0.10.5, isolated Python dependencies, two offline SDXL tokenizer sets and the WD-SwinV2 v3 ONNX captioner. Ready requires CUDA imports, local tokenizer loading and a real ONNX session; training runs force network libraries offline.

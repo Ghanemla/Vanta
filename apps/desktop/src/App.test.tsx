@@ -10,6 +10,7 @@ vi.stubGlobal(
     const fixtures: Record<string, unknown> = {
       '/api/characters': [],
       '/api/presets': [],
+      '/api/recipes': [],
       '/api/gallery': [],
       '/api/engine/components': [],
       '/api/loras': [],

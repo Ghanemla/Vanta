@@ -5,6 +5,7 @@ import binascii
 import json
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import threading
@@ -265,8 +266,8 @@ class WorkflowCompiler:
                     "seed": request["seed"],
                     "steps": request["steps"],
                     "cfg": request["guidance"],
-                    "sampler_name": "euler",
-                    "scheduler": "normal",
+                    "sampler_name": request.get("sampler", "euler"),
+                    "scheduler": request.get("scheduler", "normal"),
                     "denoise": 1.0,
                     "model": ["1", 0],
                     "positive": ["2", 0],
@@ -321,7 +322,7 @@ class WorkflowCompiler:
                     "model": ["21", 0],
                     "ipadapter": ["21", 1],
                     "image": ["20", 0],
-                    "weight": 0.6,
+                    "weight": request.get("identity_strength", 0.6),
                     "weight_type": "linear",
                     "combine_embeds": "concat",
                     "start_at": 0.0,
@@ -602,6 +603,11 @@ class EngineService:
         "start",
         "stop",
         "remove",
+        "verify",
+        "pause",
+        "resume",
+        "restart",
+        "update",
     }
     allowed_pack_actions = {"install", "verify", "repair", "remove", "set_default"}
 
@@ -736,6 +742,11 @@ class EngineService:
                 **row,
                 "capabilities": manifests[row["id"]].provided_capabilities,
                 "dependencies": manifests[row["id"]].dependencies,
+                "version": manifests[row["id"]].version,
+                "revision": manifests[row["id"]].pinned_revision,
+                "source": manifests[row["id"]].source.get("url"),
+                "sha256": manifests[row["id"]].source.get("sha256"),
+                "license": manifests[row["id"]].license.model_dump(),
             }
             for row in self.db.query_all("SELECT * FROM engine_components ORDER BY display_name")
         ]
@@ -743,6 +754,33 @@ class EngineService:
     def component_action(self, item_id: str, action: str) -> dict[str, Any]:
         if action not in self.allowed_component_actions:
             raise ValueError("Unsupported component action")
+        if action == "verify":
+            action = "health_check"
+        elif action == "pause":
+            action = "stop"
+        elif action == "resume":
+            action = "start"
+        elif action == "update":
+            manifest = next((item for item in self.core.components if item.id == item_id), None)
+            row = self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,))
+            if manifest is None or row is None:
+                raise KeyError(item_id)
+            if row["manifest_version"] == manifest.version:
+                self.db.execute(
+                    "UPDATE engine_components SET last_health_message=?,updated_at=? WHERE id=?",
+                    (f"Already current at {manifest.version}", utc_now(), item_id),
+                )
+                return (
+                    self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,))
+                    or {}
+                )
+            action = "repair"
+        elif action == "restart":
+            self.runtime.stop()
+            self.runtime.start()
+            if not self.runtime.wait_healthy(timeout=45):
+                raise ValueError("The local image engine did not restart")
+            action = "health_check"
         if item_id == "pose-control":
             if action in {"install", "repair"}:
                 if self._install_thread is None or not self._install_thread.is_alive():
@@ -830,6 +868,8 @@ class EngineService:
             self.runtime.wait_healthy()
         elif action == "stop":
             self.runtime.stop()
+        elif action == "remove":
+            self.runtime.remove()
         else:
             self.runtime.start()
             self.runtime.wait_healthy(timeout=15)
@@ -1956,13 +1996,25 @@ class EngineService:
 
     def diagnostics(self) -> dict[str, Any]:
         snapshot = self.runtime.snapshot()
-        active = self.db.query_one(
-            "SELECT id, status, progress FROM generation_jobs WHERE status NOT IN ('completed', 'failed', 'cancelled') ORDER BY created_at DESC LIMIT 1"
+        active = self.db.query_all(
+            "SELECT id,status,progress,current_step,total_steps FROM generation_jobs WHERE status NOT IN ('completed','failed','cancelled') ORDER BY created_at DESC LIMIT 10"
         )
         model = self.db.query_one(
             "SELECT alias, installed_path, verified, metadata FROM model_packs WHERE is_default=1"
         )
         model_metadata = json.loads(model["metadata"]) if model else {}
+        logs: list[str] = []
+        log_root = self.settings.logs_dir or self.settings.data_dir / "logs"
+        for path in sorted(log_root.glob("*.log")):
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+            for line in lines:
+                sanitized = line
+                if self.settings.launch_token:
+                    sanitized = sanitized.replace(self.settings.launch_token, "[redacted]")
+                sanitized = sanitized.replace(str(Path.home()), "%USERPROFILE%")
+                logs.append(f"[{path.name}] {sanitized[:1000]}")
+        components = self.list_components()
+        packs = self.list_packs()
         return {
             "summary": snapshot.message,
             "messages": [
@@ -1971,7 +2023,40 @@ class EngineService:
                 f"GPU: {self.hardware['gpu_name']} ({self.hardware['vram_gb']} GB VRAM)",
                 "No cloud services are configured",
             ],
-            "raw_logs": [],
+            "raw_logs": logs[-240:],
+            "system": {
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "orchestrator_pid": os.getpid(),
+                "comfyui_pid": self.runtime.process_id,
+                "orchestrator_host": self.settings.host,
+                "orchestrator_port": self.settings.port,
+                "comfyui_port": snapshot.port,
+            },
+            "components": [
+                {
+                    "id": item["id"],
+                    "state": item["state"],
+                    "version": item["version"],
+                    "revision": item["revision"],
+                    "source": item["source"],
+                    "sha256": item["sha256"],
+                    "license": item["license"],
+                }
+                for item in components
+            ],
+            "model_packs": [
+                {
+                    "alias": item["alias"],
+                    "state": item["state"],
+                    "installed": item["installed"],
+                    "verified": item["verified"],
+                    "filename": item.get("filename"),
+                    "sha256": item.get("sha256"),
+                    "license": item.get("license"),
+                }
+                for item in packs
+            ],
             "runtime": {
                 "engine_path": str(self.settings.runtime_root),
                 "engine_port": snapshot.port,
@@ -1984,7 +2069,7 @@ class EngineService:
                 "vram_gb": self.hardware["vram_gb"],
                 "ram_gb": self.hardware["ram_gb"],
                 "free_disk_gb": self.hardware["free_disk_gb"],
-                "current_job": active,
+                "active_jobs": active,
                 "workflow_version": WorkflowCompiler.version,
                 "output_path": str(self.settings.media_root),
             },
@@ -2189,12 +2274,15 @@ class GenerationService:
                 "comfyui_revision": self.engine.runtime.revision,
                 "steps": request["steps"],
                 "guidance": request["guidance"],
+                "sampler": request.get("sampler", "euler"),
+                "scheduler": request.get("scheduler", "normal"),
                 "loras": loras,
                 "source_generation_id": request.get("source_generation_id"),
                 "variation_strength": request.get("variation_strength"),
                 "variation_mode": request.get("variation_mode"),
                 "variation_prompt": request.get("variation_prompt"),
                 "identity_reference_id": request.get("identity_reference_id"),
+                "identity_strength": request.get("identity_strength", 0.6),
                 "pose_control": pose_metadata,
                 "inpaint": inpaint_metadata,
                 "disclosure": True,
@@ -2519,11 +2607,33 @@ class GenerationService:
                     "name": row["name"],
                     "filename": row["filename"],
                     "sha256": row["sha256"],
-                    "strength": float(
-                        assignment["strength"] if assignment else row["default_strength"]
+                    "strength": max(
+                        0.0,
+                        min(
+                            2.0,
+                            float(
+                                request.get("lora_weights", {}).get(
+                                    lora_id,
+                                    assignment["strength"]
+                                    if assignment
+                                    else row["default_strength"],
+                                )
+                            ),
+                        ),
                     ),
-                    "clip_strength": float(
-                        assignment["clip_strength"] if assignment else row["default_clip_strength"]
+                    "clip_strength": max(
+                        0.0,
+                        min(
+                            2.0,
+                            float(
+                                request.get("lora_clip_weights", {}).get(
+                                    lora_id,
+                                    assignment["clip_strength"]
+                                    if assignment
+                                    else row["default_clip_strength"],
+                                )
+                            ),
+                        ),
                     ),
                 }
             )

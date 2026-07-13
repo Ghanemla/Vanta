@@ -294,6 +294,12 @@ class LoraRepository:
         rows = self.db.query_all("SELECT * FROM lora_packs ORDER BY name")
         for row in rows:
             row["enabled"] = bool(row["enabled"])
+            if not Path(row["installed_path"]).is_file():
+                row["verification_state"] = "repair_needed"
+                self.db.execute(
+                    "UPDATE lora_packs SET verification_state='repair_needed',updated_at=? WHERE id=?",
+                    (utc_now(), row["id"]),
+                )
         return rows
 
     def get(self, item_id: str) -> dict[str, Any]:
@@ -323,6 +329,39 @@ class LoraRepository:
         )
         return {"character_id": character_id, **payload.model_dump()}
 
+    def verify(self, item_id: str) -> dict[str, Any]:
+        item = self.get(item_id)
+        path = Path(item["installed_path"])
+        if not path.is_file() or sha256_file(path) != item["sha256"]:
+            self.db.execute(
+                "UPDATE lora_packs SET verification_state='repair_needed',updated_at=? WHERE id=?",
+                (utc_now(), item_id),
+            )
+            raise ValueError("The managed LoRA file is missing or failed hash verification")
+        family = self._family(validate_safetensors(path))
+        if family != item["model_family"]:
+            raise ValueError("The LoRA model family no longer matches its import record")
+        self.db.execute(
+            "UPDATE lora_packs SET verification_state='ready',updated_at=? WHERE id=?",
+            (utc_now(), item_id),
+        )
+        return self.get(item_id)
+
+    def repair(self, item_id: str) -> dict[str, Any]:
+        item = self.get(item_id)
+        original = Path(item["original_path"]).expanduser().resolve()
+        destination = Path(item["installed_path"]).expanduser().resolve()
+        if not original.is_file() or original == destination:
+            raise ValueError("The original LoRA is unavailable; import the owned file again")
+        if sha256_file(original) != item["sha256"]:
+            raise ValueError("The original LoRA no longer matches the recorded SHA-256 hash")
+        family = self._family(validate_safetensors(original))
+        if family != item["model_family"]:
+            raise ValueError("The original LoRA model family no longer matches its import record")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(original, destination)
+        return self.verify(item_id)
+
     def remove(self, item_id: str) -> None:
         item = self.get(item_id)
         Path(item["installed_path"]).unlink(missing_ok=True)
@@ -346,11 +385,12 @@ class PresetRepository:
         return _decode(row, ("tags",))
 
     def create(self, payload: PresetInput, source_preset_id: str | None = None) -> dict[str, Any]:
+        scope_id = self._scope_id(payload.scope, payload.scope_id)
         item_id, now = f"preset-{uuid.uuid4().hex}", utc_now()
         self.db.execute(
             """INSERT INTO presets
-            (id, category, name, prompt, negative_prompt, tags, favorite, origin, scope, source_preset_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'user', ?, ?, ?, ?)""",
+            (id, category, name, prompt, negative_prompt, tags, favorite, origin, scope, scope_id, source_preset_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'user', ?, ?, ?, ?, ?)""",
             (
                 item_id,
                 payload.category,
@@ -360,6 +400,7 @@ class PresetRepository:
                 json.dumps(payload.tags),
                 int(payload.favorite),
                 payload.scope,
+                scope_id,
                 source_preset_id,
                 now,
                 now,
@@ -372,8 +413,9 @@ class PresetRepository:
         if current["origin"] == "builtin":
             copied = payload.model_copy(update={"name": f"{payload.name} — Copy"})
             return self.create(copied, source_preset_id=item_id)
+        scope_id = self._scope_id(payload.scope, payload.scope_id)
         self.db.execute(
-            """UPDATE presets SET category=?, name=?, prompt=?, negative_prompt=?, tags=?, favorite=?, scope=?, updated_at=? WHERE id=?""",
+            """UPDATE presets SET category=?, name=?, prompt=?, negative_prompt=?, tags=?, favorite=?, scope=?, scope_id=?, updated_at=? WHERE id=?""",
             (
                 payload.category,
                 payload.name,
@@ -382,6 +424,7 @@ class PresetRepository:
                 json.dumps(payload.tags),
                 int(payload.favorite),
                 payload.scope,
+                scope_id,
                 utc_now(),
                 item_id,
             ),
@@ -406,19 +449,45 @@ class PresetRepository:
     def restore_builtins(self) -> None:
         self.db.seed_presets()
 
+    def _scope_id(self, scope: str, scope_id: str | None) -> str | None:
+        if scope == "global":
+            return None
+        value = (scope_id or "").strip()
+        if not value:
+            raise ValueError(f"Choose a {scope} scope target")
+        if scope == "character" and not self.db.query_one(
+            "SELECT id FROM characters WHERE id=?", (value,)
+        ):
+            raise ValueError("The selected character scope no longer exists")
+        return value
+
 
 class RecipeRepository:
     def __init__(self, db: Database):
         self.db = db
 
     def list(self) -> list[dict[str, Any]]:
-        return self.db.query_all("SELECT * FROM recipes ORDER BY updated_at DESC")
+        return [
+            self._inflate(row)
+            for row in self.db.query_all("SELECT * FROM recipes ORDER BY updated_at DESC")
+        ]
+
+    def get(self, recipe_id: str) -> dict[str, Any]:
+        row = self.db.query_one("SELECT * FROM recipes WHERE id=?", (recipe_id,))
+        if row is None:
+            raise KeyError(recipe_id)
+        return self._inflate(row)
 
     def create(self, payload: RecipeInput) -> dict[str, Any]:
+        scope_id = self._scope_id(payload)
+        items = self._validated_items(payload.preset_ids)
         recipe_id, now = f"recipe-{uuid.uuid4().hex}", utc_now()
         self.db.execute(
-            """INSERT INTO recipes (id, name, character_id, freeform_prompt, negative_prompt, model_profile, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO recipes (
+            id,name,character_id,freeform_prompt,negative_prompt,model_profile,scope,scope_id,
+            favorite,tags,model_family,model_file,lora_stack,identity_settings,pose_settings,
+            variation_settings,video_settings,generation_settings,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 recipe_id,
                 payload.name,
@@ -426,21 +495,120 @@ class RecipeRepository:
                 payload.freeform_prompt,
                 payload.negative_prompt,
                 payload.model_profile,
+                payload.scope,
+                scope_id,
+                int(payload.favorite),
+                json.dumps(payload.tags),
+                payload.model_family,
+                payload.model_file,
+                json.dumps(payload.lora_stack),
+                json.dumps(payload.identity_settings),
+                json.dumps(payload.pose_settings),
+                json.dumps(payload.variation_settings),
+                json.dumps(payload.video_settings),
+                json.dumps(payload.generation_settings),
                 now,
                 now,
             ),
         )
-        for position, preset_id in enumerate(payload.preset_ids):
+        self._replace_items(recipe_id, items)
+        return self.get(recipe_id)
+
+    def update(self, recipe_id: str, payload: RecipeInput) -> dict[str, Any]:
+        self.get(recipe_id)
+        scope_id = self._scope_id(payload)
+        items = self._validated_items(payload.preset_ids)
+        self.db.execute(
+            """UPDATE recipes SET name=?,character_id=?,freeform_prompt=?,negative_prompt=?,
+            model_profile=?,scope=?,scope_id=?,favorite=?,tags=?,model_family=?,model_file=?,
+            lora_stack=?,identity_settings=?,pose_settings=?,variation_settings=?,video_settings=?,
+            generation_settings=?,updated_at=? WHERE id=?""",
+            (
+                payload.name,
+                payload.character_id,
+                payload.freeform_prompt,
+                payload.negative_prompt,
+                payload.model_profile,
+                payload.scope,
+                scope_id,
+                int(payload.favorite),
+                json.dumps(payload.tags),
+                payload.model_family,
+                payload.model_file,
+                json.dumps(payload.lora_stack),
+                json.dumps(payload.identity_settings),
+                json.dumps(payload.pose_settings),
+                json.dumps(payload.variation_settings),
+                json.dumps(payload.video_settings),
+                json.dumps(payload.generation_settings),
+                utc_now(),
+                recipe_id,
+            ),
+        )
+        self.db.execute("DELETE FROM recipe_items WHERE recipe_id=?", (recipe_id,))
+        self._replace_items(recipe_id, items)
+        return self.get(recipe_id)
+
+    def duplicate(self, recipe_id: str) -> dict[str, Any]:
+        source = self.get(recipe_id)
+        payload = RecipeInput(**{key: source[key] for key in RecipeInput.model_fields})
+        return self.create(payload.model_copy(update={"name": f"{source['name']} - Copy"}))
+
+    def delete(self, recipe_id: str) -> None:
+        self.get(recipe_id)
+        self.db.execute("DELETE FROM recipes WHERE id=?", (recipe_id,))
+
+    def _validated_items(self, preset_ids: list[str]) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+        for preset_id in dict.fromkeys(preset_ids):
             preset = self.db.query_one("SELECT category FROM presets WHERE id=?", (preset_id,))
-            if preset:
-                self.db.execute(
-                    "INSERT INTO recipe_items(id, recipe_id, preset_id, category, position) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        f"item-{uuid.uuid4().hex}",
-                        recipe_id,
-                        preset_id,
-                        preset["category"],
-                        position,
-                    ),
-                )
-        return self.db.query_one("SELECT * FROM recipes WHERE id=?", (recipe_id,)) or {}
+            if preset is None:
+                raise ValueError(f"Preset {preset_id} no longer exists")
+            items.append((preset_id, preset["category"]))
+        return items
+
+    def _replace_items(self, recipe_id: str, items: list[tuple[str, str]]) -> None:
+        for position, (preset_id, category) in enumerate(items):
+            self.db.execute(
+                "INSERT INTO recipe_items(id,recipe_id,preset_id,category,position) VALUES(?,?,?,?,?)",
+                (f"item-{uuid.uuid4().hex}", recipe_id, preset_id, category, position),
+            )
+
+    def _inflate(self, row: dict[str, Any]) -> dict[str, Any]:
+        result = _decode(
+            row,
+            (
+                "tags",
+                "lora_stack",
+                "identity_settings",
+                "pose_settings",
+                "variation_settings",
+                "video_settings",
+                "generation_settings",
+            ),
+        )
+        items = self.db.query_all(
+            """SELECT ri.preset_id,ri.category,ri.position,p.name,p.prompt,p.negative_prompt
+            FROM recipe_items ri JOIN presets p ON p.id=ri.preset_id
+            WHERE ri.recipe_id=? ORDER BY ri.position""",
+            (row["id"],),
+        )
+        result["preset_ids"] = [item["preset_id"] for item in items]
+        result["items"] = items
+        return result
+
+    def _scope_id(self, payload: RecipeInput) -> str | None:
+        if payload.character_id and not self.db.query_one(
+            "SELECT id FROM characters WHERE id=?", (payload.character_id,)
+        ):
+            raise ValueError("The selected recipe character no longer exists")
+        if payload.scope == "global":
+            return None
+        value = (payload.scope_id or payload.character_id or "").strip()
+        if not value:
+            raise ValueError(f"Choose a {payload.scope} scope target")
+        if payload.scope == "character" and not self.db.query_one(
+            "SELECT id FROM characters WHERE id=?", (value,)
+        ):
+            raise ValueError("The selected character scope no longer exists")
+        return value

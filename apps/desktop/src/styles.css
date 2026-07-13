@@ -3121,3 +3121,79 @@ button.tag.active {
     transition-duration: 0.01ms !important;
   }
 }
+
+.library-switch {
+  width: fit-content;
+  margin: 0 0 20px;
+}
+
+.recipe-card > small {
+  color: var(--v-muted);
+  line-height: 1.5;
+}
+
+.recipe-check-list,
+.lora-stack-item {
+  display: grid;
+  gap: 10px;
+}
+
+.lora-stack-item {
+  padding: 12px;
+  border: 1px solid var(--v-line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--v-panel-raised) 75%, transparent);
+}
+
+.lora-stack-item > label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lora-stack-item > label span {
+  display: grid;
+  gap: 2px;
+}
+
+.component-provenance {
+  color: var(--v-muted);
+  font-size: 0.78rem;
+}
+
+.component-provenance summary {
+  cursor: pointer;
+  color: var(--v-text-soft);
+}
+
+.component-provenance dl,
+.about-facts {
+  display: grid;
+  gap: 8px;
+}
+
+.component-provenance dl div,
+.about-facts div {
+  display: grid;
+  gap: 3px;
+}
+
+.component-provenance dt,
+.about-facts dt {
+  color: var(--v-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.68rem;
+}
+
+.component-provenance dd,
+.about-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.hash-value {
+  overflow-wrap: anywhere;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.72rem;
+}

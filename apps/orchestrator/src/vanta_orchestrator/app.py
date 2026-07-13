@@ -326,6 +326,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except KeyError as error:
             raise missing(error) from error
 
+    @app.post("/api/loras/{item_id}/verify")
+    def verify_lora(item_id: str) -> dict:
+        try:
+            return loras.verify(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/loras/{item_id}/repair")
+    def repair_lora(item_id: str) -> dict:
+        try:
+            return loras.repair(item_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.put("/api/characters/{item_id}/loras")
     def assign_lora(item_id: str, payload: CharacterLoraInput) -> dict:
         try:
@@ -341,7 +359,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/presets", status_code=201)
     def create_preset(payload: PresetInput) -> dict:
-        return presets.create(payload)
+        try:
+            return presets.create(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.put("/api/presets/{item_id}")
     def update_preset(item_id: str, payload: PresetInput) -> dict:
@@ -349,6 +370,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return presets.update(item_id, payload)
         except KeyError as error:
             raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.post("/api/presets/{item_id}/duplicate", status_code=201)
     def duplicate_preset(item_id: str) -> dict:
@@ -375,7 +398,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def export_presets() -> dict:
         return {
             "schema_version": 1,
-            "presets": [item for item in presets.list() if item["origin"] == "user"],
+            "presets": [
+                {key: item[key] for key in PresetInput.model_fields}
+                for item in presets.list()
+                if item["origin"] == "user"
+            ],
         }
 
     @app.post("/api/presets-import")
@@ -393,7 +420,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/recipes", status_code=201)
     def create_recipe(payload: RecipeInput) -> dict:
-        return recipes.create(payload)
+        try:
+            return recipes.create(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/recipes/{recipe_id}")
+    def get_recipe(recipe_id: str) -> dict:
+        try:
+            return recipes.get(recipe_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.put("/api/recipes/{recipe_id}")
+    def update_recipe(recipe_id: str, payload: RecipeInput) -> dict:
+        try:
+            return recipes.update(recipe_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/recipes/{recipe_id}/duplicate", status_code=201)
+    def duplicate_recipe(recipe_id: str) -> dict:
+        try:
+            return recipes.duplicate(recipe_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.delete("/api/recipes/{recipe_id}", status_code=204)
+    def delete_recipe(recipe_id: str) -> None:
+        try:
+            recipes.delete(recipe_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/recipes-export")
+    def export_recipes() -> dict:
+        return {
+            "schema_version": 1,
+            "recipes": [
+                {key: item[key] for key in RecipeInput.model_fields} for item in recipes.list()
+            ],
+        }
+
+    @app.post("/api/recipes-import")
+    def import_recipes(payload: dict) -> dict:
+        if payload.get("schema_version") != 1 or not isinstance(payload.get("recipes"), list):
+            raise HTTPException(status_code=422, detail="Unsupported recipe export format")
+        try:
+            imported = [
+                recipes.create(RecipeInput.model_validate(item)) for item in payload["recipes"]
+            ]
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"imported": len(imported)}
 
     @app.get("/api/gallery")
     def gallery(model: str | None = Query(default=None)) -> list[dict]:
@@ -777,10 +858,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
             bundle.writestr("system-metadata.json", json.dumps(metadata, indent=2))
+            diagnostic_text = json.dumps(engine.diagnostics(), indent=2)
+            if settings.launch_token:
+                diagnostic_text = diagnostic_text.replace(settings.launch_token, "[redacted]")
+            diagnostic_text = diagnostic_text.replace(str(Path.home()), "%USERPROFILE%")
+            bundle.writestr("engine-diagnostics.json", diagnostic_text)
             for log in (settings.logs_dir or settings.data_dir / "logs").glob("*.log"):
-                sanitized = log.read_text(encoding="utf-8", errors="replace").replace(
-                    settings.launch_token or "", "[redacted]"
-                )
+                sanitized = log.read_text(encoding="utf-8", errors="replace")
+                if settings.launch_token:
+                    sanitized = sanitized.replace(settings.launch_token, "[redacted]")
+                sanitized = sanitized.replace(str(Path.home()), "%USERPROFILE%")
                 bundle.writestr(f"logs/{log.name}", sanitized)
         return FileResponse(archive, media_type="application/zip", filename=archive.name)
 

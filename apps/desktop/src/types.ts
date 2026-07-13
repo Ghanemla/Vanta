@@ -81,7 +81,30 @@ export interface PresetRecord {
   favorite: boolean;
   origin: 'builtin' | 'user';
   scope: string;
+  scope_id: string | null;
   source_preset_id: string | null;
+}
+export interface RecipeRecord {
+  id: string;
+  name: string;
+  character_id: string | null;
+  freeform_prompt: string;
+  negative_prompt: string;
+  model_profile: 'photoreal_balanced' | 'preview_fast' | 'photoreal_max';
+  preset_ids: string[];
+  items: Array<{ preset_id: string; category: string; name: string; prompt: string }>;
+  scope: 'global' | 'character' | 'project';
+  scope_id: string | null;
+  favorite: boolean;
+  tags: string[];
+  model_family: 'SDXL' | 'FLUX';
+  model_file: string;
+  lora_stack: Array<{ id: string; strength: number; clip_strength: number }>;
+  identity_settings: Record<string, unknown>;
+  pose_settings: Record<string, unknown>;
+  variation_settings: Record<string, unknown>;
+  video_settings: Record<string, unknown>;
+  generation_settings: Record<string, unknown>;
 }
 export interface EngineComponent {
   id: string;
@@ -91,6 +114,11 @@ export interface EngineComponent {
   last_health_message: string;
   capabilities: string[];
   dependencies: string[];
+  version: string;
+  revision: string;
+  source: string | null;
+  sha256: string | null;
+  license: { name: string; source_url?: string | null; acceptance_required?: boolean | null };
 }
 export interface ModelPack {
   id: string;
@@ -306,4 +334,8 @@ export interface Diagnostics {
   messages: string[];
   raw_logs: string[];
   service?: Record<string, string | number | null>;
+  system?: Record<string, string | number | null>;
+  components?: Array<Record<string, unknown>>;
+  model_packs?: Array<Record<string, unknown>>;
+  runtime?: Record<string, unknown>;
 }

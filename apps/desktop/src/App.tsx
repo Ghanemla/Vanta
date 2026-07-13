@@ -61,6 +61,7 @@ import {
   chooseLocalTrainingImages,
   exportDiagnostics,
   getLocalServiceInfo,
+  openLocalPath,
   repairApplicationRuntime,
   restartLocalService,
   type LocalServiceInfo,
@@ -76,6 +77,7 @@ import type {
   MotionAsset,
   PoseRecord,
   PresetRecord,
+  RecipeRecord,
   SettingsRecord,
   TrainingDataset,
   TrainingRun,
@@ -94,6 +96,7 @@ type Screen =
 type AppData = {
   characters: CharacterRecord[];
   presets: PresetRecord[];
+  recipes: RecipeRecord[];
   gallery: GenerationRecord[];
   components: EngineComponent[];
   packs: ModelPack[];
@@ -135,6 +138,9 @@ const stateLabels: Record<string, string> = {
   extracting: 'Extracting motion',
   encoding: 'Encoding MP4',
   preparing: 'Preparing',
+  training: 'Training',
+  cancelling: 'Cancelling',
+  restarting: 'Restarting',
   generating: 'Generating',
   completed: 'Completed',
   failed: 'Failed',
@@ -309,6 +315,7 @@ export function App() {
       const [
         characters,
         presets,
+        recipes,
         gallery,
         components,
         modelResponse,
@@ -322,6 +329,7 @@ export function App() {
       ] = await Promise.all([
         api.get<CharacterRecord[]>('/characters'),
         api.get<PresetRecord[]>('/presets'),
+        api.get<RecipeRecord[]>('/recipes'),
         api.get<GenerationRecord[]>('/gallery'),
         api.get<EngineComponent[]>('/engine/components'),
         api.get<{ hardware: AppData['hardware']; packs: ModelPack[] }>('/engine/model-packs'),
@@ -336,6 +344,7 @@ export function App() {
       setData({
         characters,
         presets,
+        recipes,
         gallery,
         components,
         packs: modelResponse.packs,
@@ -591,7 +600,13 @@ export function App() {
                 <TrainingScreen data={data} refresh={load} notify={notify} />
               )}
               {screen === 'presets' && (
-                <PresetsScreen items={data.presets} refresh={load} notify={notify} />
+                <PresetsScreen
+                  items={data.presets}
+                  recipes={data.recipes}
+                  characters={data.characters}
+                  refresh={load}
+                  notify={notify}
+                />
               )}
               {screen === 'gallery' && (
                 <GalleryScreen
@@ -635,7 +650,12 @@ export function App() {
               )}
               {screen === 'engine' && <EngineScreen data={data} refresh={load} notify={notify} />}
               {screen === 'settings' && (
-                <SettingsScreen settings={data.settings} refresh={load} notify={notify} />
+                <SettingsScreen
+                  settings={data.settings}
+                  hardware={data.hardware}
+                  refresh={load}
+                  notify={notify}
+                />
               )}
             </>
           )}
@@ -860,7 +880,11 @@ function CreateScreen({
   initialDraft: Record<string, unknown> | null;
   onDraftUsed: () => void;
 }) {
-  const [mode, setMode] = useState<'simple' | 'studio'>('simple');
+  const [mode, setMode] = useState<'simple' | 'studio'>(
+    data.settings.values.default_mode === 'studio' ? 'studio' : 'simple',
+  );
+  const [recipeName, setRecipeName] = useState('Y2K Bedroom Study');
+  const [recipeId, setRecipeId] = useState('');
   const [prompt, setPrompt] = useState(
     'Moody Y2K bedroom portrait, intimate indie editorial mood, low phone-camera angle, black bedspread scattered with fashion magazines and a vinyl record.',
   );
@@ -870,6 +894,10 @@ function CreateScreen({
   const [characterId, setCharacterId] = useState(data.characters[0]?.id ?? '');
   const [steps, setSteps] = useState(30);
   const [guidance, setGuidance] = useState(5.5);
+  const [width, setWidth] = useState(832);
+  const [height, setHeight] = useState(1216);
+  const [sampler, setSampler] = useState('euler');
+  const [scheduler, setScheduler] = useState('normal');
   const [modelAlias, setModelAlias] = useState(
     data.packs.find((item) => item.is_default && item.installed && item.verified)?.alias ??
       'photoreal_balanced',
@@ -884,6 +912,14 @@ function CreateScreen({
   const [variationPrompt, setVariationPrompt] = useState('');
   const [poseId, setPoseId] = useState('');
   const [poseStrength, setPoseStrength] = useState(0.8);
+  const [identityReferenceId, setIdentityReferenceId] = useState('');
+  const [identityStrength, setIdentityStrength] = useState(0.6);
+  const [loraIds, setLoraIds] = useState<string[]>([]);
+  const [loraStrengths, setLoraStrengths] = useState<Record<string, number>>({});
+  const [loraClipStrengths, setLoraClipStrengths] = useState<Record<string, number>>({});
+  const [videoProfile, setVideoProfile] = useState('safe');
+  const [videoDuration, setVideoDuration] = useState(2);
+  const [motionPrompt, setMotionPrompt] = useState('subtle breathing and a gentle posture shift');
   const availablePoses = data.poses.filter(
     (item) => item.status === 'ready' && (!item.character_id || item.character_id === characterId),
   );
@@ -898,6 +934,7 @@ function CreateScreen({
   const isFlux = modelAlias === 'photoreal_max';
   const canGenerate = runtime?.state === 'ready' && Boolean(model?.installed && model.verified);
   const categories = [
+    'identity_modifier',
     'wardrobe',
     'expression',
     'pose',
@@ -905,6 +942,7 @@ function CreateScreen({
     'lighting',
     'camera',
     'quality',
+    'negative',
   ];
   const variationModes = [
     ['general', 'General variation', 'A fresh interpretation with the source as structure.'],
@@ -940,6 +978,10 @@ function CreateScreen({
     setCharacterId(String(initialDraft.character_id ?? characterId));
     setSteps(Number(initialDraft.steps ?? steps));
     setGuidance(Number(initialDraft.guidance ?? guidance));
+    setWidth(Number(initialDraft.width ?? width));
+    setHeight(Number(initialDraft.height ?? height));
+    setSampler(String(initialDraft.sampler ?? sampler));
+    setScheduler(String(initialDraft.scheduler ?? scheduler));
     setModelAlias(String(initialDraft.model_alias ?? modelAlias));
     setSeed(Number(initialDraft.seed ?? seed));
     setNegativePrompt(String(initialDraft.negative_prompt ?? negativePrompt));
@@ -951,6 +993,19 @@ function CreateScreen({
     setVariationPrompt(String(initialDraft.variation_prompt ?? ''));
     setPoseId(String(initialDraft.pose_id ?? ''));
     setPoseStrength(Number(initialDraft.pose_strength ?? 0.8));
+    setIdentityReferenceId(String(initialDraft.identity_reference_id ?? ''));
+    setIdentityStrength(Number(initialDraft.identity_strength ?? 0.6));
+    setLoraIds(Array.isArray(initialDraft.lora_ids) ? initialDraft.lora_ids.map(String) : []);
+    setLoraStrengths(
+      typeof initialDraft.lora_weights === 'object' && initialDraft.lora_weights
+        ? (initialDraft.lora_weights as Record<string, number>)
+        : {},
+    );
+    setLoraClipStrengths(
+      typeof initialDraft.lora_clip_weights === 'object' && initialDraft.lora_clip_weights
+        ? (initialDraft.lora_clip_weights as Record<string, number>)
+        : {},
+    );
     onDraftUsed();
   }, [initialDraft]);
   useEffect(() => {
@@ -960,9 +1015,13 @@ function CreateScreen({
     options(category).find((item) => item.id === selected[category])?.prompt ?? '';
   const generationRequest = () => ({
     character_id: characterId || null,
-    recipe_id: null,
-    character_identity:
+    recipe_id: recipeId || null,
+    character_identity: [
       data.characters.find((item) => item.id === characterId)?.identity_description ?? '',
+      presetText('identity_modifier'),
+    ]
+      .filter(Boolean)
+      .join(', '),
     wardrobe: variationMode === 'clothing' ? variationPrompt : presetText('wardrobe'),
     expression: variationMode === 'expression' ? variationPrompt : presetText('expression'),
     pose: presetText('pose'),
@@ -972,13 +1031,20 @@ function CreateScreen({
     quality: presetText('quality'),
     direction: prompt,
     custom_tags: tags,
-    negative_prompt: negativePrompt,
+    negative_prompt: [negativePrompt, presetText('negative')].filter(Boolean).join(', '),
     model_alias: modelAlias,
     seed,
-    width: poseId || isFlux ? 768 : 832,
-    height: poseId || isFlux ? 1024 : 1216,
+    width: poseId || isFlux ? 768 : width,
+    height: poseId || isFlux ? 1024 : height,
     steps,
     guidance,
+    sampler: isFlux ? 'euler' : sampler,
+    scheduler: isFlux ? 'simple' : scheduler,
+    lora_ids: loraIds,
+    lora_weights: loraStrengths,
+    lora_clip_weights: loraClipStrengths,
+    identity_reference_id: identityReferenceId || null,
+    identity_strength: identityStrength,
     source_generation_id: sourceGenerationId,
     variation_strength: variationStrength,
     variation_mode: variationMode,
@@ -989,17 +1055,95 @@ function CreateScreen({
   const saveRecipe = async () => {
     setSaving(true);
     try {
-      await api.post('/recipes', {
-        name: 'Y2K Bedroom Study',
+      const payload = {
+        name: recipeName.trim() || 'Untitled recipe',
         character_id: characterId || null,
         freeform_prompt: prompt,
+        negative_prompt: negativePrompt,
         model_profile: modelAlias,
         preset_ids: Object.values(selected).filter(Boolean),
-      });
-      notify('Recipe saved to your local library');
+        scope: characterId ? 'character' : 'global',
+        scope_id: characterId || null,
+        favorite: false,
+        tags,
+        model_family: isFlux ? 'FLUX' : 'SDXL',
+        model_file: model?.filename ?? '',
+        lora_stack: loraIds.map((id) => ({
+          id,
+          strength: loraStrengths[id] ?? 1,
+          clip_strength: loraClipStrengths[id] ?? 1,
+        })),
+        identity_settings: {
+          reference_id: identityReferenceId || null,
+          strength: identityStrength,
+        },
+        pose_settings: { pose_id: poseId || null, strength: poseStrength },
+        variation_settings: {
+          source_generation_id: sourceGenerationId,
+          mode: variationMode,
+          prompt: variationPrompt,
+          strength: variationStrength,
+        },
+        video_settings: {
+          profile: videoProfile,
+          duration_seconds: videoDuration,
+          motion_prompt: motionPrompt,
+        },
+        generation_settings: { width, height, steps, guidance, sampler, scheduler, mode },
+      };
+      const saved = recipeId
+        ? await api.put<RecipeRecord>(`/recipes/${recipeId}`, payload)
+        : await api.post<RecipeRecord>('/recipes', payload);
+      setRecipeId(saved.id);
+      notify(recipeId ? 'Recipe updated locally' : 'Recipe saved to your local library');
+      await refresh();
     } finally {
       setSaving(false);
     }
+  };
+  const applyRecipe = (recipe: RecipeRecord) => {
+    const generation = recipe.generation_settings;
+    const identity = recipe.identity_settings;
+    const pose = recipe.pose_settings;
+    const variation = recipe.variation_settings;
+    const video = recipe.video_settings;
+    setRecipeId(recipe.id);
+    setRecipeName(recipe.name);
+    setCharacterId(recipe.character_id ?? '');
+    setPrompt(recipe.freeform_prompt);
+    setNegativePrompt(recipe.negative_prompt);
+    setModelAlias(recipe.model_profile);
+    setTags(recipe.tags);
+    setSelected((current) => ({
+      ...current,
+      ...Object.fromEntries(recipe.items.map((item) => [item.category, item.preset_id])),
+    }));
+    setLoraIds(recipe.lora_stack.map((item) => item.id));
+    setLoraStrengths(Object.fromEntries(recipe.lora_stack.map((item) => [item.id, item.strength])));
+    setLoraClipStrengths(
+      Object.fromEntries(recipe.lora_stack.map((item) => [item.id, item.clip_strength])),
+    );
+    setIdentityReferenceId(String(identity.reference_id ?? ''));
+    setIdentityStrength(Number(identity.strength ?? 0.6));
+    setPoseId(String(pose.pose_id ?? ''));
+    setPoseStrength(Number(pose.strength ?? 0.8));
+    setSourceGenerationId(
+      variation.source_generation_id ? String(variation.source_generation_id) : null,
+    );
+    setVariationMode(String(variation.mode ?? 'general'));
+    setVariationPrompt(String(variation.prompt ?? ''));
+    setVariationStrength(Number(variation.strength ?? 0.45));
+    setVideoProfile(String(video.profile ?? 'safe'));
+    setVideoDuration(Number(video.duration_seconds ?? 2));
+    setMotionPrompt(String(video.motion_prompt ?? ''));
+    setWidth(Number(generation.width ?? 832));
+    setHeight(Number(generation.height ?? 1216));
+    setSteps(Number(generation.steps ?? 30));
+    setGuidance(Number(generation.guidance ?? 5.5));
+    setSampler(String(generation.sampler ?? 'euler'));
+    setScheduler(String(generation.scheduler ?? 'normal'));
+    setMode(generation.mode === 'studio' ? 'studio' : 'simple');
+    notify(`Loaded recipe ${recipe.name}`);
   };
   const generate = async () => {
     if (!canGenerate) {
@@ -1104,7 +1248,10 @@ function CreateScreen({
               </div>
               <div className="preview-label">
                 <small>Active character</small>
-                <strong>{data.characters[0]?.name ?? 'No character selected'}</strong>
+                <strong>
+                  {data.characters.find((item) => item.id === characterId)?.name ??
+                    'No character selected'}
+                </strong>
                 <span>Original adult · v0.3</span>
               </div>
               <div className="preview-index">01 / local study</div>
@@ -1143,7 +1290,15 @@ function CreateScreen({
                   {tag}
                 </button>
               ))}
-              <button className="tag">
+              <button
+                className="tag"
+                onClick={() => {
+                  const value = window.prompt('Add a short creative tag');
+                  if (value?.trim() && !tags.includes(value.trim())) {
+                    setTags((current) => [...current, value.trim()]);
+                  }
+                }}
+              >
                 <Plus /> Custom tag
               </button>
             </div>
@@ -1154,9 +1309,33 @@ function CreateScreen({
             <div className="panel-heading">
               <div>
                 <span className="eyebrow">Scene recipe</span>
-                <h2>Y2K Bedroom Study</h2>
+                <h2>{recipeName}</h2>
               </div>
               <MoreHorizontal />
+            </div>
+            <div className="form-grid">
+              <label>
+                Saved recipe
+                <select
+                  value={recipeId}
+                  onChange={(event) => {
+                    const next = data.recipes.find((item) => item.id === event.target.value);
+                    if (next) applyRecipe(next);
+                    else setRecipeId('');
+                  }}
+                >
+                  <option value="">New recipe</option>
+                  {data.recipes.map((recipe) => (
+                    <option key={recipe.id} value={recipe.id}>
+                      {recipe.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Recipe name
+                <input value={recipeName} onChange={(event) => setRecipeName(event.target.value)} />
+              </label>
             </div>
             <label>
               Character
@@ -1360,11 +1539,186 @@ function CreateScreen({
                   </label>
                   <label>
                     Sampler
-                    <select>
-                      <option>DPM++ 2M Karras</option>
+                    <select
+                      value={isFlux ? 'euler' : sampler}
+                      disabled={isFlux}
+                      onChange={(event) => setSampler(event.target.value)}
+                    >
+                      <option value="euler">Euler</option>
+                      <option value="euler_ancestral">Euler ancestral</option>
+                      <option value="dpmpp_2m">DPM++ 2M</option>
+                      <option value="dpmpp_sde">DPM++ SDE</option>
+                    </select>
+                  </label>
+                  <label>
+                    Scheduler
+                    <select
+                      value={scheduler}
+                      onChange={(event) => setScheduler(event.target.value)}
+                      disabled={isFlux}
+                    >
+                      <option value="normal">Normal</option>
+                      <option value="karras">Karras</option>
+                      <option value="simple">Simple</option>
+                    </select>
+                  </label>
+                  <label>
+                    Width
+                    <input
+                      type="number"
+                      min={512}
+                      max={1536}
+                      step={64}
+                      value={width}
+                      disabled={Boolean(poseId) || isFlux}
+                      onChange={(event) => setWidth(Number(event.target.value))}
+                    />
+                  </label>
+                  <label>
+                    Height
+                    <input
+                      type="number"
+                      min={512}
+                      max={1536}
+                      step={64}
+                      value={height}
+                      disabled={Boolean(poseId) || isFlux}
+                      onChange={(event) => setHeight(Number(event.target.value))}
+                    />
+                  </label>
+                </div>
+                <div className="section-rule">
+                  <span>Identity & LoRA stack</span>
+                </div>
+                <div className="form-grid">
+                  <label>
+                    Identity reference
+                    <select
+                      value={identityReferenceId}
+                      onChange={(event) => setIdentityReferenceId(event.target.value)}
+                      disabled={isFlux}
+                    >
+                      <option value="">Character primary reference</option>
+                      {(
+                        data.characters.find((item) => item.id === characterId)?.references ?? []
+                      ).map((reference, index) => (
+                        <option key={reference.id} value={reference.id}>
+                          Reference {index + 1}
+                          {reference.is_primary ? ' - primary' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Identity strength <span>{identityStrength.toFixed(2)}</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={identityStrength}
+                      disabled={isFlux}
+                      onChange={(event) => setIdentityStrength(Number(event.target.value))}
+                    />
+                  </label>
+                </div>
+                <div className="recipe-check-list">
+                  {data.loras
+                    .filter(
+                      (item) => item.enabled && item.model_family === (isFlux ? 'FLUX' : 'SDXL'),
+                    )
+                    .map((item) => (
+                      <div className="lora-stack-item" key={item.id}>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={loraIds.includes(item.id)}
+                            onChange={() =>
+                              setLoraIds((current) =>
+                                current.includes(item.id)
+                                  ? current.filter((id) => id !== item.id)
+                                  : [...current, item.id],
+                              )
+                            }
+                          />
+                          <span>
+                            <strong>{item.name}</strong>
+                            <small>{item.trigger_token || item.filename}</small>
+                          </span>
+                        </label>
+                        {loraIds.includes(item.id) && (
+                          <div className="form-grid">
+                            <label>
+                              Model weight {Number(loraStrengths[item.id] ?? 1).toFixed(2)}
+                              <input
+                                type="range"
+                                min={0}
+                                max={2}
+                                step={0.05}
+                                value={loraStrengths[item.id] ?? item.default_strength}
+                                onChange={(event) =>
+                                  setLoraStrengths((current) => ({
+                                    ...current,
+                                    [item.id]: Number(event.target.value),
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label>
+                              Text weight {Number(loraClipStrengths[item.id] ?? 1).toFixed(2)}
+                              <input
+                                type="range"
+                                min={0}
+                                max={2}
+                                step={0.05}
+                                value={loraClipStrengths[item.id] ?? item.default_clip_strength}
+                                onChange={(event) =>
+                                  setLoraClipStrengths((current) => ({
+                                    ...current,
+                                    [item.id]: Number(event.target.value),
+                                  }))
+                                }
+                              />
+                            </label>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                </div>
+                <div className="section-rule">
+                  <span>Saved video direction</span>
+                </div>
+                <div className="form-grid">
+                  <label>
+                    Video profile
+                    <select
+                      value={videoProfile}
+                      onChange={(event) => setVideoProfile(event.target.value)}
+                    >
+                      <option value="safe">Safe</option>
+                      <option value="balanced">Balanced</option>
+                      <option value="quality">Quality</option>
+                    </select>
+                  </label>
+                  <label>
+                    Duration
+                    <select
+                      value={videoDuration}
+                      onChange={(event) => setVideoDuration(Number(event.target.value))}
+                    >
+                      <option value={2}>2 seconds</option>
+                      <option value={3}>3 seconds</option>
+                      <option value={4}>4 seconds</option>
                     </select>
                   </label>
                 </div>
+                <label>
+                  Motion prompt
+                  <textarea
+                    value={motionPrompt}
+                    onChange={(event) => setMotionPrompt(event.target.value)}
+                  />
+                </label>
                 <label>
                   Negative prompt
                   <textarea
@@ -2455,6 +2809,7 @@ function MotionLibraryScreen({
 
 const presetCategories = [
   'all',
+  'identity_modifier',
   'wardrobe',
   'expression',
   'pose',
@@ -3049,20 +3404,29 @@ function TrainingScreen({
 
 function PresetsScreen({
   items,
+  recipes,
+  characters,
   refresh,
   notify,
 }: {
   items: PresetRecord[];
+  recipes: RecipeRecord[];
+  characters: CharacterRecord[];
   refresh: () => Promise<void>;
   notify: (message: string) => void;
 }) {
+  const [library, setLibrary] = useState<'presets' | 'recipes'>('presets');
   const [category, setCategory] = useState('all');
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState<PresetRecord | 'new' | null>(null);
+  const [editingRecipe, setEditingRecipe] = useState<RecipeRecord | 'new' | null>(null);
   const filtered = items.filter(
     (item) =>
       (category === 'all' || item.category === category) &&
       `${item.name} ${item.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()),
+  );
+  const filteredRecipes = recipes.filter((item) =>
+    `${item.name} ${item.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()),
   );
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -3077,7 +3441,13 @@ function PresetsScreen({
         .map((tag) => tag.trim())
         .filter(Boolean),
       favorite: editing !== 'new' && editing ? editing.favorite : false,
-      scope: 'global',
+      scope: String(form.get('scope')),
+      scope_id:
+        String(form.get('scope')) === 'character'
+          ? String(form.get('character_scope'))
+          : String(form.get('scope')) === 'project'
+            ? String(form.get('project_scope'))
+            : null,
     };
     if (editing === 'new') await api.post('/presets', payload);
     else if (editing) await api.put(`/presets/${editing.id}`, payload);
@@ -3098,6 +3468,7 @@ function PresetsScreen({
       tags: item.tags,
       favorite: !item.favorite,
       scope: item.scope,
+      scope_id: item.scope_id,
     });
     notify(
       item.origin === 'builtin'
@@ -3106,6 +3477,87 @@ function PresetsScreen({
           ? 'Removed from favorites'
           : 'Added to favorites',
     );
+    await refresh();
+  };
+  const recipeInput = (item: RecipeRecord, overrides: Partial<RecipeRecord> = {}) => ({
+    name: item.name,
+    character_id: item.character_id,
+    freeform_prompt: item.freeform_prompt,
+    negative_prompt: item.negative_prompt,
+    model_profile: item.model_profile,
+    preset_ids: item.preset_ids,
+    scope: item.scope,
+    scope_id: item.scope_id,
+    favorite: item.favorite,
+    tags: item.tags,
+    model_family: item.model_family,
+    model_file: item.model_file,
+    lora_stack: item.lora_stack,
+    identity_settings: item.identity_settings,
+    pose_settings: item.pose_settings,
+    variation_settings: item.variation_settings,
+    video_settings: item.video_settings,
+    generation_settings: item.generation_settings,
+    ...overrides,
+  });
+  const saveRecipeLibrary = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const scope = String(form.get('scope')) as RecipeRecord['scope'];
+    const characterId = String(form.get('character_id')) || null;
+    const base = editingRecipe === 'new' ? null : editingRecipe;
+    const payload = base
+      ? recipeInput(base, {
+          name: String(form.get('name')),
+          character_id: characterId,
+          freeform_prompt: String(form.get('prompt')),
+          negative_prompt: String(form.get('negative')),
+          model_profile: String(form.get('model_profile')) as RecipeRecord['model_profile'],
+          model_family: String(form.get('model_profile')) === 'photoreal_max' ? 'FLUX' : 'SDXL',
+          scope,
+          scope_id:
+            scope === 'character'
+              ? String(form.get('character_scope'))
+              : scope === 'project'
+                ? String(form.get('project_scope'))
+                : null,
+          tags: String(form.get('tags'))
+            .split(',')
+            .map((tag) => tag.trim())
+            .filter(Boolean),
+        })
+      : {
+          name: String(form.get('name')),
+          character_id: characterId,
+          freeform_prompt: String(form.get('prompt')),
+          negative_prompt: String(form.get('negative')),
+          model_profile: String(form.get('model_profile')),
+          preset_ids: [],
+          scope,
+          scope_id:
+            scope === 'character'
+              ? String(form.get('character_scope'))
+              : scope === 'project'
+                ? String(form.get('project_scope'))
+                : null,
+          favorite: false,
+          tags: String(form.get('tags'))
+            .split(',')
+            .map((tag) => tag.trim())
+            .filter(Boolean),
+          model_family: String(form.get('model_profile')) === 'photoreal_max' ? 'FLUX' : 'SDXL',
+          model_file: '',
+          lora_stack: [],
+          identity_settings: {},
+          pose_settings: {},
+          variation_settings: {},
+          video_settings: {},
+          generation_settings: {},
+        };
+    if (base) await api.put(`/recipes/${base.id}`, payload);
+    else await api.post('/recipes', payload);
+    setEditingRecipe(null);
+    notify(base ? 'Recipe updated' : 'Recipe created');
     await refresh();
   };
   const duplicate = async (item: PresetRecord) => {
@@ -3143,12 +3595,42 @@ function PresetsScreen({
     };
     reader.readAsText(file);
   };
+  const exportRecipes = async () => {
+    const payload = await api.get('/recipes-export');
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'vanta-recipes.json';
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify('Recipe library exported');
+  };
+  const importRecipes = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        await api.post('/recipes-import', JSON.parse(String(reader.result)));
+        notify('Recipes imported');
+        await refresh();
+      } catch {
+        notify('Import failed: choose a Vanta recipe export');
+      }
+    };
+    reader.readAsText(file);
+  };
   return (
     <div className="screen">
       <PageTitle
         eyebrow="Creative library"
-        title="Presets that become yours."
-        body="Start curated. Duplicate, tag, and reshape anything without losing the original."
+        title={
+          library === 'presets' ? 'Presets that become yours.' : 'Complete recipes, remembered.'
+        }
+        body={
+          library === 'presets'
+            ? 'Start curated. Duplicate, tag, and reshape anything without losing the original.'
+            : 'Model, LoRAs, identity, pose, variation, video, and generation settings stay together.'
+        }
         actions={
           <>
             <label className="v-button v-button--secondary file-button">
@@ -3158,54 +3640,151 @@ function PresetsScreen({
                 accept="application/json"
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-                  if (file) importJson(file);
+                  if (file) (library === 'presets' ? importJson : importRecipes)(file);
                 }}
               />
             </label>
-            <Button onClick={() => void exportJson()}>
+            <Button onClick={() => void (library === 'presets' ? exportJson() : exportRecipes())}>
               <FileDown /> Export
             </Button>
-            <Button variant="primary" onClick={() => setEditing('new')}>
-              <Plus /> New preset
+            <Button
+              variant="primary"
+              onClick={() => (library === 'presets' ? setEditing('new') : setEditingRecipe('new'))}
+            >
+              <Plus /> New {library === 'presets' ? 'preset' : 'recipe'}
             </Button>
           </>
         }
       />
+      <div className="mode-switch library-switch" role="group" aria-label="Creative library type">
+        <button
+          className={library === 'presets' ? 'active' : ''}
+          onClick={() => setLibrary('presets')}
+        >
+          Presets
+        </button>
+        <button
+          className={library === 'recipes' ? 'active' : ''}
+          onClick={() => setLibrary('recipes')}
+        >
+          Recipes
+        </button>
+      </div>
       <div className="library-toolbar">
         <div className="search-field">
           <Search />
           <input
-            aria-label="Search presets"
-            placeholder="Search names and tags"
+            aria-label={`Search ${library}`}
+            placeholder={`Search ${library} by name or tag`}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
-        <div className="category-tabs" role="tablist" aria-label="Preset categories">
-          {presetCategories.map((item) => (
-            <button
-              key={item}
-              role="tab"
-              aria-selected={category === item}
-              className={category === item ? 'active' : ''}
-              onClick={() => setCategory(item)}
-            >
-              {item.replace('_', ' ')}
-            </button>
-          ))}
-        </div>
-        <Button
-          variant="ghost"
-          onClick={async () => {
-            await api.post('/presets/restore-builtins');
-            notify('Built-in presets restored');
-            await refresh();
-          }}
-        >
-          <RotateCcw /> Restore built-ins
-        </Button>
+        {library === 'presets' && (
+          <div className="category-tabs" role="tablist" aria-label="Preset categories">
+            {presetCategories.map((item) => (
+              <button
+                key={item}
+                role="tab"
+                aria-selected={category === item}
+                className={category === item ? 'active' : ''}
+                onClick={() => setCategory(item)}
+              >
+                {item.replace('_', ' ')}
+              </button>
+            ))}
+          </div>
+        )}
+        {library === 'presets' && (
+          <Button
+            variant="ghost"
+            onClick={async () => {
+              await api.post('/presets/restore-builtins');
+              notify('Built-in presets restored');
+              await refresh();
+            }}
+          >
+            <RotateCcw /> Restore built-ins
+          </Button>
+        )}
       </div>
-      {filtered.length === 0 ? (
+      {library === 'recipes' ? (
+        filteredRecipes.length === 0 ? (
+          <EmptyState
+            title="No recipes match"
+            body="Create a recipe here or save the current composition from Create."
+            action={<Button onClick={() => setEditingRecipe('new')}>New recipe</Button>}
+          />
+        ) : (
+          <div className="preset-grid">
+            {filteredRecipes.map((recipe) => (
+              <Panel className="preset-card recipe-card" key={recipe.id}>
+                <header>
+                  <span className="preset-origin user">{recipe.scope} recipe</span>
+                  <button
+                    className={`icon-button ${recipe.favorite ? 'favorite' : ''}`}
+                    aria-label={`${recipe.favorite ? 'Unfavorite' : 'Favorite'} ${recipe.name}`}
+                    onClick={async () => {
+                      await api.put(
+                        `/recipes/${recipe.id}`,
+                        recipeInput(recipe, { favorite: !recipe.favorite }),
+                      );
+                      await refresh();
+                    }}
+                  >
+                    <Heart fill={recipe.favorite ? 'currentColor' : 'none'} />
+                  </button>
+                </header>
+                <span className="eyebrow">
+                  {recipe.model_family} · {recipe.model_profile}
+                </span>
+                <h2>{recipe.name}</h2>
+                <p>{recipe.freeform_prompt || 'Preset-led composition'}</p>
+                <div className="tag-row">
+                  {recipe.tags.map((tag) => (
+                    <span className="tag" key={tag}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+                <small>
+                  {recipe.preset_ids.length} presets · {recipe.lora_stack.length} LoRAs ·{' '}
+                  {String(recipe.generation_settings.width ?? 'default')} ×{' '}
+                  {String(recipe.generation_settings.height ?? 'default')}
+                </small>
+                <footer>
+                  <Button variant="ghost" onClick={() => setEditingRecipe(recipe)}>
+                    <Edit3 /> Edit
+                  </Button>
+                  <button
+                    className="icon-button"
+                    aria-label={`Duplicate ${recipe.name}`}
+                    onClick={async () => {
+                      await api.post(`/recipes/${recipe.id}/duplicate`);
+                      notify('Recipe duplicated');
+                      await refresh();
+                    }}
+                  >
+                    <Copy />
+                  </button>
+                  <button
+                    className="icon-button danger"
+                    aria-label={`Delete ${recipe.name}`}
+                    onClick={async () => {
+                      if (!window.confirm(`Delete ${recipe.name}?`)) return;
+                      await api.delete(`/recipes/${recipe.id}`);
+                      notify('Recipe deleted');
+                      await refresh();
+                    }}
+                  >
+                    <Trash2 />
+                  </button>
+                </footer>
+              </Panel>
+            ))}
+          </div>
+        )
+      ) : filtered.length === 0 ? (
         <EmptyState
           title="No presets match"
           body="Clear the search or create a preset in this category."
@@ -3348,12 +3927,184 @@ function PresetsScreen({
                 placeholder="editorial, moody, indoor"
               />
             </label>
+            <div className="form-grid">
+              <label>
+                Scope
+                <select name="scope" defaultValue={editing === 'new' ? 'global' : editing.scope}>
+                  <option value="global">Global</option>
+                  <option value="character">Character</option>
+                  <option value="project">Project</option>
+                </select>
+              </label>
+              <label>
+                Character scope
+                <select
+                  name="character_scope"
+                  defaultValue={editing === 'new' ? '' : (editing.scope_id ?? '')}
+                >
+                  <option value="">Choose a character</option>
+                  {characters.map((character) => (
+                    <option key={character.id} value={character.id}>
+                      {character.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label>
+              Project scope name
+              <input
+                name="project_scope"
+                defaultValue={
+                  editing !== 'new' && editing.scope === 'project' ? (editing.scope_id ?? '') : ''
+                }
+                placeholder="Campaign or project name"
+              />
+            </label>
             <footer>
               <Button type="button" variant="ghost" onClick={() => setEditing(null)}>
                 Cancel
               </Button>
               <Button variant="primary" type="submit">
                 Save {editing !== 'new' && editing.origin === 'builtin' ? 'as copy' : 'preset'}
+              </Button>
+            </footer>
+          </form>
+        </div>
+      )}
+      {editingRecipe && (
+        <div className="modal-layer">
+          <form className="modal modal--wide" onSubmit={(event) => void saveRecipeLibrary(event)}>
+            <header>
+              <div>
+                <span className="eyebrow">
+                  {editingRecipe === 'new' ? 'New recipe' : 'Edit recipe'}
+                </span>
+                <h2>
+                  {editingRecipe === 'new' ? 'Save a complete composition' : editingRecipe.name}
+                </h2>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => setEditingRecipe(null)}
+                aria-label="Close recipe editor"
+              >
+                <X />
+              </button>
+            </header>
+            <div className="form-grid">
+              <label>
+                Name
+                <input
+                  name="name"
+                  required
+                  autoFocus
+                  defaultValue={editingRecipe === 'new' ? '' : editingRecipe.name}
+                />
+              </label>
+              <label>
+                Model profile
+                <select
+                  name="model_profile"
+                  defaultValue={
+                    editingRecipe === 'new' ? 'photoreal_balanced' : editingRecipe.model_profile
+                  }
+                >
+                  <option value="photoreal_balanced">Realistic - Balanced</option>
+                  <option value="preview_fast">Preview - Fast</option>
+                  <option value="photoreal_max">Realistic - Maximum (FLUX)</option>
+                </select>
+              </label>
+            </div>
+            <label>
+              Custom positive prompt
+              <textarea
+                name="prompt"
+                defaultValue={editingRecipe === 'new' ? '' : editingRecipe.freeform_prompt}
+              />
+            </label>
+            <label>
+              Custom negative prompt
+              <textarea
+                name="negative"
+                defaultValue={editingRecipe === 'new' ? '' : editingRecipe.negative_prompt}
+              />
+            </label>
+            <div className="form-grid">
+              <label>
+                Character
+                <select
+                  name="character_id"
+                  defaultValue={editingRecipe === 'new' ? '' : (editingRecipe.character_id ?? '')}
+                >
+                  <option value="">No character</option>
+                  {characters.map((character) => (
+                    <option key={character.id} value={character.id}>
+                      {character.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Scope
+                <select
+                  name="scope"
+                  defaultValue={editingRecipe === 'new' ? 'global' : editingRecipe.scope}
+                >
+                  <option value="global">Global</option>
+                  <option value="character">Character</option>
+                  <option value="project">Project</option>
+                </select>
+              </label>
+              <label>
+                Character scope
+                <select
+                  name="character_scope"
+                  defaultValue={editingRecipe === 'new' ? '' : (editingRecipe.scope_id ?? '')}
+                >
+                  <option value="">Choose a character</option>
+                  {characters.map((character) => (
+                    <option key={character.id} value={character.id}>
+                      {character.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Project scope name
+                <input
+                  name="project_scope"
+                  defaultValue={
+                    editingRecipe !== 'new' && editingRecipe.scope === 'project'
+                      ? (editingRecipe.scope_id ?? '')
+                      : ''
+                  }
+                />
+              </label>
+            </div>
+            <label>
+              Tags
+              <input
+                name="tags"
+                defaultValue={editingRecipe === 'new' ? '' : editingRecipe.tags.join(', ')}
+              />
+            </label>
+            {editingRecipe !== 'new' && (
+              <div className="copy-notice">
+                <Info />
+                <span>
+                  Advanced LoRA, identity, pose, variation, video, and generation settings are
+                  preserved here. Open this recipe in Create to tune them visually.
+                </span>
+              </div>
+            )}
+            <footer>
+              <Button type="button" variant="ghost" onClick={() => setEditingRecipe(null)}>
+                Cancel
+              </Button>
+              <Button type="submit" variant="primary">
+                Save recipe
               </Button>
             </footer>
           </form>
@@ -4340,7 +5091,7 @@ function EngineScreen({
     setBusy(item.id);
     try {
       await api.post(`/engine/components/${item.id}/${action}`);
-      notify(`${action === 'repair' ? 'Repair' : 'Installation'} started for ${item.display_name}`);
+      notify(`${item.display_name}: ${action.replace('_', ' ')}`);
       await refresh();
     } finally {
       setBusy('');
@@ -4398,6 +5149,27 @@ function EngineScreen({
       setBusy('');
     }
   };
+  const importLocalLora = async () => {
+    const sourcePath = await chooseLocalLoraFile();
+    if (!sourcePath) return;
+    const filename = sourcePath.split(/[\\/]/).pop() ?? 'Local LoRA';
+    setBusy('lora-import');
+    try {
+      await api.post('/loras/import', {
+        source_path: sourcePath,
+        name: filename.replace(/\.safetensors$/i, ''),
+        source_notes: 'Imported from a user-selected local file',
+        license_notes: '',
+        trigger_token: '',
+        default_strength: 1,
+        default_clip_strength: 1,
+      });
+      notify('Local LoRA imported and verified');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
   return (
     <div className="screen engine-screen">
       <PageTitle
@@ -4408,6 +5180,9 @@ function EngineScreen({
           <>
             <Button onClick={() => void importLocalModel()} disabled={busy === 'model-import'}>
               <Upload /> Import local model
+            </Button>
+            <Button onClick={() => void importLocalLora()} disabled={busy === 'lora-import'}>
+              <Plus /> Import LoRA
             </Button>
             <Button onClick={async () => setDiagnostics(await api.get('/engine/diagnostics'))}>
               <Info /> Diagnostics
@@ -4472,6 +5247,35 @@ function EngineScreen({
               </header>
               <h3>{item.display_name}</h3>
               <p>{item.last_health_message}</p>
+              <details className="component-provenance">
+                <summary>Version & provenance</summary>
+                <dl>
+                  <div>
+                    <dt>Version</dt>
+                    <dd>{item.version}</dd>
+                  </div>
+                  <div>
+                    <dt>Revision</dt>
+                    <dd>{item.revision}</dd>
+                  </div>
+                  <div>
+                    <dt>License</dt>
+                    <dd>{item.license.name}</dd>
+                  </div>
+                  {item.sha256 && (
+                    <div>
+                      <dt>SHA-256</dt>
+                      <dd className="hash-value">{item.sha256}</dd>
+                    </div>
+                  )}
+                  {item.source && (
+                    <div>
+                      <dt>Source</dt>
+                      <dd>{item.source}</dd>
+                    </div>
+                  )}
+                </dl>
+              </details>
               <div className="capability-list">
                 {item.capabilities.map((capability) => (
                   <span key={capability}>
@@ -4491,15 +5295,54 @@ function EngineScreen({
                 ) : item.state === 'ready' ? (
                   <>
                     <Button
-                      onClick={() => void componentAction(item, 'health_check')}
+                      onClick={() => void componentAction(item, 'verify')}
                       disabled={busy === item.id}
                     >
                       <ShieldCheck /> Verify
                     </Button>
-                    {(item.id === 'pose-control' || item.id === 'identity-lock') && (
+                    <Button
+                      variant="ghost"
+                      onClick={() => void componentAction(item, 'update')}
+                      disabled={busy === item.id}
+                    >
+                      Update
+                    </Button>
+                    {item.id === 'workflow-runtime' && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          onClick={() => void componentAction(item, 'restart')}
+                          disabled={busy === item.id}
+                        >
+                          Restart
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          onClick={() => void componentAction(item, 'pause')}
+                          disabled={busy === item.id}
+                        >
+                          Pause
+                        </Button>
+                      </>
+                    )}
+                    {[
+                      'workflow-runtime',
+                      'pose-control',
+                      'identity-lock',
+                      'lora-training',
+                      'captioning',
+                    ].includes(item.id) && (
                       <Button
                         variant="ghost"
-                        onClick={() => void componentAction(item, 'remove')}
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Remove ${item.display_name}? User projects and media remain.`,
+                            )
+                          ) {
+                            void componentAction(item, 'remove');
+                          }
+                        }}
                         disabled={busy === item.id}
                       >
                         Remove
@@ -4512,16 +5355,22 @@ function EngineScreen({
                     onClick={() =>
                       void componentAction(
                         item,
-                        item.state === 'repair_needed'
-                          ? 'repair'
-                          : item.state === 'installing'
-                            ? 'cancel'
-                            : 'install',
+                        ['stopped', 'paused'].includes(item.state)
+                          ? 'resume'
+                          : item.state === 'repair_needed'
+                            ? 'repair'
+                            : item.state === 'installing'
+                              ? 'cancel'
+                              : 'install',
                       )
                     }
                     disabled={busy === item.id}
                   >
-                    {item.state === 'repair_needed' ? (
+                    {['stopped', 'paused'].includes(item.state) ? (
+                      <>
+                        <Play /> Resume {item.display_name}
+                      </>
+                    ) : item.state === 'repair_needed' ? (
                       <>
                         <Wrench /> Repair {item.display_name}
                       </>
@@ -4575,7 +5424,14 @@ function EngineScreen({
                     <span>
                       <ShieldCheck /> {item.license.name}
                     </span>
+                    {item.filename && (
+                      <span>
+                        <Box /> {item.filename}
+                      </span>
+                    )}
                   </div>
+                  {item.sha256 && <p className="hash-value">SHA-256 {item.sha256}</p>}
+                  {item.source_information && <p>{item.source_information}</p>}
                 </div>
               </div>
               <div className="model-actions">
@@ -4599,7 +5455,7 @@ function EngineScreen({
                   )}
                 {!item.installed &&
                   !['photoreal_balanced', 'preview_fast', 'photoreal_max'].includes(item.alias) &&
-                  (item.alias === 'identity_plus_face_sdxl' ? (
+                  (item.alias === 'identity_plus_face_sdxl' || item.alias === 'video_ltx_2b' ? (
                     <Button
                       onClick={() => void packAction(item, 'install')}
                       disabled={busy === item.id}
@@ -4643,7 +5499,7 @@ function EngineScreen({
                     Verify
                   </Button>
                 )}
-                {item.installed && !item.is_default && item.alias === 'pose_xinsir_sdxl' && (
+                {item.installed && !item.is_default && (
                   <Button
                     variant="ghost"
                     onClick={() => void packAction(item, 'remove')}
@@ -4656,6 +5512,91 @@ function EngineScreen({
             </Panel>
           ))}
         </div>
+      </section>
+      <section className="engine-section">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Reusable adapters</span>
+            <h2>Imported & trained LoRAs</h2>
+          </div>
+          <p>
+            Every adapter retains its family, trigger, source notes, license notes, size and hash.
+          </p>
+        </div>
+        {data.loras.length ? (
+          <div className="model-list">
+            {data.loras.map((item) => (
+              <Panel className="model-card" key={item.id}>
+                <div className="model-card__lead">
+                  <div className="model-family">{item.model_family}</div>
+                  <div>
+                    <div className="model-title">
+                      <h3>{item.name}</h3>
+                    </div>
+                    <p>{item.trigger_token || 'No trigger token recorded'}</p>
+                    <div className="model-meta">
+                      <span>
+                        <Database /> {(item.file_size / 1_000_000).toFixed(1)} MB
+                      </span>
+                      <span>
+                        <ShieldCheck /> {item.license_notes || 'User-provided license notes'}
+                      </span>
+                    </div>
+                    <p className="hash-value">SHA-256 {item.sha256}</p>
+                  </div>
+                </div>
+                <div className="model-actions">
+                  <StatusPill tone={item.verification_state === 'ready' ? 'ready' : 'danger'}>
+                    {stateLabels[item.verification_state] ?? item.verification_state}
+                  </StatusPill>
+                  <Button
+                    variant="ghost"
+                    onClick={async () => {
+                      await api.post(`/loras/${item.id}/verify`);
+                      notify(`${item.name} verified`);
+                      await refresh();
+                    }}
+                  >
+                    Verify
+                  </Button>
+                  {item.verification_state === 'repair_needed' && (
+                    <Button
+                      variant="primary"
+                      onClick={async () => {
+                        await api.post(`/loras/${item.id}/repair`);
+                        notify(`${item.name} repaired from its verified original`);
+                        await refresh();
+                      }}
+                    >
+                      Repair
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    onClick={async () => {
+                      if (
+                        !window.confirm(
+                          `Remove ${item.name}? Character assignments will also be removed.`,
+                        )
+                      )
+                        return;
+                      await api.delete(`/loras/${item.id}`);
+                      notify(`${item.name} removed`);
+                      await refresh();
+                    }}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              </Panel>
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            title="No LoRAs installed"
+            body="Import an owned compatible SDXL or FLUX LoRA, or train one locally."
+          />
+        )}
       </section>
       <Drawer
         open={diagnostics !== null}
@@ -4682,6 +5623,19 @@ function EngineScreen({
             <Button onClick={() => void exportDiagnostics()}>
               <FileDown /> Export support bundle
             </Button>
+            <Button onClick={() => void openLocalPath('logs')}>
+              <FolderLock /> Open logs
+            </Button>
+            {diagnostics.system && (
+              <dl className="runtime-diagnostics">
+                {Object.entries(diagnostics.system).map(([key, value]) => (
+                  <div key={key}>
+                    <dt>{key.replaceAll('_', ' ')}</dt>
+                    <dd>{String(value ?? 'Not running')}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
           </div>
         )}
       </Drawer>
@@ -4691,10 +5645,12 @@ function EngineScreen({
 
 function SettingsScreen({
   settings,
+  hardware,
   refresh,
   notify,
 }: {
   settings: SettingsRecord;
+  hardware: AppData['hardware'];
   refresh: () => Promise<void>;
   notify: (message: string) => void;
 }) {
@@ -4725,7 +5681,10 @@ function SettingsScreen({
                 Studio data
                 <div>
                   <input value={settings.paths.data} readOnly />
-                  <Button aria-label="Open studio data folder">
+                  <Button
+                    aria-label="Open studio data folder"
+                    onClick={() => void openLocalPath('data')}
+                  >
                     <MoreHorizontal />
                   </Button>
                 </div>
@@ -4734,7 +5693,10 @@ function SettingsScreen({
                 Model packs
                 <div>
                   <input value={settings.paths.models} readOnly />
-                  <Button aria-label="Open model pack folder">
+                  <Button
+                    aria-label="Open model pack folder"
+                    onClick={() => void openLocalPath('models')}
+                  >
                     <MoreHorizontal />
                   </Button>
                 </div>
@@ -4743,7 +5705,10 @@ function SettingsScreen({
                 Database
                 <div>
                   <input value={settings.paths.database} readOnly />
-                  <Button aria-label="Show database location">
+                  <Button
+                    aria-label="Show database location"
+                    onClick={() => void openLocalPath('database')}
+                  >
                     <MoreHorizontal />
                   </Button>
                 </div>
@@ -4766,17 +5731,14 @@ function SettingsScreen({
                 <p>Local cache and generated media allocation.</p>
               </div>
             </div>
-            <div className="storage-bar">
-              <span style={{ width: '34%' }} />
-            </div>
             <div className="storage-legend">
               <span>
                 <i />
-                Vanta assets · 31.4 GB
+                Vanta-managed files
               </span>
-              <span>186 GB free</span>
+              <span>{hardware.free_disk_gb.toFixed(1)} GB free</span>
             </div>
-            <Button>Review local storage</Button>
+            <Button onClick={() => void openLocalPath('data')}>Review local storage</Button>
           </Panel>
         </div>
         <div>
@@ -4793,15 +5755,17 @@ function SettingsScreen({
                 <strong>Default creation mode</strong>
                 <span>Simple keeps advanced engine controls out of the way.</span>
               </div>
-              <div className="mode-switch">
+              <div className="mode-switch" role="group" aria-label="Default creation mode">
                 <button
                   className={settings.values.default_mode !== 'studio' ? 'active' : ''}
+                  aria-pressed={settings.values.default_mode !== 'studio'}
                   onClick={() => void update('default_mode', 'simple')}
                 >
                   Simple
                 </button>
                 <button
                   className={settings.values.default_mode === 'studio' ? 'active' : ''}
+                  aria-pressed={settings.values.default_mode === 'studio'}
                   onClick={() => void update('default_mode', 'studio')}
                 >
                   Studio
@@ -4850,6 +5814,32 @@ function SettingsScreen({
                 <Check /> No paid API fallback
               </span>
             </div>
+          </Panel>
+          <Panel className="settings-panel about-panel">
+            <div className="settings-heading">
+              <Info />
+              <div>
+                <h2>About Vanta</h2>
+                <p>Essential V1 · desktop 0.1.0 · local orchestrator 0.1.0</p>
+              </div>
+            </div>
+            <dl className="about-facts">
+              <div>
+                <dt>Architecture</dt>
+                <dd>Tauri · React · FastAPI · SQLite · managed ComfyUI</dd>
+              </div>
+              <div>
+                <dt>Networking</dt>
+                <dd>Authenticated loopback only · 127.0.0.1</dd>
+              </div>
+              <div>
+                <dt>Data ownership</dt>
+                <dd>User-owned local files with numbered upgrade migrations</dd>
+              </div>
+            </dl>
+            <Button onClick={() => void openLocalPath('logs')}>
+              <FileDown /> Open local logs
+            </Button>
           </Panel>
         </div>
       </div>

@@ -51,4 +51,18 @@ def test_migrations_create_all_required_tables(client):
     assert {"preview_path", "start_seconds", "fit_mode", "smoothing", "strength"}.issubset(
         motion_columns
     )
+    preset_columns = {row[1] for row in connection.execute("PRAGMA table_info(presets)")}
+    assert "scope_id" in preset_columns
+    recipe_columns = {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
+    assert {
+        "scope_id",
+        "model_family",
+        "model_file",
+        "lora_stack",
+        "identity_settings",
+        "pose_settings",
+        "variation_settings",
+        "video_settings",
+        "generation_settings",
+    }.issubset(recipe_columns)
     connection.close()

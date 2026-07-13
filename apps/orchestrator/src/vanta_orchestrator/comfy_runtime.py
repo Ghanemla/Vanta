@@ -134,6 +134,12 @@ class ManagedComfyRuntime:
             self._refresh_process_state()
             return RuntimeSnapshot(self._state, self._port, self._message, self.revision)
 
+    @property
+    def process_id(self) -> int | None:
+        with self._lock:
+            self._refresh_process_state()
+            return self._process.pid if self._process is not None else None
+
     def installed_layout(self) -> tuple[Path, Path] | None:
         if not self.root.is_dir():
             return None
@@ -308,6 +314,14 @@ class ManagedComfyRuntime:
             self._port = None
             self._state = "stopped" if self.installed_layout() else "not_installed"
             self._message = "Local Generation Engine stopped"
+
+    def remove(self) -> None:
+        self.stop()
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        self._set_state(
+            "not_installed", "Local Generation Engine was removed; models and media remain"
+        )
 
     def _request_json(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         snapshot = self.snapshot()

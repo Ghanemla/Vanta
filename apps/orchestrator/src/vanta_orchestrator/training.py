@@ -197,6 +197,23 @@ class TrainingService:
     def component_action(self, item_id: str, action: str) -> dict[str, Any]:
         if item_id not in {"lora-training", "captioning"}:
             raise KeyError(item_id)
+        if action == "verify":
+            action = "health_check"
+        if action == "update":
+            manifest = (
+                self._trainer_manifest if item_id == "lora-training" else self._caption_manifest
+            )
+            row = self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,))
+            if row and row["manifest_version"] == manifest.version:
+                self.db.execute(
+                    "UPDATE engine_components SET last_health_message=?,updated_at=? WHERE id=?",
+                    (f"Already current at {manifest.version}", utc_now(), item_id),
+                )
+                return (
+                    self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,))
+                    or {}
+                )
+            action = "repair"
         if action in {"install", "repair"}:
             thread = self._component_threads.get(item_id)
             if thread is None or not thread.is_alive():

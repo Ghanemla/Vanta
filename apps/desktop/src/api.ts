@@ -84,6 +84,12 @@ export const chooseLocalVideoFile = () => chooseLocalFile('choose_local_video_fi
 export const chooseLocalLoraFile = () => chooseLocalFile('choose_local_lora_file');
 export const chooseLocalUpscalerFile = () => chooseLocalFile('choose_local_upscaler_file');
 
+export async function openLocalPath(kind: 'data' | 'models' | 'logs' | 'database'): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('open_local_path', { kind });
+}
+
 export async function exportDiagnostics(): Promise<void> {
   const response = await fetch(`${apiBase}/api/diagnostics/export`, {
     headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},

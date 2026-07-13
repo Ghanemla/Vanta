@@ -5,6 +5,33 @@ def test_health_is_loopback_only(client):
     assert response.json()["privacy"] == "local-only"
 
 
+def test_engine_diagnostics_and_support_bundle_are_sanitized_and_traceable(client):
+    import io
+    import json
+    import zipfile
+    from pathlib import Path
+
+    components = client.get("/api/engine/components").json()
+    assert components
+    assert all(
+        {"version", "revision", "source", "sha256", "license"} <= item.keys() for item in components
+    )
+    diagnostics = client.get("/api/engine/diagnostics")
+    assert diagnostics.status_code == 200
+    payload = diagnostics.json()
+    assert payload["system"]["orchestrator_host"] == "127.0.0.1"
+    assert "active_jobs" in payload["runtime"]
+    assert payload["components"]
+
+    exported = client.get("/api/diagnostics/export")
+    assert exported.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        assert {"system-metadata.json", "engine-diagnostics.json"} <= set(archive.namelist())
+        bundled = archive.read("engine-diagnostics.json").decode()
+        assert str(Path.home()) not in bundled
+        assert json.loads(bundled)["system"]["orchestrator_host"] == "127.0.0.1"
+
+
 def test_character_crud_archives_without_deleting(client):
     payload = {"name": "Mara", "identity_description": "Original adult character, age 29"}
     created = client.post("/api/characters", json=payload)
@@ -50,6 +77,90 @@ def test_preset_crud_and_builtin_copy_rule(client):
     assert copied.json()["origin"] == "user"
     assert copied.json()["source_preset_id"] == builtin["id"]
     assert client.delete(f"/api/presets/{preset_id}").status_code == 204
+
+
+def test_complete_scoped_recipe_round_trip_and_json_portability(client):
+    character = client.post(
+        "/api/characters",
+        json={"name": "Recipe subject", "identity_description": "Original adult character"},
+    ).json()
+    categories = {item["category"] for item in client.get("/api/presets").json()}
+    assert categories == {
+        "identity_modifier",
+        "wardrobe",
+        "expression",
+        "pose",
+        "location",
+        "lighting",
+        "camera",
+        "quality",
+        "negative",
+        "motion",
+    }
+    scoped_preset = client.post(
+        "/api/presets",
+        json={
+            "category": "location",
+            "name": "Character loft",
+            "prompt": "restrained private loft",
+            "scope": "character",
+            "scope_id": character["id"],
+        },
+    ).json()
+    payload = {
+        "name": "Complete editorial direction",
+        "character_id": character["id"],
+        "freeform_prompt": "authored positive direction",
+        "negative_prompt": "watermark, text",
+        "model_profile": "photoreal_balanced",
+        "preset_ids": [scoped_preset["id"]],
+        "scope": "project",
+        "scope_id": "Autumn campaign",
+        "favorite": True,
+        "tags": ["campaign", "editorial"],
+        "model_family": "SDXL",
+        "model_file": "verified-local-model.safetensors",
+        "lora_stack": [{"id": "lora-local", "strength": 0.75, "clip_strength": 0.9}],
+        "identity_settings": {"reference_id": "reference-local", "strength": 0.65},
+        "pose_settings": {"pose_id": "pose-local", "strength": 0.8},
+        "variation_settings": {"mode": "lighting", "strength": 0.35},
+        "video_settings": {"profile": "safe", "duration_seconds": 3},
+        "generation_settings": {
+            "width": 768,
+            "height": 1024,
+            "steps": 28,
+            "guidance": 5.5,
+            "sampler": "dpmpp_2m",
+            "scheduler": "karras",
+            "mode": "studio",
+        },
+    }
+    created = client.post("/api/recipes", json=payload)
+    assert created.status_code == 201
+    recipe = created.json()
+    assert recipe["scope_id"] == "Autumn campaign"
+    assert recipe["lora_stack"][0]["strength"] == 0.75
+    assert recipe["generation_settings"]["scheduler"] == "karras"
+    assert recipe["items"][0]["preset_id"] == scoped_preset["id"]
+
+    updated_payload = {**payload, "name": "Updated direction", "favorite": False}
+    updated = client.put(f"/api/recipes/{recipe['id']}", json=updated_payload)
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Updated direction"
+    duplicate = client.post(f"/api/recipes/{recipe['id']}/duplicate")
+    assert duplicate.status_code == 201
+    assert duplicate.json()["generation_settings"] == payload["generation_settings"]
+    exported = client.get("/api/recipes-export").json()
+    assert exported["schema_version"] == 1
+    assert len(exported["recipes"]) == 2
+    assert client.post("/api/recipes-import", json=exported).status_code == 200
+    rejected = client.put(
+        f"/api/recipes/{recipe['id']}",
+        json={**updated_payload, "name": "Must not partially save", "preset_ids": ["missing"]},
+    )
+    assert rejected.status_code == 422
+    assert client.get(f"/api/recipes/{recipe['id']}").json()["name"] == "Updated direction"
+    assert client.delete(f"/api/recipes/{recipe['id']}").status_code == 204
 
 
 def test_recipe_and_real_generation_queue_are_not_seeded_with_fixtures(client):
@@ -107,6 +218,7 @@ def test_engine_manifest_and_model_pack_services(client):
 
 def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):
     import json
+    from pathlib import Path
 
     from PIL import Image
 
@@ -136,6 +248,13 @@ def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):
     )
     assert lora.status_code == 201
     assert lora.json()["model_family"] == "SDXL"
+    managed_lora = Path(lora.json()["installed_path"])
+    managed_lora.unlink()
+    assert client.get("/api/loras").json()[0]["verification_state"] == "repair_needed"
+    repaired = client.post(f"/api/loras/{lora.json()['id']}/repair")
+    assert repaired.status_code == 200
+    assert repaired.json()["verification_state"] == "ready"
+    assert managed_lora.is_file()
     assignment = client.put(
         f"/api/characters/{character['id']}/loras",
         json={"lora_id": lora.json()["id"], "strength": 0.7, "clip_strength": 0.8},
