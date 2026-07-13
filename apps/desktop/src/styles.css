@@ -2258,6 +2258,120 @@ button.tag.active {
     justify-content: flex-start;
   }
 }
+.pose-create-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  padding: 18px 0;
+  border-top: 1px solid var(--v-line);
+}
+.pose-create-control .field-help {
+  grid-column: 1 / -1;
+  margin: -4px 0 0;
+  color: var(--v-muted);
+  font-size: 12px;
+}
+.pose-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  gap: 18px;
+}
+.pose-card {
+  display: grid;
+  gap: 16px;
+}
+.pose-card > header,
+.pose-card > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.pose-character-name,
+.pose-favorite {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--v-muted);
+  font-size: 12px;
+}
+.pose-favorite {
+  color: var(--v-accent-muted);
+}
+.pose-favorite svg {
+  width: 14px;
+  height: 14px;
+}
+.pose-comparison {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  overflow: hidden;
+  border-radius: var(--v-radius-md);
+  background: var(--v-line);
+}
+.pose-comparison > div {
+  position: relative;
+  min-height: 220px;
+  background: var(--v-bg);
+}
+.pose-comparison img,
+.pose-image-placeholder {
+  width: 100%;
+  height: 100%;
+  min-height: 220px;
+  object-fit: cover;
+}
+.pose-image-placeholder {
+  background: linear-gradient(135deg, var(--v-panel-raised), var(--v-bg));
+}
+.pose-comparison span {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: var(--v-text);
+  background: rgb(9 9 13 / 82%);
+  font-size: 12px;
+}
+.pose-drop-zone {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 28px;
+  border: 1px dashed var(--v-line-strong);
+  border-radius: var(--v-radius-md);
+  background: var(--v-bg-raised);
+  text-align: center;
+}
+.pose-drop-zone > svg {
+  color: var(--v-accent);
+}
+.inline-error {
+  padding: 10px 12px;
+  border-left: 3px solid var(--v-danger);
+  color: var(--v-danger);
+  background: color-mix(in srgb, var(--v-danger) 8%, transparent);
+}
+.checkbox-row {
+  display: flex !important;
+  align-items: center;
+  gap: 10px;
+}
+.checkbox-row input {
+  width: 18px;
+  height: 18px;
+}
+@media (max-width: 760px) {
+  .pose-create-control {
+    grid-template-columns: 1fr;
+  }
+  .pose-grid {
+    grid-template-columns: 1fr;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

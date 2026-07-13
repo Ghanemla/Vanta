@@ -4,21 +4,38 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
+import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
-from .comfy_runtime import ManagedComfyRuntime, sha256_file, validate_safetensors
+from .comfy_runtime import (
+    ManagedComfyRuntime,
+    ensure_safe_archive_members,
+    sha256_file,
+    validate_safetensors,
+)
 from .config import Settings
 from .database import Database, utc_now
 
 logger = logging.getLogger("vanta.orchestrator.engine")
+
+POSE_PACK_ALIAS = "pose_xinsir_sdxl"
+POSE_CONTROL_FILENAME = "xinsir-openpose-sdxl-1.0.safetensors"
+POSE_EXTENSION_PATCH = "dwpose-minimal-imports-003"
+IDENTITY_PACK_ALIAS = "identity_plus_face_sdxl"
+IDENTITY_ADAPTER_FILENAME = "ip-adapter-plus-face_sdxl_vit-h.safetensors"
+IDENTITY_CLIP_FILENAME = "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
 
 ComponentState = Literal[
     "not_installed",
@@ -51,7 +68,7 @@ class ComponentManifest(BaseModel):
     pinned_revision: str
     source: dict[str, Any]
     license: LicenseMetadata
-    install_strategy: Literal["managed_archive", "managed_fixture"]
+    install_strategy: Literal["managed_archive", "managed_fixture", "managed_extension_archive"]
     health_checks: list[dict[str, str]]
     repair_strategy: Literal["reverify_and_restore"]
     dependencies: list[str]
@@ -154,6 +171,24 @@ def detect_hardware(data_dir: Path) -> dict[str, Any]:
 
 class WorkflowCompiler:
     version = "image-sdxl-photoreal-v1"
+
+    @classmethod
+    def workflow_version(
+        cls,
+        *,
+        source_image: bool = False,
+        identity_image: bool = False,
+        pose_image: bool = False,
+    ) -> str:
+        if identity_image and pose_image:
+            return "image-sdxl-identity-pose-v1"
+        if identity_image:
+            return "image-sdxl-identity-ipadapter-v1"
+        if pose_image:
+            return "image-sdxl-pose-controlnet-v1"
+        if source_image:
+            return "image-sdxl-variation-img2img-v1"
+        return cls.version
 
     @staticmethod
     def compile_prompt(request: dict[str, Any]) -> str:
@@ -277,7 +312,7 @@ class WorkflowCompiler:
                 "class_type": "DiffControlNetLoader",
                 "inputs": {
                     "model": workflow["5"]["inputs"]["model"],
-                    "control_net_name": "control-lora-openposeXL2-rank256.safetensors",
+                    "control_net_name": POSE_CONTROL_FILENAME,
                 },
             }
             workflow["32"] = {
@@ -329,8 +364,16 @@ class WorkflowCompiler:
 
 
 class EngineService:
-    allowed_component_actions = {"install", "repair", "cancel", "health_check", "start", "stop"}
-    allowed_pack_actions = {"verify", "repair", "remove", "set_default"}
+    allowed_component_actions = {
+        "install",
+        "repair",
+        "cancel",
+        "health_check",
+        "start",
+        "stop",
+        "remove",
+    }
+    allowed_pack_actions = {"install", "verify", "repair", "remove", "set_default"}
 
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -349,7 +392,11 @@ class EngineService:
         )
         self.hardware = detect_hardware(settings.data_dir)
         self._install_thread: threading.Thread | None = None
+        self._identity_install_thread: threading.Thread | None = None
+        self._pack_threads: dict[str, threading.Thread] = {}
         self._seed()
+        self._sync_pose_component()
+        self._sync_identity_component()
 
     def close(self) -> None:
         self.runtime.stop()
@@ -357,10 +404,18 @@ class EngineService:
     def _seed(self) -> None:
         now = utc_now()
         for component in self.core.components:
-            state = "not_installed" if component.id == "workflow-runtime" else "unsupported"
+            state = (
+                "not_installed"
+                if component.id in {"workflow-runtime", "pose-control", "identity-lock"}
+                else "unsupported"
+            )
             message = (
                 "Install the managed local image engine to continue"
                 if component.id == "workflow-runtime"
+                else "Install the reviewed local DWPose preprocessor"
+                if component.id == "pose-control"
+                else "Install the reviewed local identity-conditioning extension"
+                if component.id == "identity-lock"
                 else "Coming later; this capability is not included in the current image release"
             )
             self.db.execute(
@@ -369,12 +424,20 @@ class EngineService:
                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (component.id, component.display_name, component.version, state, 0, message, now),
             )
+            self.db.execute(
+                "UPDATE engine_components SET display_name=?, manifest_version=?, updated_at=? WHERE id=?",
+                (component.display_name, component.version, now, component.id),
+            )
         for pack in self.pack_collection.packs:
             self.db.execute(
                 """INSERT OR IGNORE INTO model_packs
                 (id, alias, display_name, state, installed, verified, is_default, progress, metadata, updated_at)
                 VALUES (?, ?, ?, 'not_installed', 0, 0, 0, 0, ?, ?)""",
                 (pack.id, pack.alias, pack.display_name, pack.model_dump_json(), now),
+            )
+            self.db.execute(
+                "UPDATE model_packs SET display_name=?, metadata=?, updated_at=? WHERE id=? AND installed=0",
+                (pack.display_name, pack.model_dump_json(), now, pack.id),
             )
         self._sync_runtime()
 
@@ -411,6 +474,8 @@ class EngineService:
 
     def list_components(self) -> list[dict[str, Any]]:
         self._sync_runtime()
+        self._sync_pose_component()
+        self._sync_identity_component()
         manifests = {item.id: item for item in self.core.components}
         return [
             {
@@ -424,6 +489,41 @@ class EngineService:
     def component_action(self, item_id: str, action: str) -> dict[str, Any]:
         if action not in self.allowed_component_actions:
             raise ValueError("Unsupported component action")
+        if item_id == "pose-control":
+            if action in {"install", "repair"}:
+                if self._install_thread is None or not self._install_thread.is_alive():
+                    self._component_progress(1, "Preparing the managed DWPose installation")
+                    self._install_thread = threading.Thread(
+                        target=self._install_pose_component, daemon=True
+                    )
+                    self._install_thread.start()
+            elif action == "remove":
+                self._remove_pose_component()
+            elif action == "health_check":
+                self._verify_pose_component()
+            else:
+                raise ValueError("Use Install, Verify, Repair, or Remove for Pose Control")
+            return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
+        if item_id == "identity-lock":
+            if action in {"install", "repair"}:
+                if (
+                    self._identity_install_thread is None
+                    or not self._identity_install_thread.is_alive()
+                ):
+                    self._identity_component_progress(
+                        1, "Preparing the managed Identity Lock installation"
+                    )
+                    self._identity_install_thread = threading.Thread(
+                        target=self._install_identity_component, daemon=True
+                    )
+                    self._identity_install_thread.start()
+            elif action == "remove":
+                self._remove_identity_component()
+            elif action == "health_check":
+                self._verify_identity_component()
+            else:
+                raise ValueError("Use Install, Verify, Repair, or Remove for Identity Lock")
+            return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
         if item_id != "workflow-runtime":
             raise ValueError(
                 "This capability is coming later and is not available in the image release"
@@ -444,6 +544,368 @@ class EngineService:
             self.runtime.wait_healthy(timeout=15)
         self._sync_runtime()
         return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
+
+    def _pose_manifest(self) -> ComponentManifest:
+        return next(item for item in self.core.components if item.id == "pose-control")
+
+    def _identity_manifest(self) -> ComponentManifest:
+        return next(item for item in self.core.components if item.id == "identity-lock")
+
+    def _identity_extension_root(self) -> Path | None:
+        layout = self.runtime.installed_layout()
+        return layout[0].parent / "custom_nodes" / "ComfyUI_IPAdapter_plus" if layout else None
+
+    def _sync_identity_component(self) -> None:
+        root = self._identity_extension_root()
+        row = self.db.query_one("SELECT state FROM engine_components WHERE id='identity-lock'")
+        if row and row["state"] == "installing":
+            return
+        if root is None or not (root / ".vanta-component.json").is_file():
+            self.db.execute(
+                "UPDATE engine_components SET state='not_installed', progress=0, last_health_message=?, updated_at=? WHERE id='identity-lock'",
+                ("Install the reviewed local identity-conditioning extension", utc_now()),
+            )
+
+    def _identity_component_progress(self, progress: int, message: str) -> None:
+        self.db.execute(
+            "UPDATE engine_components SET state='installing', progress=?, last_health_message=?, updated_at=? WHERE id='identity-lock'",
+            (progress, message, utc_now()),
+        )
+
+    def _install_identity_component(self) -> None:
+        manifest = self._identity_manifest()
+        try:
+            root = self._identity_extension_root()
+            if root is None:
+                raise ValueError("Install the Local Generation Engine before Identity Lock")
+            self._identity_component_progress(5, "Downloading the reviewed identity extension")
+            archive = self._download_verified(
+                str(manifest.source["url"]),
+                self.settings.engine_root
+                / "downloads"
+                / f"identity-lock-{manifest.pinned_revision}.zip",
+                int(manifest.source["bytes"]),
+                str(manifest.source["sha256"]),
+                lambda value: self._identity_component_progress(
+                    min(70, 5 + round(value * 0.65)),
+                    "Downloading the reviewed identity extension",
+                ),
+            )
+            self.runtime.stop()
+            staging = self.settings.engine_root / f"identity-staging-{uuid.uuid4().hex}"
+            staging.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(archive) as bundle:
+                    ensure_safe_archive_members(bundle.namelist())
+                    bundle.extractall(staging)
+                source = next(staging.iterdir())
+                if root.exists():
+                    shutil.rmtree(root)
+                shutil.copytree(source, root)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+            (root / ".vanta-component.json").write_text(
+                json.dumps(
+                    {"revision": manifest.pinned_revision, "sha256": manifest.source["sha256"]}
+                ),
+                encoding="utf-8",
+            )
+            self._identity_component_progress(90, "Restarting and verifying Identity Lock")
+            self._verify_identity_component()
+        except Exception as error:
+            logger.exception("managed identity component installation failed")
+            self.db.execute(
+                "UPDATE engine_components SET state='repair_needed', progress=0, last_health_message=?, updated_at=? WHERE id='identity-lock'",
+                (str(error), utc_now()),
+            )
+
+    def _verify_identity_component(self) -> None:
+        root = self._identity_extension_root()
+        if root is None or not (root / ".vanta-component.json").is_file():
+            raise ValueError("Identity Lock is not installed")
+        manifest = self._identity_manifest()
+        marker = json.loads((root / ".vanta-component.json").read_text(encoding="utf-8"))
+        if marker.get("revision") != manifest.pinned_revision:
+            raise ValueError("Identity Lock is out of date; use Repair")
+        self.runtime.stop()
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=90):
+            raise ValueError("The local engine did not restart after installing Identity Lock")
+        nodes = self.runtime._request_json("/object_info")
+        if not {"IPAdapterUnifiedLoader", "IPAdapterAdvanced"}.issubset(nodes):
+            raise ValueError("The managed identity-conditioning extension did not load; use Repair")
+        self.db.execute(
+            "UPDATE engine_components SET state='ready', progress=100, last_health_message=?, updated_at=? WHERE id='identity-lock'",
+            ("Identity reference conditioning is installed and verified locally", utc_now()),
+        )
+
+    def _remove_identity_component(self) -> None:
+        self.runtime.stop()
+        root = self._identity_extension_root()
+        if root and (root / ".vanta-component.json").is_file():
+            shutil.rmtree(root)
+        self.db.execute(
+            "UPDATE engine_components SET state='not_installed', progress=0, last_health_message=?, updated_at=? WHERE id='identity-lock'",
+            ("Identity Lock was removed; character references remain in your library", utc_now()),
+        )
+        self.runtime.start()
+
+    def _pose_extension_root(self) -> Path | None:
+        layout = self.runtime.installed_layout()
+        return layout[0].parent / "custom_nodes" / "comfyui_controlnet_aux" if layout else None
+
+    def _sync_pose_component(self) -> None:
+        root = self._pose_extension_root()
+        row = self.db.query_one("SELECT state FROM engine_components WHERE id='pose-control'")
+        if row and row["state"] == "installing":
+            return
+        if root is None or not (root / ".vanta-component.json").is_file():
+            self.db.execute(
+                "UPDATE engine_components SET state='not_installed', progress=0, last_health_message=?, updated_at=? WHERE id='pose-control'",
+                ("Install the reviewed local pose preprocessor", utc_now()),
+            )
+
+    def _component_progress(self, progress: int, message: str) -> None:
+        self.db.execute(
+            "UPDATE engine_components SET state='installing', progress=?, last_health_message=?, updated_at=? WHERE id='pose-control'",
+            (progress, message, utc_now()),
+        )
+
+    @staticmethod
+    def _patch_dwpose_extension(root: Path) -> None:
+        """Remove unused legacy OpenPose imports from the maintained DWPose wrapper."""
+        module = root / "src" / "custom_controlnet_aux" / "dwpose" / "__init__.py"
+        source = module.read_text(encoding="utf-8")
+        original = (
+            "from .body import Body, BodyResult, Keypoint\n"
+            "from .hand import Hand\n"
+            "from .face import Face\n"
+            "from .types import PoseResult, HandResult, FaceResult, AnimalPoseResult"
+        )
+        replacement = (
+            "from .types import (\n"
+            "    AnimalPoseResult,\n"
+            "    BodyResult,\n"
+            "    FaceResult,\n"
+            "    HandResult,\n"
+            "    Keypoint,\n"
+            "    PoseResult,\n"
+            ")"
+        )
+        if original not in source:
+            raise RuntimeError("The reviewed DWPose compatibility patch no longer applies")
+        module.write_text(source.replace(original, replacement, 1), encoding="utf-8")
+
+        utility = root / "src" / "custom_controlnet_aux" / "dwpose" / "util.py"
+        source = utility.read_text(encoding="utf-8")
+        color_expression = "matplotlib.colors.hsv_to_rgb([ie / float(len(edges)), 1.0, 1.0]) * 255"
+        if (
+            "import matplotlib" not in source
+            or "from .body import BodyResult, Keypoint" not in source
+            or color_expression not in source
+        ):
+            raise RuntimeError("The reviewed DWPose color compatibility patch no longer applies")
+        source = source.replace("import matplotlib", "import colorsys", 1)
+        source = source.replace(
+            "from .body import BodyResult, Keypoint",
+            "from .types import BodyResult, Keypoint",
+            1,
+        )
+        source = source.replace(
+            color_expression,
+            "np.array(colorsys.hsv_to_rgb(ie / float(len(edges)), 1.0, 1.0)) * 255",
+            1,
+        )
+        utility.write_text(source, encoding="utf-8")
+
+    @staticmethod
+    def _download_verified(
+        url: str,
+        destination: Path,
+        expected_size: int,
+        expected_hash: str,
+        progress: Callable[[int], None] | None = None,
+    ) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        existing = destination.stat().st_size if destination.exists() else 0
+        if existing == expected_size and sha256_file(destination) == expected_hash:
+            return destination
+        request = Request(url, headers={"User-Agent": "Vanta/0.1", "Range": f"bytes={existing}-"})
+        try:
+            with urlopen(request, timeout=45) as response:
+                resumed = existing > 0 and response.status == 206
+                written = existing if resumed else 0
+                with destination.open("ab" if resumed else "wb") as target:
+                    while chunk := response.read(1024 * 1024):
+                        target.write(chunk)
+                        written += len(chunk)
+                        if progress:
+                            progress(min(95, round(100 * written / expected_size)))
+        except URLError as error:
+            raise RuntimeError("Vanta could not download the reviewed component") from error
+        if destination.stat().st_size != expected_size or sha256_file(destination) != expected_hash:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError("The managed component download failed verification")
+        return destination
+
+    def _install_pose_component(self) -> None:
+        manifest = self._pose_manifest()
+        try:
+            root = self._pose_extension_root()
+            layout = self.runtime.installed_layout()
+            if root is None or layout is None:
+                raise ValueError("Install the Local Generation Engine before Pose Control")
+            self._component_progress(5, "Downloading the reviewed pose preprocessor")
+            archive = self._download_verified(
+                str(manifest.source["url"]),
+                self.settings.engine_root
+                / "downloads"
+                / f"pose-control-{manifest.pinned_revision}.zip",
+                int(manifest.source["bytes"]),
+                str(manifest.source["sha256"]),
+                lambda value: self._component_progress(
+                    min(45, 5 + round(value * 0.4)), "Downloading the reviewed pose preprocessor"
+                ),
+            )
+            wheel_metadata = manifest.source["python_wheel"]
+            self._component_progress(46, "Downloading the pinned local vision runtime")
+            wheel = self._download_verified(
+                str(wheel_metadata["url"]),
+                self.settings.engine_root / "downloads" / Path(str(wheel_metadata["url"])).name,
+                int(wheel_metadata["bytes"]),
+                str(wheel_metadata["sha256"]),
+                lambda value: self._component_progress(
+                    min(54, 46 + round(value * 0.08)), "Downloading the pinned local vision runtime"
+                ),
+            )
+            asset_downloads: list[tuple[dict[str, Any], Path]] = []
+            for index, asset in enumerate(manifest.source["model_assets"]):
+                self._component_progress(55 + index * 7, f"Downloading {asset['name']}")
+                downloaded = self._download_verified(
+                    str(asset["url"]),
+                    self.settings.engine_root / "downloads" / str(asset["filename"]),
+                    int(asset["bytes"]),
+                    str(asset["sha256"]),
+                    lambda value, index=index, name=str(asset["name"]): self._component_progress(
+                        min(68, 55 + index * 7 + round(value * 0.06)), f"Downloading {name}"
+                    ),
+                )
+                asset_downloads.append((asset, downloaded))
+            self.runtime.stop()
+            staging = self.settings.engine_root / f"pose-staging-{uuid.uuid4().hex}"
+            staging.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(archive) as bundle:
+                    ensure_safe_archive_members(bundle.namelist())
+                    bundle.extractall(staging)
+                source = next(staging.iterdir())
+                if root.exists():
+                    shutil.rmtree(root)
+                shutil.copytree(source, root)
+                self._patch_dwpose_extension(root)
+                asset_root = root / "ckpts" / "yzd-v" / "DWPose"
+                asset_root.mkdir(parents=True, exist_ok=True)
+                for asset, downloaded in asset_downloads:
+                    shutil.copy2(downloaded, asset_root / str(asset["filename"]))
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+            self._component_progress(72, "Installing the pinned local vision runtime")
+            completed = subprocess.run(
+                [
+                    str(layout[1]),
+                    "-s",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-index",
+                    "--no-deps",
+                    "--force-reinstall",
+                    str(wheel),
+                ],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+                timeout=1800,
+            )
+            if completed.returncode != 0:
+                details = completed.stdout.decode("utf-8", errors="replace")[-800:]
+                raise RuntimeError(f"Pose dependency installation failed: {details}")
+            (root / ".vanta-component.json").write_text(
+                json.dumps(
+                    {
+                        "revision": manifest.pinned_revision,
+                        "sha256": manifest.source["sha256"],
+                        "vanta_patch": POSE_EXTENSION_PATCH,
+                        "python_wheel": {
+                            "name": wheel_metadata["name"],
+                            "version": wheel_metadata["version"],
+                            "sha256": wheel_metadata["sha256"],
+                        },
+                        "model_assets": [
+                            {
+                                "filename": asset["filename"],
+                                "sha256": asset["sha256"],
+                                "bytes": asset["bytes"],
+                            }
+                            for asset in manifest.source["model_assets"]
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._component_progress(90, "Restarting and verifying Pose Control")
+            self._verify_pose_component()
+        except Exception as error:
+            logger.exception("managed pose component installation failed")
+            self.db.execute(
+                "UPDATE engine_components SET state='repair_needed', progress=0, last_health_message=?, updated_at=? WHERE id='pose-control'",
+                (str(error), utc_now()),
+            )
+
+    def _verify_pose_component(self) -> None:
+        root = self._pose_extension_root()
+        if root is None or not (root / ".vanta-component.json").is_file():
+            raise ValueError("Pose Control is not installed")
+        manifest = self._pose_manifest()
+        marker = json.loads((root / ".vanta-component.json").read_text(encoding="utf-8"))
+        if marker.get("revision") != manifest.pinned_revision:
+            raise ValueError("Pose Control is out of date; use Repair")
+        if marker.get("vanta_patch") != POSE_EXTENSION_PATCH:
+            raise ValueError("Pose Control needs the current Vanta compatibility patch; use Repair")
+        for asset in manifest.source["model_assets"]:
+            path = root / "ckpts" / "yzd-v" / "DWPose" / str(asset["filename"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(asset["bytes"])
+                or sha256_file(path) != str(asset["sha256"])
+            ):
+                raise ValueError(f"{asset['name']} failed verification; use Repair")
+        self.runtime.stop()
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=90):
+            raise ValueError("The local engine did not restart after installing Pose Control")
+        nodes = self.runtime._request_json("/object_info")
+        if "DWPreprocessor" not in nodes:
+            raise ValueError("The managed pose preprocessor did not load; use Repair")
+        self.db.execute(
+            "UPDATE engine_components SET state='ready', progress=100, last_health_message=?, updated_at=? WHERE id='pose-control'",
+            ("DWPose extraction and its pinned local assets are verified", utc_now()),
+        )
+
+    def _remove_pose_component(self) -> None:
+        self.runtime.stop()
+        root = self._pose_extension_root()
+        if root and (root / ".vanta-component.json").is_file():
+            shutil.rmtree(root)
+        self.db.execute(
+            "UPDATE engine_components SET state='not_installed', progress=0, last_health_message=?, updated_at=? WHERE id='pose-control'",
+            ("Pose Control was removed; saved pose assets remain in your library", utc_now()),
+        )
+        self.runtime.start()
 
     def _pack_row(self, alias: str) -> dict[str, Any]:
         row = self.db.query_one("SELECT * FROM model_packs WHERE alias=?", (alias,))
@@ -544,17 +1006,15 @@ class EngineService:
             if not source.is_file():
                 raise ValueError(f"Choose an existing local {label} file")
             validate_safetensors(source)
-        adapter_target = (
-            self.settings.ipadapter_root / "ip-adapter-plus-face_sdxl_vit-h.safetensors"
-        )
-        clip_target = self.settings.clip_vision_root / "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+        adapter_target = self.settings.ipadapter_root / IDENTITY_ADAPTER_FILENAME
+        clip_target = self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME
         self.settings.ipadapter_root.mkdir(parents=True, exist_ok=True)
         self.settings.clip_vision_root.mkdir(parents=True, exist_ok=True)
         if adapter_source != adapter_target:
             shutil.copy2(adapter_source, adapter_target)
         if clip_source != clip_target:
             shutil.copy2(clip_source, clip_target)
-        metadata = json.loads(self._pack_row("identity_plus_face_sdxl")["metadata"])
+        metadata = json.loads(self._pack_row(IDENTITY_PACK_ALIAS)["metadata"])
         metadata.update(
             {
                 "filename": adapter_target.name,
@@ -581,15 +1041,25 @@ class EngineService:
         return self.verify_identity_adapter()
 
     def verify_identity_adapter(self) -> dict[str, Any]:
-        row = self._pack_row("identity_plus_face_sdxl")
-        adapter = self.settings.ipadapter_root / "ip-adapter-plus-face_sdxl_vit-h.safetensors"
-        encoder = self.settings.clip_vision_root / "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+        row = self._pack_row(IDENTITY_PACK_ALIAS)
+        adapter = self.settings.ipadapter_root / IDENTITY_ADAPTER_FILENAME
+        encoder = self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME
         if not adapter.is_file() or not encoder.is_file():
             raise ValueError(
                 "Identity Lock is missing its adapter or CLIP Vision encoder; import both to repair"
             )
         validate_safetensors(adapter)
         validate_safetensors(encoder)
+        expected = json.loads(row["metadata"])
+        download = expected["download"]
+        clip = download["clip_vision"]
+        if (
+            adapter.stat().st_size != int(download["bytes"])
+            or sha256_file(adapter) != expected["sha256"]
+            or encoder.stat().st_size != int(clip["bytes"])
+            or sha256_file(encoder) != clip["sha256"]
+        ):
+            raise ValueError("Identity Lock model files failed manifest verification; use Repair")
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
             raise ValueError("Start the Local Generation Engine before verifying Identity Lock")
@@ -610,7 +1080,7 @@ class EngineService:
             "UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100, metadata=?, updated_at=? WHERE alias='identity_plus_face_sdxl'",
             (json.dumps(metadata), utc_now()),
         )
-        return self._pack_row("identity_plus_face_sdxl")
+        return self._pack_row(IDENTITY_PACK_ALIAS)
 
     def verify_upscaler(self, alias: str) -> dict[str, Any]:
         names = {
@@ -710,22 +1180,175 @@ class EngineService:
             )
         return rows
 
+    def _install_pose_pack(self, item_id: str) -> None:
+        try:
+            row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
+            if row is None:
+                raise KeyError(item_id)
+            metadata = json.loads(row["metadata"])
+            download = metadata["download"]
+            destination = self.settings.controlnet_root / Path(metadata["target_path"]).name
+            self.db.execute(
+                "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
+                (utc_now(), item_id),
+            )
+
+            def progress(value: int) -> None:
+                self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
+                    (value, utc_now(), item_id),
+                )
+
+            self._download_verified(
+                str(download["url"]),
+                destination,
+                int(download["bytes"]),
+                str(metadata["sha256"]),
+                progress,
+            )
+            self.db.execute(
+                """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
+                installed_path=?, original_path=?, file_size=?, license_notes=?, imported_at=?, updated_at=? WHERE id=?""",
+                (
+                    str(destination),
+                    str(download["url"]),
+                    destination.stat().st_size,
+                    metadata["license"]["name"],
+                    utc_now(),
+                    utc_now(),
+                    item_id,
+                ),
+            )
+            self.verify_pose_pack()
+        except Exception:
+            logger.exception("managed pose model installation failed")
+            self.db.execute(
+                "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
+                (utc_now(), item_id),
+            )
+
+    def verify_pose_pack(self) -> dict[str, Any]:
+        row = self._pack_row(POSE_PACK_ALIAS)
+        metadata = json.loads(row["metadata"])
+        path = self.settings.controlnet_root / Path(metadata["target_path"]).name
+        if not path.is_file() or path.stat().st_size != int(metadata["download"]["bytes"]):
+            raise ValueError("The Pose Control model is missing or incomplete; use Repair")
+        validate_safetensors(path)
+        if sha256_file(path) != metadata["sha256"]:
+            raise ValueError("The Pose Control model failed hash verification; use Repair")
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=45):
+            raise ValueError("Start the Local Generation Engine before verifying Pose Control")
+        nodes = self.runtime._request_json("/object_info")
+        missing = {"DiffControlNetLoader", "ControlNetApplyAdvanced"} - set(nodes)
+        if missing:
+            raise ValueError("The local engine is missing compatible Pose Control runtime support")
+        self.db.execute(
+            """UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100,
+            installed_path=?, file_size=?, updated_at=? WHERE alias=?""",
+            (str(path), path.stat().st_size, utc_now(), POSE_PACK_ALIAS),
+        )
+        return self._pack_row(POSE_PACK_ALIAS)
+
+    def _install_identity_pack(self, item_id: str) -> None:
+        try:
+            row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
+            if row is None:
+                raise KeyError(item_id)
+            metadata = json.loads(row["metadata"])
+            download = metadata["download"]
+            clip = download["clip_vision"]
+            adapter_path = self.settings.ipadapter_root / IDENTITY_ADAPTER_FILENAME
+            clip_path = self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME
+            self._download_verified(
+                str(download["url"]),
+                adapter_path,
+                int(download["bytes"]),
+                str(metadata["sha256"]),
+                lambda value: self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
+                    (min(25, round(value * 0.25)), utc_now(), item_id),
+                ),
+            )
+            self._download_verified(
+                str(clip["url"]),
+                clip_path,
+                int(clip["bytes"]),
+                str(clip["sha256"]),
+                lambda value: self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
+                    (min(95, 25 + round(value * 0.7)), utc_now(), item_id),
+                ),
+            )
+            self.db.execute(
+                """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
+                installed_path=?, original_path=?, file_size=?, license_notes=?, imported_at=?, updated_at=? WHERE id=?""",
+                (
+                    str(adapter_path),
+                    str(download["url"]),
+                    adapter_path.stat().st_size + clip_path.stat().st_size,
+                    metadata["license"]["name"],
+                    utc_now(),
+                    utc_now(),
+                    item_id,
+                ),
+            )
+            self.verify_identity_adapter()
+        except Exception:
+            logger.exception("managed identity model installation failed")
+            self.db.execute(
+                "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
+                (utc_now(), item_id),
+            )
+
     def pack_action(self, item_id: str, action: str) -> dict[str, Any]:
         if action not in self.allowed_pack_actions:
             raise ValueError("Unsupported model-pack action")
         row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
         if row is None:
             raise KeyError(item_id)
+        if row["alias"] == POSE_PACK_ALIAS and action in {"install", "repair"}:
+            thread = self._pack_threads.get(item_id)
+            if thread is None or not thread.is_alive():
+                self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
+                    (utc_now(), item_id),
+                )
+                thread = threading.Thread(
+                    target=self._install_pose_pack, args=(item_id,), daemon=True
+                )
+                self._pack_threads[item_id] = thread
+                thread.start()
+            return self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,)) or {}
+        if row["alias"] == IDENTITY_PACK_ALIAS and action in {"install", "repair"}:
+            thread = self._pack_threads.get(item_id)
+            if thread is None or not thread.is_alive():
+                self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
+                    (utc_now(), item_id),
+                )
+                thread = threading.Thread(
+                    target=self._install_identity_pack, args=(item_id,), daemon=True
+                )
+                self._pack_threads[item_id] = thread
+                thread.start()
+            return self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,)) or {}
         if action in {"verify", "repair"}:
-            if row["alias"] == "identity_plus_face_sdxl":
+            if row["alias"] == POSE_PACK_ALIAS:
+                return self.verify_pose_pack()
+            if row["alias"] == IDENTITY_PACK_ALIAS:
                 return self.verify_identity_adapter()
             if row["alias"] in {"realesrgan_x2plus", "ultrasharp_x4"}:
                 return self.verify_upscaler(row["alias"])
             return self.verify_model(row["alias"])
+        if action == "install":
+            raise ValueError("This pack is installed with its dedicated import action")
         if action == "remove":
             if row["is_default"]:
                 raise ValueError("Choose another verified model before removing the default")
             Path(row.get("installed_path") or "").unlink(missing_ok=True)
+            if row["alias"] == IDENTITY_PACK_ALIAS:
+                (self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME).unlink(missing_ok=True)
             self.db.execute(
                 "UPDATE model_packs SET state='not_installed', installed=0, verified=0, progress=0, installed_path=NULL, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
@@ -905,7 +1528,11 @@ class GenerationService:
                 rendered.thumbnail((480, 480))
                 rendered.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
             metadata = {
-                "workflow_version": WorkflowCompiler.version,
+                "workflow_version": WorkflowCompiler.workflow_version(
+                    source_image=bool(source_image_name),
+                    identity_image=bool(identity_image_name),
+                    pose_image=bool(pose_image_name),
+                ),
                 "compiled_positive_prompt": WorkflowCompiler.compile_prompt(request),
                 "negative_prompt": request.get("negative_prompt", ""),
                 "model_filename": Path(model["installed_path"]).name,
@@ -1150,12 +1777,12 @@ class GenerationService:
         pose = self.db.query_one("SELECT * FROM pose_assets WHERE id=?", (pose_id,))
         if pose is None or not Path(pose["control_path"]).is_file():
             raise ValueError("The selected pose control image is no longer available")
-        model = (
-            self.engine.settings.controlnet_root / "control-lora-openposeXL2-rank256.safetensors"
-        )
+        if pose["character_id"] and pose["character_id"] != request.get("character_id"):
+            raise ValueError("This pose belongs to a different character")
+        model = self.engine.settings.controlnet_root / POSE_CONTROL_FILENAME
         if not model.is_file():
             raise ValueError(
-                "Install the Vanta OpenPose XL control model before using a saved pose"
+                "Install the Vanta Xinsir OpenPose SDXL control model before using a saved pose"
             )
         layout = self.engine.runtime.installed_layout()
         if layout is None:
@@ -1169,10 +1796,13 @@ class GenerationService:
             if request.get("pose_strength") is not None
             else pose["strength"]
         )
-        return f"Vanta/{filename}", {
+        metadata = {
             key: pose[key]
             for key in (
                 "id",
+                "name",
+                "scope",
+                "strength",
                 "source_sha256",
                 "control_sha256",
                 "crop_settings",
@@ -1180,6 +1810,8 @@ class GenerationService:
                 "workflow_pack_version",
             )
         }
+        metadata["strength"] = request["pose_strength"]
+        return f"Vanta/{filename}", metadata
 
     def get(self, job_id: str) -> dict[str, Any]:
         job = self.db.query_one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))

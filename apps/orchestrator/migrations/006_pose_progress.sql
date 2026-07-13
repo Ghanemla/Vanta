@@ -1,0 +1,4 @@
+ALTER TABLE pose_assets ADD COLUMN status TEXT NOT NULL DEFAULT 'ready';
+ALTER TABLE pose_assets ADD COLUMN progress INTEGER NOT NULL DEFAULT 100;
+ALTER TABLE pose_assets ADD COLUMN error_message TEXT;
+

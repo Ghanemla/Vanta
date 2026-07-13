@@ -117,26 +117,59 @@
       "active_default": false
     },
     {
+      "id": "vanta-pose-xinsir-sdxl-v1",
+      "alias": "pose_xinsir_sdxl",
+      "display_name": "Pose — Xinsir OpenPose SDXL",
+      "model_family": "SDXL ControlNet",
+      "capabilities": ["Pose Control", "Identity Lock + Pose", "12 GB Safe Profile"],
+      "hardware": { "minimum_vram_gb": 8, "recommended_vram_gb": 12, "minimum_ram_gb": 24 },
+      "disk_gb": 2.51,
+      "download": {
+        "source_name": "Xinsir OpenPose SDXL official model repository",
+        "url": "https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0/resolve/229b885b1a6108259d8d0e128a726ba4416ce385/diffusion_pytorch_model.safetensors?download=true",
+        "bytes": 2502139104,
+        "authentication": "none",
+        "source_revision": "229b885b1a6108259d8d0e128a726ba4416ce385"
+      },
+      "license": {
+        "name": "Apache-2.0; review and acceptance required",
+        "acceptance_required": true,
+        "source_url": "https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0"
+      },
+      "sha256": "b8524e557a7df60d081f5d4a0eb109967d107df217943bf88c2d99b9ebcc06c5",
+      "target_path": "models/controlnet/xinsir-openpose-sdxl-1.0.safetensors",
+      "compatible_workflows": ["pose-dwpose-sdxl-v1", "image-sdxl-identity-pose-v1"],
+      "active_default": false
+    },
+    {
       "id": "vanta-identity-plus-face-sdxl-v1",
       "alias": "identity_plus_face_sdxl",
       "display_name": "Identity — Plus Face SDXL",
       "model_family": "SDXL IP-Adapter Plus Face",
       "capabilities": ["Character Reference Conditioning", "Identity Lock"],
       "hardware": { "minimum_vram_gb": 10, "recommended_vram_gb": 12, "minimum_ram_gb": 24 },
-      "disk_gb": 1.98,
+      "disk_gb": 3.38,
       "download": {
-        "source_name": "IP-Adapter official local model source",
-        "url": "https://huggingface.co/h94/IP-Adapter",
-        "authentication": "none"
+        "source_name": "h94 IP-Adapter official model repository",
+        "url": "https://huggingface.co/h94/IP-Adapter/resolve/018e402774aeeddd60609b4ecdb7e298259dc729/sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors?download=true",
+        "bytes": 847517512,
+        "authentication": "none",
+        "source_revision": "018e402774aeeddd60609b4ecdb7e298259dc729",
+        "clip_vision": {
+          "filename": "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors",
+          "url": "https://huggingface.co/h94/IP-Adapter/resolve/018e402774aeeddd60609b4ecdb7e298259dc729/models/image_encoder/model.safetensors?download=true",
+          "bytes": 2528373448,
+          "sha256": "6ca9667da1ca9e0b0f75e46bb030f7e011f44f86cbfb8d5a36590fcd7507b030"
+        }
       },
       "license": {
-        "name": "Apache-2.0 (IP-Adapter source); verify model-card terms on import",
+        "name": "Apache-2.0; review and acceptance required",
         "acceptance_required": true,
         "source_url": "https://huggingface.co/h94/IP-Adapter"
       },
       "sha256": "677ad8860204f7d0bfba12d29e6c31ded9beefdf3e4bbd102518357d31a292c1",
       "target_path": "models/ipadapter/ip-adapter-plus-face_sdxl_vit-h.safetensors",
-      "compatible_workflows": ["image-sdxl-identity-ipadapter-v1"],
+      "compatible_workflows": ["image-sdxl-identity-ipadapter-v1", "image-sdxl-identity-pose-v1"],
       "active_default": false
     }
   ]

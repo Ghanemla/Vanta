@@ -150,4 +150,15 @@ export const api = {
       throw new ApiError('Vanta could not load this local reference.', response.status);
     return URL.createObjectURL(await response.blob());
   },
+  poseImageUrl: async (
+    poseId: string,
+    variant: 'source' | 'source-thumbnail' | 'control' | 'control-thumbnail',
+  ) => {
+    const response = await fetch(`${apiBase}/api/poses/${poseId}/${variant}`, {
+      headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
+    });
+    if (!response.ok)
+      throw new ApiError('Vanta could not load this local pose image.', response.status);
+    return URL.createObjectURL(await response.blob());
+  },
 };

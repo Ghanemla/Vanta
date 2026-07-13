@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from vanta_orchestrator.comfy_runtime import ensure_safe_archive_members, validate_safetensors
-from vanta_orchestrator.engine import WorkflowCompiler
+from vanta_orchestrator.engine import POSE_CONTROL_FILENAME, WorkflowCompiler
+from vanta_orchestrator.pose import PoseService
 
 
 def test_prompt_compilation_is_stable_and_workflow_is_local_comfy_api_shape():
@@ -119,3 +120,36 @@ def test_identity_workflow_uses_the_managed_ipadapter_not_a_prompt_only_substitu
     assert workflow["21"]["inputs"]["preset"] == "PLUS FACE (portraits)"
     assert workflow["22"]["class_type"] == "IPAdapterAdvanced"
     assert workflow["5"]["inputs"]["model"] == ["22", 0]
+
+
+def test_pose_extraction_and_identity_pose_generation_use_managed_nodes():
+    extraction = PoseService._extraction_workflow("pose-1", "owned-reference.png")
+    assert extraction["2"]["class_type"] == "DWPreprocessor"
+    assert extraction["2"]["inputs"]["bbox_detector"] == "yolox_l.onnx"
+    assert extraction["2"]["inputs"]["pose_estimator"] == "dw-ll_ucoco_384.onnx"
+
+    request = {
+        "direction": "original adult editorial portrait",
+        "negative_prompt": "",
+        "seed": 10,
+        "width": 768,
+        "height": 1024,
+        "steps": 2,
+        "guidance": 5.5,
+    }
+    workflow = WorkflowCompiler().compile(
+        request,
+        "model.safetensors",
+        identity_image_name="Vanta/identity-reference.png",
+        pose_image_name="Vanta/pose.png",
+        pose_strength=0.7,
+    )
+    assert workflow["31"]["class_type"] == "DiffControlNetLoader"
+    assert workflow["31"]["inputs"]["control_net_name"] == POSE_CONTROL_FILENAME
+    assert workflow["32"]["inputs"]["strength"] == 0.7
+    assert workflow["31"]["inputs"]["model"] == ["22", 0]
+    assert (
+        WorkflowCompiler.workflow_version(identity_image=True, pose_image=True)
+        == "image-sdxl-identity-pose-v1"
+    )
+    assert WorkflowCompiler.workflow_version(source_image=True) == "image-sdxl-variation-img2img-v1"

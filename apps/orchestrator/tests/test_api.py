@@ -81,8 +81,10 @@ def test_recipe_and_real_generation_queue_are_not_seeded_with_fixtures(client):
 def test_engine_manifest_and_model_pack_services(client):
     components = client.get("/api/engine/components").json()
     identity = next(item for item in components if item["id"] == "identity-lock")
-    assert identity["state"] == "unsupported"
-    assert client.post("/api/engine/components/identity-lock/repair").status_code == 409
+    assert identity["state"] == "not_installed"
+    assert client.post("/api/engine/components/identity-lock/health_check").status_code == 409
+    pose_component = next(item for item in components if item["id"] == "pose-control")
+    assert pose_component["state"] == "not_installed"
     packs = client.get("/api/engine/model-packs").json()
     balanced = next(item for item in packs["packs"] if item["alias"] == "photoreal_balanced")
     assert balanced["installed"] is False
@@ -96,6 +98,11 @@ def test_engine_manifest_and_model_pack_services(client):
     )
     assert identity_pack["installed"] is False
     assert "Identity Lock" in identity_pack["capabilities"]
+    assert identity_pack["download"]["bytes"] == 847517512
+    assert identity_pack["download"]["clip_vision"]["bytes"] == 2528373448
+    pose_pack = next(item for item in packs["packs"] if item["alias"] == "pose_xinsir_sdxl")
+    assert pose_pack["installed"] is False
+    assert pose_pack["sha256"] == "b8524e557a7df60d081f5d4a0eb109967d107df217943bf88c2d99b9ebcc06c5"
 
 
 def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):
@@ -137,3 +144,48 @@ def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):
     restored = client.get(f"/api/characters/{character['id']}").json()
     assert restored["references"][0]["is_primary"] is True
     assert restored["loras"][0]["name"] == "Owned SDXL style"
+
+
+def test_pose_library_persists_source_progress_edit_and_delete(client, tmp_path):
+    import time
+
+    from PIL import Image
+
+    source = tmp_path / "owned-pose.png"
+    Image.new("RGB", (640, 800), "navy").save(source)
+    created = client.post(
+        "/api/poses/import",
+        json={
+            "name": "Owned standing reference",
+            "source_path": str(source),
+            "tags": ["standing", "editorial"],
+            "favorite": True,
+            "notes": "Broad movement only",
+            "strength": 0.7,
+        },
+    )
+    assert created.status_code == 201
+    pose_id = created.json()["id"]
+    assert client.get(f"/api/poses/{pose_id}/source").status_code == 200
+    for _ in range(50):
+        item = client.get(f"/api/poses/{pose_id}").json()
+        if item["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert item["status"] == "failed"
+    assert "Local Generation Engine" in item["error_message"]
+    updated = client.put(
+        f"/api/poses/{pose_id}",
+        json={
+            "name": "Renamed pose",
+            "tags": ["standing"],
+            "favorite": False,
+            "notes": "Updated locally",
+            "strength": 0.55,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Renamed pose"
+    assert updated.json()["strength"] == 0.55
+    assert client.delete(f"/api/poses/{pose_id}").status_code == 204
+    assert client.get(f"/api/poses/{pose_id}").status_code == 404

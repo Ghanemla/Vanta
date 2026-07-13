@@ -45,6 +45,15 @@ class PoseImportInput(StrictModel):
     strength: float = Field(default=0.8, ge=0, le=1)
 
 
+class PoseUpdateInput(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    favorite: bool = False
+    notes: str = Field(default="", max_length=2000)
+    character_id: str | None = None
+    strength: float = Field(default=0.8, ge=0, le=1)
+
+
 class LoraImportInput(StrictModel):
     source_path: str = Field(min_length=1, max_length=32767)
     name: str = Field(min_length=1, max_length=120)

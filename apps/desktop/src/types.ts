@@ -53,10 +53,23 @@ export interface LoraRecord {
   verification_state: string;
 }
 export interface PoseRecord {
-  id: string; name: string; scope: 'global' | 'character'; character_id: string | null;
-  source_thumbnail_path: string; control_thumbnail_path: string; tags: string[]; favorite: boolean;
-  notes: string; strength: number; source_sha256: string; control_sha256: string;
-  preprocessor_revision: string; workflow_pack_version: string;
+  id: string;
+  name: string;
+  scope: 'global' | 'character';
+  character_id: string | null;
+  source_thumbnail_path: string;
+  control_thumbnail_path: string;
+  tags: string[];
+  favorite: boolean;
+  notes: string;
+  strength: number;
+  source_sha256: string;
+  control_sha256: string;
+  preprocessor_revision: string;
+  workflow_pack_version: string;
+  status: 'queued' | 'starting' | 'extracting' | 'saving' | 'ready' | 'failed';
+  progress: number;
+  error_message: string | null;
 }
 export interface PresetRecord {
   id: string;
@@ -134,6 +147,14 @@ export interface GenerationRecord {
     }[];
     source_generation_id?: string | null;
     variation_strength?: number;
+    pose_control?: {
+      id: string;
+      name: string;
+      scope: 'global' | 'character';
+      strength: number;
+      source_sha256: string;
+      control_sha256: string;
+    } | null;
     request?: Record<string, unknown>;
   };
   created_at: string;

@@ -33,6 +33,7 @@ from .schemas import (
     LoraImportInput,
     ModelImportInput,
     PoseImportInput,
+    PoseUpdateInput,
     PresetInput,
     RecipeInput,
     ReferenceImportInput,
@@ -247,6 +248,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return poses.import_pose(payload)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/poses/{pose_id}")
+    def get_pose(pose_id: str) -> dict:
+        try:
+            return poses.get(pose_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.put("/api/poses/{pose_id}")
+    def update_pose(pose_id: str, payload: PoseUpdateInput) -> dict:
+        try:
+            return poses.update(pose_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/poses/{pose_id}/duplicate", status_code=201)
+    def duplicate_pose(pose_id: str) -> dict:
+        try:
+            return poses.duplicate(pose_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.delete("/api/poses/{pose_id}", status_code=204)
+    def delete_pose(pose_id: str) -> None:
+        try:
+            poses.delete(pose_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.get("/api/poses/{pose_id}/{variant}")
+    def pose_media(pose_id: str, variant: str) -> FileResponse:
+        field = {
+            "source": "source_path",
+            "source-thumbnail": "source_thumbnail_path",
+            "control": "control_path",
+            "control-thumbnail": "control_thumbnail_path",
+        }.get(variant)
+        if not field:
+            raise HTTPException(status_code=404, detail="Pose media variant was not found")
+        try:
+            item = poses.get(pose_id)
+        except KeyError as error:
+            raise missing(error) from error
+        path = Path(item[field])
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Pose media is not ready")
+        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "image/png")
 
     @app.post("/api/loras/import", status_code=201)
     def import_lora(payload: LoraImportInput) -> dict:

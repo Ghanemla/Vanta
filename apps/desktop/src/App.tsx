@@ -265,18 +265,27 @@ export function App() {
     setLoading(true);
     setError('');
     try {
-      const [characters, presets, gallery, components, modelResponse, settings, loras, jobs, poses] =
-        await Promise.all([
-          api.get<CharacterRecord[]>('/characters'),
-          api.get<PresetRecord[]>('/presets'),
-          api.get<GenerationRecord[]>('/gallery'),
-          api.get<EngineComponent[]>('/engine/components'),
-          api.get<{ hardware: AppData['hardware']; packs: ModelPack[] }>('/engine/model-packs'),
-          api.get<SettingsRecord>('/settings'),
-          api.get<LoraRecord[]>('/loras'),
-          api.get<GenerationJob[]>('/jobs'),
-          api.get<PoseRecord[]>('/poses'),
-        ]);
+      const [
+        characters,
+        presets,
+        gallery,
+        components,
+        modelResponse,
+        settings,
+        loras,
+        jobs,
+        poses,
+      ] = await Promise.all([
+        api.get<CharacterRecord[]>('/characters'),
+        api.get<PresetRecord[]>('/presets'),
+        api.get<GenerationRecord[]>('/gallery'),
+        api.get<EngineComponent[]>('/engine/components'),
+        api.get<{ hardware: AppData['hardware']; packs: ModelPack[] }>('/engine/model-packs'),
+        api.get<SettingsRecord>('/settings'),
+        api.get<LoraRecord[]>('/loras'),
+        api.get<GenerationJob[]>('/jobs'),
+        api.get<PoseRecord[]>('/poses'),
+      ]);
       setData({
         characters,
         presets,
@@ -501,6 +510,7 @@ export function App() {
                   refresh={load}
                   notify={notify}
                   goEngine={() => navigate('engine')}
+                  goPoses={() => navigate('poses')}
                   initialDraft={generationDraft}
                   onDraftUsed={() => setGenerationDraft(null)}
                 />
@@ -513,7 +523,14 @@ export function App() {
                   notify={notify}
                 />
               )}
-              {screen === 'poses' && <PoseLibraryScreen items={data.poses} refresh={load} notify={notify} />}
+              {screen === 'poses' && (
+                <PoseLibraryScreen
+                  items={data.poses}
+                  characters={data.characters}
+                  refresh={load}
+                  notify={notify}
+                />
+              )}
               {screen === 'presets' && (
                 <PresetsScreen items={data.presets} refresh={load} notify={notify} />
               )}
@@ -762,6 +779,7 @@ function CreateScreen({
   refresh,
   notify,
   goEngine,
+  goPoses,
   initialDraft,
   onDraftUsed,
 }: {
@@ -769,6 +787,7 @@ function CreateScreen({
   refresh: () => Promise<void>;
   notify: (message: string) => void;
   goEngine: () => void;
+  goPoses: () => void;
   initialDraft: Record<string, unknown> | null;
   onDraftUsed: () => void;
 }) {
@@ -788,6 +807,11 @@ function CreateScreen({
   );
   const [sourceGenerationId, setSourceGenerationId] = useState<string | null>(null);
   const [variationStrength, setVariationStrength] = useState(0.45);
+  const [poseId, setPoseId] = useState('');
+  const [poseStrength, setPoseStrength] = useState(0.8);
+  const availablePoses = data.poses.filter(
+    (item) => item.status === 'ready' && (!item.character_id || item.character_id === characterId),
+  );
   const runtime = data.components.find((item) => item.id === 'workflow-runtime');
   const model =
     data.packs.find((item) => item.is_default) ??
@@ -820,8 +844,13 @@ function CreateScreen({
       initialDraft.source_generation_id ? String(initialDraft.source_generation_id) : null,
     );
     setVariationStrength(Number(initialDraft.variation_strength ?? 0.45));
+    setPoseId(String(initialDraft.pose_id ?? ''));
+    setPoseStrength(Number(initialDraft.pose_strength ?? 0.8));
     onDraftUsed();
   }, [initialDraft]);
+  useEffect(() => {
+    if (poseId && !availablePoses.some((item) => item.id === poseId)) setPoseId('');
+  }, [availablePoses, poseId]);
   const presetText = (category: string) =>
     options(category).find((item) => item.id === selected[category])?.prompt ?? '';
   const generationRequest = () => ({
@@ -841,12 +870,14 @@ function CreateScreen({
     negative_prompt: negativePrompt,
     model_alias: 'photoreal_balanced',
     seed,
-    width: 832,
-    height: 1216,
+    width: poseId ? 768 : 832,
+    height: poseId ? 1024 : 1216,
     steps,
     guidance,
     source_generation_id: sourceGenerationId,
     variation_strength: variationStrength,
+    pose_id: poseId || null,
+    pose_strength: poseId ? poseStrength : null,
   });
   const saveRecipe = async () => {
     setSaving(true);
@@ -1053,6 +1084,39 @@ function CreateScreen({
                   </select>
                 </label>
               ))}
+            </div>
+            <div className="pose-create-control">
+              <label>
+                Pose Control
+                <select value={poseId} onChange={(event) => setPoseId(event.target.value)}>
+                  <option value="">No saved pose</option>
+                  {availablePoses.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                      {item.character_id ? ' — character pose' : ' — global'}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {poseId && (
+                <>
+                  <label>
+                    Pose strength <span>{poseStrength.toFixed(2)}</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={poseStrength}
+                      onChange={(event) => setPoseStrength(Number(event.target.value))}
+                    />
+                  </label>
+                  <p className="field-help">12 GB safe canvas · 768 × 1024</p>
+                </>
+              )}
+              <Button type="button" variant="ghost" onClick={goPoses}>
+                <Plus /> Extract new pose
+              </Button>
             </div>
             {mode === 'studio' && (
               <div className="studio-controls">
@@ -1496,6 +1560,336 @@ function LocalReferenceImage({ referenceId, alt }: { referenceId: string; alt: s
     <img className="character-reference-image" src={url} alt={alt} />
   ) : (
     <div className="portrait-silhouette" />
+  );
+}
+
+function LocalPoseImage({
+  poseId,
+  variant,
+  alt,
+}: {
+  poseId: string;
+  variant: 'source-thumbnail' | 'control-thumbnail';
+  alt: string;
+}) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    void api
+      .poseImageUrl(poseId, variant)
+      .then((next) => {
+        objectUrl = next;
+        if (active) setUrl(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [poseId, variant]);
+  return url ? <img src={url} alt={alt} /> : <div className="pose-image-placeholder" />;
+}
+
+function PoseLibraryScreen({
+  items,
+  characters,
+  refresh,
+  notify,
+}: {
+  items: PoseRecord[];
+  characters: CharacterRecord[];
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [editing, setEditing] = useState<PoseRecord | 'new' | null>(null);
+  const [sourcePath, setSourcePath] = useState('');
+  const [working, setWorking] = useState(false);
+  const filtered = items.filter((item) =>
+    `${item.name} ${item.tags.join(' ')} ${item.notes}`.toLowerCase().includes(query.toLowerCase()),
+  );
+
+  useEffect(() => {
+    if (!items.some((item) => !['ready', 'failed'].includes(item.status))) return;
+    const timer = window.setInterval(() => void refresh(), 900);
+    return () => window.clearInterval(timer);
+  }, [items, refresh]);
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === 'drop' && event.payload.paths[0]) {
+          setSourcePath(event.payload.paths[0]);
+          setEditing('new');
+        }
+      })
+      .then((stop) => {
+        unlisten = stop;
+      });
+    return () => unlisten?.();
+  }, []);
+
+  const chooseSource = async () => {
+    const path = await chooseLocalImageFile();
+    if (path) setSourcePath(path);
+  };
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      name: String(form.get('name')),
+      tags: String(form.get('tags'))
+        .split(',')
+        .map((tag) => tag.trim())
+        .filter(Boolean),
+      favorite: form.get('favorite') === 'on',
+      notes: String(form.get('notes')),
+      character_id: String(form.get('character_id') || '') || null,
+      strength: Number(form.get('strength')),
+    };
+    setWorking(true);
+    try {
+      if (editing === 'new') {
+        await api.post('/poses/import', { ...payload, source_path: sourcePath });
+        notify('Pose extraction queued locally');
+      } else if (editing) {
+        await api.put(`/poses/${editing.id}`, payload);
+        notify('Pose details saved');
+      }
+      setEditing(null);
+      setSourcePath('');
+      await refresh();
+    } finally {
+      setWorking(false);
+    }
+  };
+  return (
+    <div className="screen pose-library-screen">
+      <PageTitle
+        eyebrow="Pose library"
+        title="Movement, held in place."
+        body="Import references you have rights to use. Vanta extracts broad body structure locally."
+        actions={
+          <Button variant="primary" onClick={() => setEditing('new')}>
+            <Plus /> Import pose
+          </Button>
+        }
+      />
+      <div className="library-toolbar">
+        <div className="search-field">
+          <Search />
+          <input
+            aria-label="Search poses"
+            placeholder="Search names, notes, and tags"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </div>
+      </div>
+      {filtered.length === 0 ? (
+        <EmptyState
+          title="No poses yet"
+          body="Import an owned reference image or drag one into Vanta to extract a reusable control pose."
+          action={<Button onClick={() => setEditing('new')}>Import first pose</Button>}
+        />
+      ) : (
+        <div className="pose-grid">
+          {filtered.map((item) => (
+            <Panel className="pose-card" key={item.id}>
+              <div className="pose-comparison">
+                <div>
+                  <LocalPoseImage
+                    poseId={item.id}
+                    variant="source-thumbnail"
+                    alt={`${item.name} original reference`}
+                  />
+                  <span>Original</span>
+                </div>
+                <div>
+                  <LocalPoseImage
+                    poseId={item.id}
+                    variant="control-thumbnail"
+                    alt={`${item.name} extracted pose control`}
+                  />
+                  <span>Control</span>
+                </div>
+              </div>
+              <header>
+                <div>
+                  <span className="eyebrow">{item.scope}</span>
+                  <h2>{item.name}</h2>
+                  {item.character_id && (
+                    <span className="pose-character-name">
+                      {characters.find((character) => character.id === item.character_id)?.name ??
+                        'Archived character'}
+                    </span>
+                  )}
+                </div>
+                <StatusPill
+                  tone={
+                    item.status === 'ready'
+                      ? 'ready'
+                      : item.status === 'failed'
+                        ? 'danger'
+                        : 'warning'
+                  }
+                >
+                  {item.status === 'ready'
+                    ? 'Ready'
+                    : item.status === 'failed'
+                      ? 'Needs attention'
+                      : `${item.progress}%`}
+                </StatusPill>
+              </header>
+              {!['ready', 'failed'].includes(item.status) && (
+                <div className="progress">
+                  <span style={{ width: `${item.progress}%` }} />
+                </div>
+              )}
+              {item.error_message && <p className="inline-error">{item.error_message}</p>}
+              <p>{item.notes || 'No notes'}</p>
+              {item.favorite && (
+                <span className="pose-favorite">
+                  <Heart fill="currentColor" /> Favorite
+                </span>
+              )}
+              <div className="tag-row">
+                {item.tags.map((tag) => (
+                  <span className="tag" key={tag}>
+                    {tag}
+                  </span>
+                ))}
+              </div>
+              <footer>
+                <Button variant="ghost" onClick={() => setEditing(item)}>
+                  <Edit3 /> Edit
+                </Button>
+                <button
+                  className="icon-button"
+                  aria-label={`Duplicate ${item.name}`}
+                  onClick={async () => {
+                    await api.post(`/poses/${item.id}/duplicate`);
+                    notify('Pose duplicated and queued for extraction');
+                    await refresh();
+                  }}
+                >
+                  <Copy />
+                </button>
+                <button
+                  className="icon-button danger"
+                  aria-label={`Delete ${item.name}`}
+                  onClick={async () => {
+                    if (!window.confirm(`Delete ${item.name}?`)) return;
+                    await api.delete(`/poses/${item.id}`);
+                    await refresh();
+                    notify('Pose deleted');
+                  }}
+                >
+                  <Trash2 />
+                </button>
+              </footer>
+            </Panel>
+          ))}
+        </div>
+      )}
+      {editing && (
+        <div className="modal-layer">
+          <form className="modal modal--wide" onSubmit={(event) => void save(event)}>
+            <header>
+              <div>
+                <span className="eyebrow">
+                  {editing === 'new' ? 'Local extraction' : 'Edit saved pose'}
+                </span>
+                <h2>{editing === 'new' ? 'Import pose reference' : editing.name}</h2>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                onClick={() => setEditing(null)}
+              >
+                <X />
+              </button>
+            </header>
+            {editing === 'new' && (
+              <div className="pose-drop-zone" onDragOver={(event) => event.preventDefault()}>
+                <Upload />
+                <strong>{sourcePath || 'Choose or drop an image'}</strong>
+                <span>PNG, JPEG, or WebP · at least 256 px per side</span>
+                <Button type="button" onClick={() => void chooseSource()}>
+                  Choose image
+                </Button>
+              </div>
+            )}
+            <div className="form-grid">
+              <label>
+                Name
+                <input name="name" required defaultValue={editing === 'new' ? '' : editing.name} />
+              </label>
+              <label>
+                Tags
+                <input
+                  name="tags"
+                  defaultValue={editing === 'new' ? '' : editing.tags.join(', ')}
+                />
+              </label>
+              <label>
+                Scope
+                <select
+                  name="character_id"
+                  defaultValue={editing === 'new' ? '' : (editing.character_id ?? '')}
+                >
+                  <option value="">Global — available to every character</option>
+                  {characters.map((character) => (
+                    <option key={character.id} value={character.id}>
+                      {character.name} — character only
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label>
+              Notes
+              <textarea name="notes" defaultValue={editing === 'new' ? '' : editing.notes} />
+            </label>
+            <label>
+              Default strength
+              <input
+                name="strength"
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                defaultValue={editing === 'new' ? 0.8 : editing.strength}
+              />
+            </label>
+            <label className="checkbox-row">
+              <input
+                name="favorite"
+                type="checkbox"
+                defaultChecked={editing !== 'new' && editing.favorite}
+              />{' '}
+              Favorite
+            </label>
+            <footer>
+              <Button type="button" variant="ghost" onClick={() => setEditing(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                disabled={working || (editing === 'new' && !sourcePath)}
+              >
+                {working ? 'Saving…' : editing === 'new' ? 'Extract pose' : 'Save pose'}
+              </Button>
+            </footer>
+          </form>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1971,6 +2365,14 @@ function GalleryScreen({
                   </dd>
                 </div>
                 <div>
+                  <dt>Pose control</dt>
+                  <dd>
+                    {selected.metadata.pose_control
+                      ? `${selected.metadata.pose_control.name} · ${selected.metadata.pose_control.strength.toFixed(2)}`
+                      : 'None'}
+                  </dd>
+                </div>
+                <div>
                   <dt>Disclosure</dt>
                   <dd>
                     {selected.metadata.disclosure ? 'AI-created metadata attached' : 'Not attached'}
@@ -2090,24 +2492,6 @@ function EngineScreen({
       setBusy('');
     }
   };
-  const importIdentityAdapter = async () => {
-    const adapterPath = await chooseLocalModelFile();
-    if (!adapterPath) return;
-    const clipVisionPath = await chooseLocalModelFile();
-    if (!clipVisionPath) return;
-    setBusy('identity-import');
-    try {
-      await api.post('/engine/identity-adapter/import', {
-        adapter_source_path: adapterPath,
-        clip_vision_source_path: clipVisionPath,
-        license_notes: '',
-      });
-      notify('Local identity adapter and CLIP Vision encoder verified');
-      await refresh();
-    } finally {
-      setBusy('');
-    }
-  };
   return (
     <div className="screen engine-screen">
       <PageTitle
@@ -2199,12 +2583,23 @@ function EngineScreen({
                 {item.state === 'unsupported' ? (
                   <Button disabled>Coming later</Button>
                 ) : item.state === 'ready' ? (
-                  <Button
-                    onClick={() => void componentAction(item, 'health_check')}
-                    disabled={busy === item.id}
-                  >
-                    <ShieldCheck /> Health check
-                  </Button>
+                  <>
+                    <Button
+                      onClick={() => void componentAction(item, 'health_check')}
+                      disabled={busy === item.id}
+                    >
+                      <ShieldCheck /> Verify
+                    </Button>
+                    {(item.id === 'pose-control' || item.id === 'identity-lock') && (
+                      <Button
+                        variant="ghost"
+                        onClick={() => void componentAction(item, 'remove')}
+                        disabled={busy === item.id}
+                      >
+                        Remove
+                      </Button>
+                    )}
+                  </>
                 ) : (
                   <Button
                     variant={item.state === 'repair_needed' ? 'primary' : 'secondary'}
@@ -2295,10 +2690,10 @@ function EngineScreen({
                   item.alias !== 'photoreal_balanced' &&
                   (item.alias === 'identity_plus_face_sdxl' ? (
                     <Button
-                      onClick={() => void importIdentityAdapter()}
-                      disabled={busy === 'identity-import'}
+                      onClick={() => void packAction(item, 'install')}
+                      disabled={busy === item.id}
                     >
-                      <Upload /> Import adapter + encoder
+                      <Download /> Install reviewed pack
                     </Button>
                   ) : item.alias === 'realesrgan_x2plus' || item.alias === 'ultrasharp_x4' ? (
                     <Button
@@ -2308,6 +2703,13 @@ function EngineScreen({
                       disabled={busy === `upscaler-${item.alias}`}
                     >
                       <Upload /> Import local pack
+                    </Button>
+                  ) : item.alias === 'pose_xinsir_sdxl' ? (
+                    <Button
+                      onClick={() => void packAction(item, 'install')}
+                      disabled={busy === item.id}
+                    >
+                      <Download /> Install reviewed pack
                     </Button>
                   ) : (
                     <Button disabled>Coming later</Button>
@@ -2328,6 +2730,15 @@ function EngineScreen({
                     disabled={busy === item.id}
                   >
                     Verify
+                  </Button>
+                )}
+                {item.installed && !item.is_default && item.alias === 'pose_xinsir_sdxl' && (
+                  <Button
+                    variant="ghost"
+                    onClick={() => void packAction(item, 'remove')}
+                    disabled={busy === item.id}
+                  >
+                    Remove
                   </Button>
                 )}
               </div>
