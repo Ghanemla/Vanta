@@ -72,6 +72,10 @@ def test_recipe_and_real_generation_queue_are_not_seeded_with_fixtures(client):
     )
     assert job.status_code == 202
     assert job.json()["status"] in {"queued", "checking_engine", "failed"}
+    jobs = client.get("/api/jobs")
+    assert jobs.status_code == 200
+    assert jobs.json()[0]["id"] == job.json()["id"]
+    assert "queue_position" in jobs.json()[0]
 
 
 def test_engine_manifest_and_model_pack_services(client):

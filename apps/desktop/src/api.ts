@@ -131,8 +131,11 @@ export const api = {
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
   delete: (path: string) => request<void>(path, { method: 'DELETE' }),
-  imageUrl: async (generationId: string): Promise<string> => {
-    const response = await fetch(`${apiBase}/api/generations/${generationId}/image`, {
+  imageUrl: async (
+    generationId: string,
+    variant: 'image' | 'thumbnail' = 'image',
+  ): Promise<string> => {
+    const response = await fetch(`${apiBase}/api/generations/${generationId}/${variant}`, {
       headers: launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {},
     });
     if (!response.ok) throw new ApiError('Vanta could not load this local image.', response.status);

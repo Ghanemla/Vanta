@@ -13,6 +13,7 @@ vi.stubGlobal(
       '/api/gallery': [],
       '/api/engine/components': [],
       '/api/loras': [],
+      '/api/jobs': [],
       '/api/engine/model-packs': {
         hardware: { gpu_name: 'RTX 4070 Super', vram_gb: 12, ram_gb: 32, free_disk_gb: 100 },
         packs: [],

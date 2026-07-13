@@ -582,6 +582,18 @@ class GenerationService:
         self._start_worker()
         return self.get(job_id)
 
+    def list(self, limit: int = 40) -> list[dict[str, Any]]:
+        rows = self.db.query_all(
+            "SELECT * FROM generation_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return [self._present(row) for row in rows]
+
+    def retry(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job["status"] not in {"failed", "cancelled"}:
+            raise ValueError("Only failed or cancelled jobs can be retried")
+        return self.queue(json.loads(job["request_json"]))
+
     def _start_worker(self) -> None:
         with self._lock:
             if self._worker is None or not self._worker.is_alive():
@@ -628,7 +640,13 @@ class GenerationService:
 
             def progress(value: int, maximum: int) -> None:
                 percentage = min(88, 20 + round(68 * value / maximum))
-                self._update(job_id, "generating", percentage)
+                self._update(
+                    job_id,
+                    "generating",
+                    percentage,
+                    current_step=value,
+                    total_steps=maximum,
+                )
 
             prompt_id, history = self.engine.runtime.submit(workflow, progress)
             self._update(job_id, "decoding", 90, prompt_id=prompt_id)
@@ -772,4 +790,20 @@ class GenerationService:
         job = self.db.query_one("SELECT * FROM generation_jobs WHERE id=?", (job_id,))
         if job is None:
             raise KeyError(job_id)
-        return job
+        return self._present(job)
+
+    def _present(self, job: dict[str, Any]) -> dict[str, Any]:
+        result = dict(job)
+        if result["status"] == "queued":
+            result["queue_position"] = (
+                int(
+                    self.db.query_one(
+                        "SELECT COUNT(*) AS count FROM generation_jobs WHERE status='queued' AND created_at < ?",
+                        (result["created_at"],),
+                    )["count"]
+                )
+                + 1
+            )
+        else:
+            result["queue_position"] = None
+        return result

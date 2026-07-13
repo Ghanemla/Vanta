@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import mimetypes
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -338,6 +339,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except KeyError as error:
             raise missing(error) from error
 
+    @app.get("/api/jobs")
+    def list_jobs(limit: int = Query(default=40, ge=1, le=100)) -> list[dict]:
+        return generation_jobs.list(limit)
+
+    @app.post("/api/generations/{job_id}/retry", status_code=202)
+    def retry_generation(job_id: str) -> dict:
+        try:
+            return generation_jobs.retry(job_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.post("/api/generations/{job_id}/cancel")
     def cancel_generation(job_id: str) -> dict:
         try:
@@ -352,12 +366,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Generation was not found")
         return json.loads(row["metadata"]).get("request", {})
 
+    def generation_media(generation_id: str, variant: str) -> FileResponse:
+        if variant not in {"image", "thumbnail"}:
+            raise HTTPException(status_code=404, detail="Generated media variant was not found")
+        column = "image_path" if variant == "image" else "thumbnail_path"
+        row = db.query_one(f"SELECT {column} FROM generations WHERE id=?", (generation_id,))
+        path = Path(row.get(column) or "") if row else Path()
+        if not row or not path.is_file():
+            raise HTTPException(status_code=404, detail=f"Generated {variant} file was not found")
+        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "image/png")
+
     @app.get("/api/generations/{generation_id}/image")
     def generation_image(generation_id: str) -> FileResponse:
-        row = db.query_one("SELECT image_path FROM generations WHERE id=?", (generation_id,))
-        if row is None or not Path(row["image_path"]).is_file():
-            raise HTTPException(status_code=404, detail="Generated image file was not found")
-        return FileResponse(row["image_path"], media_type="image/png")
+        return generation_media(generation_id, "image")
+
+    @app.get("/api/generations/{generation_id}/thumbnail")
+    def generation_thumbnail(generation_id: str) -> FileResponse:
+        return generation_media(generation_id, "thumbnail")
+
+    @app.post("/api/generations/{generation_id}/repair-media")
+    def repair_generation_media(generation_id: str) -> dict:
+        row = db.query_one(
+            "SELECT image_path, thumbnail_path FROM generations WHERE id=?", (generation_id,)
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Generation was not found")
+        image = Path(row["image_path"])
+        if not image.is_file():
+            candidate = settings.media_root / f"{generation_id}.png"
+            if not candidate.is_file():
+                raise HTTPException(
+                    status_code=409, detail="The original generated image is missing"
+                )
+            image = candidate
+        thumbnail = Path(row.get("thumbnail_path") or "")
+        regenerated = False
+        if not thumbnail.is_file():
+            from PIL import Image
+
+            thumbnail = settings.media_root / f"{generation_id}.thumb.jpg"
+            with Image.open(image) as original:
+                original.thumbnail((480, 480))
+                original.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
+            regenerated = True
+        db.execute(
+            "UPDATE generations SET image_path=?, thumbnail_path=? WHERE id=?",
+            (str(image), str(thumbnail), generation_id),
+        )
+        return {"generation_id": generation_id, "thumbnail_regenerated": regenerated}
 
     @app.delete("/api/generations/{generation_id}", status_code=204)
     def delete_generation(generation_id: str) -> None:

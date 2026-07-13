@@ -68,6 +68,7 @@ type AppData = {
   components: EngineComponent[];
   packs: ModelPack[];
   loras: LoraRecord[];
+  jobs: GenerationJob[];
   hardware: { gpu_name: string; vram_gb: number; ram_gb: number; free_disk_gb: number };
   settings: SettingsRecord;
 };
@@ -254,12 +255,13 @@ export function App() {
   const [toast, setToast] = useState('');
   const [navOpen, setNavOpen] = useState(false);
   const [generationDraft, setGenerationDraft] = useState<Record<string, unknown> | null>(null);
+  const [showJobs, setShowJobs] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const [characters, presets, gallery, components, modelResponse, settings, loras] =
+      const [characters, presets, gallery, components, modelResponse, settings, loras, jobs] =
         await Promise.all([
           api.get<CharacterRecord[]>('/characters'),
           api.get<PresetRecord[]>('/presets'),
@@ -268,6 +270,7 @@ export function App() {
           api.get<{ hardware: AppData['hardware']; packs: ModelPack[] }>('/engine/model-packs'),
           api.get<SettingsRecord>('/settings'),
           api.get<LoraRecord[]>('/loras'),
+          api.get<GenerationJob[]>('/jobs'),
         ]);
       setData({
         characters,
@@ -278,6 +281,7 @@ export function App() {
         hardware: modelResponse.hardware,
         settings,
         loras,
+        jobs,
       });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The local studio could not start.');
@@ -315,6 +319,14 @@ export function App() {
     const timer = window.setTimeout(() => setToast(''), 3800);
     return () => window.clearTimeout(timer);
   }, [toast]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void api.get<GenerationJob[]>('/jobs').then((jobs) => {
+        setData((current) => (current ? { ...current, jobs } : current));
+      });
+    }, 1100);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const notify = (message: string) => setToast(message);
   const navigate = (next: Screen) => {
@@ -391,6 +403,22 @@ export function App() {
           </div>
         </aside>
         <main id="main-content" tabIndex={-1}>
+          {data && (
+            <button className="jobs-button" onClick={() => setShowJobs(true)}>
+              <Zap /> Jobs
+              {data.jobs.some(
+                (job) => !['completed', 'failed', 'cancelled'].includes(job.status),
+              ) && (
+                <span>
+                  {
+                    data.jobs.filter(
+                      (job) => !['completed', 'failed', 'cancelled'].includes(job.status),
+                    ).length
+                  }
+                </span>
+              )}
+            </button>
+          )}
           {loading && !service && <LoadingView />}
           {!loading && service && service.state !== 'ready' && !error && (
             <StartupView service={service} />
@@ -509,6 +537,47 @@ export function App() {
             </>
           )}
         </main>
+        <Drawer open={showJobs} title="Local jobs" onClose={() => setShowJobs(false)}>
+          <div className="metadata-drawer">
+            {data?.jobs.length ? (
+              data.jobs.map((job) => (
+                <Panel key={job.id} className="job-card">
+                  <div>
+                    <strong>{stateLabels[job.status] ?? job.status}</strong>
+                    <span>
+                      {job.current_step && job.total_steps
+                        ? `Step ${job.current_step} / ${job.total_steps}`
+                        : job.queue_position
+                          ? `Queue position ${job.queue_position}`
+                          : `${job.progress}%`}
+                    </span>
+                  </div>
+                  <div className="progress">
+                    <span style={{ width: `${job.progress}%` }} />
+                  </div>
+                  {job.error_message && <small>{job.error_message}</small>}
+                  <footer>
+                    {!['completed', 'failed', 'cancelled'].includes(job.status) && (
+                      <Button onClick={() => void api.post(`/generations/${job.id}/cancel`)}>
+                        Cancel
+                      </Button>
+                    )}
+                    {['failed', 'cancelled'].includes(job.status) && (
+                      <Button onClick={() => void api.post(`/generations/${job.id}/retry`)}>
+                        Retry
+                      </Button>
+                    )}
+                  </footer>
+                </Panel>
+              ))
+            ) : (
+              <EmptyState
+                title="No local jobs"
+                body="Generation activity will stay here while you work elsewhere."
+              />
+            )}
+          </div>
+        </Drawer>
         {toast && (
           <div className="toast" role="status">
             <Check />
@@ -1741,12 +1810,20 @@ function PresetsScreen({
   );
 }
 
-function LocalGenerationImage({ generationId, alt }: { generationId: string; alt: string }) {
+function LocalGenerationImage({
+  generationId,
+  alt,
+  thumbnail = false,
+}: {
+  generationId: string;
+  alt: string;
+  thumbnail?: boolean;
+}) {
   const [url, setUrl] = useState('');
   useEffect(() => {
     let active = true;
     let objectUrl = '';
-    void api.imageUrl(generationId).then((next) => {
+    void api.imageUrl(generationId, thumbnail ? 'thumbnail' : 'image').then((next) => {
       objectUrl = next;
       if (active) setUrl(next);
     });
@@ -1754,7 +1831,7 @@ function LocalGenerationImage({ generationId, alt }: { generationId: string; alt
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [generationId]);
+  }, [generationId, thumbnail]);
   return url ? (
     <img className="generation-image" src={url} alt={alt} />
   ) : (
@@ -1813,7 +1890,11 @@ function GalleryScreen({
               onClick={() => setSelected(item)}
             >
               <div className="generated-study">
-                <LocalGenerationImage generationId={item.id} alt={`Generated image ${item.id}`} />
+                <LocalGenerationImage
+                  generationId={item.id}
+                  alt={`Generated image ${item.id}`}
+                  thumbnail
+                />
                 <span className="disclosure">
                   <Sparkles /> AI-created
                 </span>

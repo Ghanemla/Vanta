@@ -137,6 +137,10 @@ export interface GenerationJob {
   status: string;
   progress: number;
   error_message?: string | null;
+  current_step?: number | null;
+  total_steps?: number | null;
+  queue_position?: number | null;
+  created_at?: string;
 }
 export interface SettingsRecord {
   values: Record<string, string>;
