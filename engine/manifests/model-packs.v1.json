@@ -28,22 +28,22 @@
       "id": "vanta-flux-maximum-v1",
       "alias": "photoreal_max",
       "display_name": "Realistic — Maximum",
-      "model_family": "FLUX-compatible quantized",
-      "capabilities": ["Maximum Detail", "Photoreal Portrait"],
-      "hardware": { "minimum_vram_gb": 16, "recommended_vram_gb": 24, "minimum_ram_gb": 32 },
-      "disk_gb": 24.5,
+      "model_family": "FLUX.1-dev FP8",
+      "capabilities": ["Maximum Detail", "Photoreal Portrait", "Native FLUX LoRA"],
+      "hardware": { "minimum_vram_gb": 10, "recommended_vram_gb": 16, "minimum_ram_gb": 32 },
+      "disk_gb": 17.1,
       "download": {
-        "source_name": "User-selected licensed source",
+        "source_name": "User-selected self-contained FLUX.1-dev FP8 checkpoint",
         "url": null,
         "authentication": "may_be_required"
       },
       "license": {
-        "name": "Source dependent; explicit review required",
+        "name": "FLUX.1-dev Non-Commercial License; explicit review required",
         "acceptance_required": true,
         "source_url": null
       },
       "sha256": "fixture:must-be-resolved-before-install",
-      "target_path": "models/checkpoints/photoreal_max.safetensors",
+      "target_path": "models/checkpoints/flux_dev.safetensors",
       "compatible_workflows": ["image-flux-photoreal-v1"],
       "active_default": false
     },

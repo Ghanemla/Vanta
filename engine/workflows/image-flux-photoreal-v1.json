@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "workflow_id": "image-flux-photoreal-v1",
+  "engine_adapter": "comfyui",
+  "model_alias": "photoreal_max",
+  "required_capabilities": ["Workflow Execution", "FLUX Guidance", "Image I/O"],
+  "parameters": [
+    "positive_prompt",
+    "negative_prompt",
+    "seed",
+    "width",
+    "height",
+    "steps",
+    "guidance"
+  ],
+  "hardware_safe_profile": {
+    "width": 768,
+    "height": 1024,
+    "steps": 20,
+    "guidance": 3.5,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "cfg": 1.0
+  },
+  "internal_template": "Native self-contained FLUX checkpoint compiler; engine node IDs remain isolated from the UI."
+}

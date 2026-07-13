@@ -254,8 +254,8 @@ class LoraRepository:
             raise ValueError("Choose an existing local .safetensors LoRA")
         header = validate_safetensors(source)
         family = self._family(header)
-        if family != "SDXL":
-            raise ValueError("This LoRA is not compatible with Vanta's installed SDXL workflow")
+        if family not in {"SDXL", "FLUX"}:
+            raise ValueError("This LoRA is not compatible with Vanta's SDXL or FLUX workflows")
         digest = sha256_file(source)
         duplicate = self.db.query_one("SELECT id FROM lora_packs WHERE sha256=?", (digest,))
         if duplicate:
@@ -307,8 +307,8 @@ class LoraRepository:
         if self.db.query_one("SELECT id FROM characters WHERE id=?", (character_id,)) is None:
             raise KeyError(character_id)
         lora = self.get(payload.lora_id)
-        if lora["model_family"] != "SDXL":
-            raise ValueError("Only verified SDXL LoRAs can be assigned to this workflow")
+        if lora["model_family"] not in {"SDXL", "FLUX"}:
+            raise ValueError("Only verified SDXL or FLUX LoRAs can be assigned")
         self.db.execute(
             """INSERT INTO character_loras(character_id, lora_id, position, strength, clip_strength, enabled)
             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(character_id, lora_id) DO UPDATE SET position=excluded.position, strength=excluded.strength, clip_strength=excluded.clip_strength, enabled=excluded.enabled""",

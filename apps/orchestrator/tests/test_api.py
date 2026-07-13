@@ -145,6 +145,25 @@ def test_character_reference_and_sdxl_lora_import_flow(client, tmp_path):
     assert restored["references"][0]["is_primary"] is True
     assert restored["loras"][0]["name"] == "Owned SDXL style"
 
+    flux_lora = tmp_path / "owned-flux-style.safetensors"
+    flux_header = json.dumps(
+        {"__metadata__": {}, "lora_unet_double_blocks_0_img_attn_proj.lora_up.weight": {}}
+    ).encode()
+    flux_lora.write_bytes(len(flux_header).to_bytes(8, "little") + flux_header + b"payload")
+    imported_flux = client.post(
+        "/api/loras/import",
+        json={"source_path": str(flux_lora), "name": "Owned FLUX style"},
+    )
+    assert imported_flux.status_code == 201
+    assert imported_flux.json()["model_family"] == "FLUX"
+    assert (
+        client.put(
+            f"/api/characters/{character['id']}/loras",
+            json={"lora_id": imported_flux.json()["id"], "position": 1},
+        ).status_code
+        == 200
+    )
+
 
 def test_pose_library_persists_source_progress_edit_and_delete(client, tmp_path):
     import time

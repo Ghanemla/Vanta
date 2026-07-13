@@ -39,11 +39,10 @@ Last updated: 2026-07-13
 
 ## Current feature
 
-Real inpainting and controlled variations are **implemented with current-code local evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is the native FLUX-family adapter.
+The separate native FLUX-family adapter is **implemented with current-code production evidence; the pre-commit verification gate is active**. The next independent Essential V1 slice is local image-to-video and reference motion.
 
 Remaining V1 work:
 
-- Separate FLUX adapter with native FLUX workflow/model selection and real output while preserving the installed 17.1 GB model.
 - Local image-to-video, reference motion and video adapter.
 - Local LoRA training, dataset checks and resumable run evidence.
 - Preset/recipe mode completion and remaining Models & Engine diagnostics polish.
@@ -88,6 +87,19 @@ Remaining V1 work:
 - `docs/ESSENTIAL_V1_RUNBOOK.md`
 - `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
 
+## FLUX adapter files changed
+
+- `apps/orchestrator/src/vanta_orchestrator/engine.py`
+- `apps/orchestrator/src/vanta_orchestrator/repositories.py`
+- `apps/orchestrator/src/vanta_orchestrator/schemas.py`
+- `apps/orchestrator/tests/test_real_generation_domain.py`
+- `apps/desktop/src/App.tsx`
+- `engine/manifests/model-packs.v1.json`
+- `engine/workflows/image-flux-photoreal-v1.json`
+- `scripts/verify_managed_pose.py`
+- `docs/ESSENTIAL_V1_RUNBOOK.md`
+- `docs/MANUAL_ACCEPTANCE_CHECKLIST.md`
+
 ## Tests run
 
 - Baseline Python suite: **21 passed**, 29 deprecation warnings.
@@ -105,6 +117,11 @@ Remaining V1 work:
 - UTF-8 JSON parse of both engine manifests: **passed**.
 - Desktop production renderer build: **passed**, 1,656 modules, 281.02 kB JS / 38.48 kB CSS before gzip.
 - Tauri `cargo check`: **passed**.
+- Full Python suite after FLUX integration: **27 passed**, 33 deprecation warnings.
+- FLUX/SDXL family detection, native graph isolation, safe defaults and LoRA wiring have automated domain coverage.
+- Ruff lint, desktop strict TypeScript and ESLint zero-warning gates after FLUX integration: **passed**.
+- Desktop Vitest from its package configuration with Vite's non-bundling config loader: **2 files / 2 tests passed**.
+- FLUX-integrated production renderer build: **passed**, 1,656 modules, 294.75 kB JS / 42.76 kB CSS before gzip; Tauri `cargo check`: **passed**.
 - Inpainting/derivative focused API, migration and workflow suite: **17 passed** before final slice gate.
 - Inpainting request test proves the base64 canvas is validated into a Vanta-owned PNG and removed from persisted job JSON.
 - Desktop strict TypeScript and focused ESLint after editor integration: **passed**.
@@ -145,6 +162,13 @@ Remaining V1 work:
 - Real controlled lighting variation:
   - Source `generation-44d21d6c6860476497f4ef2d711fea59`, job `job-af15c7a5123240fe9ad881991ccc187d`, derivative `generation-21fc2465440e4a6d82850cd22167536b`.
   - 832x1216, denoise 0.38, 25 steps, 35.20 seconds, mode `lighting` with warm rose-gold prompt and preserved composition.
+- Real native FLUX verification and generation:
+  - The existing `%APPDATA%\\studio.vanta.desktop\\engine\\models\\checkpoints\\flux_dev.safetensors` remains in place at exactly 17,078,891,958 bytes; no copy, rename or model conversion occurred.
+  - Header inspection proves a self-contained checkpoint with 780 diffusion tensors, 418 embedded text-encoder tensors and 244 embedded VAE tensors. SHA-256 is `2eda627c8aee140edc77e28ed8dd3c662928ae60f0f960f36824f8862dcbb713`.
+  - Native one-step diagnostic passed in pinned ComfyUI `v0.27.0`; model alias `photoreal_max` is persisted Ready with workflow `image-flux-photoreal-v1`.
+  - Job `job-8e69168e2afd47078e2fe041a3cb9fb7`, generation `generation-e91bd1d704bf4ebda45d4f44bf1d333d`: 768x1024, 20 steps, guidance 3.5, 77.20 seconds on the detected 12 GB GPU using the hardware-safe offload path.
+  - Visual review accepted a coherent original editorial portrait with natural anatomy, controlled studio lighting and no visible text or watermark artifacts. Full reproducibility and AI-disclosure metadata are persisted in Gallery.
+  - The Create screen exposes verified model profiles and applies FLUX-safe defaults. SDXL-only identity, pose, variation and inpainting controls are explicitly routed to Balanced instead of being compiled into an invalid FLUX graph.
 
 ## Blockers
 
@@ -153,7 +177,7 @@ Remaining V1 work:
 
 ## Exact next action
 
-Commit the verified inpainting/variation slice, then implement and prove the separate native FLUX-family adapter without modifying the original FLUX model.
+Commit the verified native FLUX slice, then implement and prove local image-to-video and reference motion.
 
 ## Final acceptance status
 

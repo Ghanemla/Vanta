@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from vanta_orchestrator.comfy_runtime import ensure_safe_archive_members, validate_safetensors
-from vanta_orchestrator.engine import POSE_CONTROL_FILENAME, WorkflowCompiler
+from vanta_orchestrator.engine import (
+    POSE_CONTROL_FILENAME,
+    FluxWorkflowCompiler,
+    WorkflowCompiler,
+    checkpoint_family,
+)
 from vanta_orchestrator.pose import PoseService
 
 
@@ -72,6 +77,41 @@ def test_sdxl_lora_workflow_is_inserted_without_exposing_nodes_to_the_ui():
     assert workflow["8"]["class_type"] == "LoraLoader"
     assert workflow["5"]["inputs"]["model"] == ["8", 0]
     assert workflow["2"]["inputs"]["clip"] == ["8", 1]
+
+
+def test_flux_workflow_is_a_distinct_native_adapter_with_safe_defaults_and_loras():
+    request = {
+        "direction": "original adult editorial portrait",
+        "negative_prompt": "text, watermark",
+        "seed": 17,
+        "width": 768,
+        "height": 1024,
+        "steps": 20,
+        "guidance": 3.5,
+    }
+    workflow = FluxWorkflowCompiler().compile(
+        request,
+        "flux_dev.safetensors",
+        [{"filename": "flux-style.safetensors", "strength": 0.7, "clip_strength": 0.8}],
+    )
+    assert workflow["1"]["class_type"] == "CheckpointLoaderSimple"
+    assert workflow["3"]["class_type"] == "FluxGuidance"
+    assert workflow["5"]["class_type"] == "EmptySD3LatentImage"
+    assert workflow["6"]["inputs"]["cfg"] == 1.0
+    assert workflow["6"]["inputs"]["scheduler"] == "simple"
+    assert workflow["20"]["class_type"] == "LoraLoader"
+    assert workflow["6"]["inputs"]["model"] == ["20", 0]
+    assert workflow["2"]["inputs"]["clip"] == ["20", 1]
+
+
+def test_checkpoint_family_requires_self_contained_flux_assets():
+    header = {
+        "model.diffusion_model.double_blocks.0.img_attn.proj.weight": {},
+        "text_encoders.t5xxl.transformer.encoder.block.0.weight": {},
+        "vae.decoder.conv_in.weight": {},
+    }
+    assert checkpoint_family(header) == "FLUX"
+    assert checkpoint_family({"model.diffusion_model.input_blocks.0.0.weight": {}}) == "SDXL"
 
 
 def test_variation_workflow_encodes_a_local_source_image():

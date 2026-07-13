@@ -78,6 +78,8 @@ def main() -> int:
             "inpaint",
             "variation-clothing",
             "variation-lighting",
+            "import-flux",
+            "generate-flux",
         ],
     )
     parser.add_argument(
@@ -433,6 +435,71 @@ def main() -> int:
             )
             generations = GenerationService(db, engine)
             row = generations.queue(request)
+            deadline = time.monotonic() + args.timeout
+            while (
+                row["status"] not in {"completed", "failed", "cancelled"}
+                and time.monotonic() < deadline
+            ):
+                print(f"{row['status']} {row['progress']}%", flush=True)
+                time.sleep(1)
+                row = generations.get(row["id"])
+            success = row["status"] == "completed"
+            if success:
+                row = {
+                    "job": row,
+                    "generation": db.query_one(
+                        "SELECT * FROM generations WHERE id=?",
+                        (row["result_generation_id"],),
+                    ),
+                }
+        elif args.action == "import-flux":
+            if args.source is None:
+                parser.error("import-flux requires --source")
+            row = engine.import_model(
+                str(args.source.resolve()),
+                "photoreal_max",
+                "User-owned local self-contained FLUX.1-dev FP8 checkpoint; license acceptance recorded for local use.",
+            )
+            success = row["state"] == "ready" and bool(row["verified"])
+        elif args.action == "generate-flux":
+            generations = GenerationService(db, engine)
+            row = generations.queue(
+                {
+                    "operation": "generate",
+                    "character_id": None,
+                    "recipe_id": None,
+                    "character_identity": "an original adult woman with short dark hair",
+                    "wardrobe": "structured deep-plum wool coat, black silk blouse",
+                    "expression": "calm self-possessed expression",
+                    "pose": "standing three-quarter portrait",
+                    "location": "restrained charcoal editorial studio",
+                    "lighting": "large softbox key light, subtle warm rim light, controlled shadows",
+                    "camera": "medium-format editorial photograph, 80mm lens, shallow depth of field",
+                    "quality": "premium photoreal detail, natural skin texture, tactile fabric",
+                    "direction": "original fictional character, authored fashion campaign frame",
+                    "custom_tags": ["essential-v1", "flux-evidence"],
+                    "negative_prompt": "text, watermark, malformed anatomy, plastic skin",
+                    "model_alias": "photoreal_max",
+                    "seed": 14072031,
+                    "width": 768,
+                    "height": 1024,
+                    "steps": 20,
+                    "guidance": 3.5,
+                    "lora_ids": [],
+                    "source_generation_id": None,
+                    "identity_reference_id": None,
+                    "pose_id": None,
+                    "pose_strength": None,
+                    "variation_strength": 0.45,
+                    "variation_mode": "general",
+                    "variation_prompt": "",
+                    "inpaint_mask_data_url": None,
+                    "region_prompt": "",
+                    "region_negative_prompt": "",
+                    "inpaint_strength": 0.62,
+                    "upscale_profile": None,
+                }
+            )
             deadline = time.monotonic() + args.timeout
             while (
                 row["status"] not in {"completed", "failed", "cancelled"}

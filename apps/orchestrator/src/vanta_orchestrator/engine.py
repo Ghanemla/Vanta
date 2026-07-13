@@ -467,6 +467,118 @@ class WorkflowCompiler:
         }
 
 
+class FluxWorkflowCompiler:
+    """Compile FLUX graphs without leaking engine node details into the desktop UI."""
+
+    version = "image-flux-photoreal-v1"
+
+    def compile(
+        self,
+        request: dict[str, Any],
+        checkpoint_name: str,
+        loras: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        positive = WorkflowCompiler.compile_prompt(request)
+        if not positive:
+            raise ValueError("Describe the frame before generating")
+        negative = str(request.get("negative_prompt", "")).strip()
+        workflow: dict[str, Any] = {
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": checkpoint_name},
+            },
+            "2": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": positive, "clip": ["1", 1]},
+            },
+            "3": {
+                "class_type": "FluxGuidance",
+                "inputs": {"guidance": request["guidance"], "conditioning": ["2", 0]},
+            },
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": negative, "clip": ["1", 1]},
+            },
+            "5": {
+                "class_type": "EmptySD3LatentImage",
+                "inputs": {
+                    "width": request["width"],
+                    "height": request["height"],
+                    "batch_size": 1,
+                },
+            },
+            "6": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": request["seed"],
+                    "steps": request["steps"],
+                    "cfg": 1.0,
+                    "sampler_name": "euler",
+                    "scheduler": "simple",
+                    "denoise": 1.0,
+                    "model": ["1", 0],
+                    "positive": ["3", 0],
+                    "negative": ["4", 0],
+                    "latent_image": ["5", 0],
+                },
+            },
+            "7": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["6", 0], "vae": ["1", 2]},
+            },
+            "8": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "Vanta/flux-generation", "images": ["7", 0]},
+            },
+        }
+        if loras:
+            model_source: list[Any] = ["1", 0]
+            clip_source: list[Any] = ["1", 1]
+            for index, lora in enumerate(loras, start=20):
+                workflow[str(index)] = {
+                    "class_type": "LoraLoader",
+                    "inputs": {
+                        "model": model_source,
+                        "clip": clip_source,
+                        "lora_name": lora["filename"],
+                        "strength_model": lora["strength"],
+                        "strength_clip": lora["clip_strength"],
+                    },
+                }
+                model_source, clip_source = [str(index), 0], [str(index), 1]
+            workflow["2"]["inputs"]["clip"] = clip_source
+            workflow["4"]["inputs"]["clip"] = clip_source
+            workflow["6"]["inputs"]["model"] = model_source
+        return workflow
+
+    def diagnostic(self, checkpoint_name: str) -> dict[str, Any]:
+        return self.compile(
+            {
+                "character_identity": "original adult portrait",
+                "direction": "neutral diagnostic image",
+                "negative_prompt": "",
+                "seed": 7,
+                "width": 512,
+                "height": 512,
+                "steps": 1,
+                "guidance": 3.5,
+            },
+            checkpoint_name,
+        )
+
+
+def checkpoint_family(header: dict[str, Any]) -> str:
+    keys = [key.lower() for key in header if key != "__metadata__"]
+    joined = " ".join(keys)
+    if (
+        "model.diffusion_model.double_blocks" in joined
+        and any(key.startswith("text_encoders.t5xxl") for key in keys)
+        and any(key.startswith("vae.") for key in keys)
+    ):
+        return "FLUX"
+    return "SDXL"
+
+
 class EngineService:
     allowed_component_actions = {
         "install",
@@ -1090,12 +1202,17 @@ class EngineService:
         return row
 
     def import_model(self, source_path: str, alias: str, license_notes: str = "") -> dict[str, Any]:
-        if alias != "photoreal_balanced":
-            raise ValueError("The first release supports import into photoreal_balanced only")
+        if alias not in {"photoreal_balanced", "preview_fast", "photoreal_max"}:
+            raise ValueError("Choose a supported Vanta image model profile")
         source = Path(source_path).expanduser().resolve()
         if not source.is_file():
             raise ValueError("Choose an existing local .safetensors checkpoint")
-        validate_safetensors(source)
+        family = checkpoint_family(validate_safetensors(source))
+        expected_family = "FLUX" if alias == "photoreal_max" else "SDXL"
+        if family != expected_family:
+            raise ValueError(
+                f"This checkpoint is {family}; the selected profile requires {expected_family}"
+            )
         self.settings.model_root.mkdir(parents=True, exist_ok=True)
         destination = self.settings.model_root / source.name
         if destination.resolve() != source:
@@ -1105,7 +1222,7 @@ class EngineService:
         metadata.update(
             {
                 "filename": destination.name,
-                "model_family": "SDXL-compatible (pending engine verification)",
+                "model_family": f"{family} (pending engine verification)",
                 "source_information": "Imported from a user-selected local file",
                 "sha256": actual_hash,
             }
@@ -1305,23 +1422,42 @@ class EngineService:
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
             raise ValueError("Start the Local Generation Engine before verifying this model")
+        header = validate_safetensors(path)
+        family = checkpoint_family(header)
+        expected_family = "FLUX" if alias == "photoreal_max" else "SDXL"
+        if family != expected_family:
+            raise ValueError(
+                f"This checkpoint is {family}; the {alias} profile requires {expected_family}"
+            )
         actual_hash = sha256_file(path)
         self.db.execute(
             "UPDATE model_packs SET state='verifying', progress=80, updated_at=? WHERE alias=?",
             (utc_now(), alias),
         )
         try:
-            self.runtime.submit(WorkflowCompiler().diagnostic(path.name), lambda _value, _max: None)
+            compiler = FluxWorkflowCompiler() if family == "FLUX" else WorkflowCompiler()
+            self.runtime.submit(compiler.diagnostic(path.name), lambda _value, _max: None)
         except Exception as error:
             self.db.execute(
                 "UPDATE model_packs SET state='repair_needed', verified=0, progress=0, updated_at=? WHERE alias=?",
                 (utc_now(), alias),
             )
             raise ValueError(
-                "The local image engine could not load this SDXL checkpoint"
+                f"The local image engine could not load this {family} checkpoint"
             ) from error
         metadata = json.loads(row["metadata"])
-        metadata.update({"filename": path.name, "sha256": actual_hash, "model_family": "SDXL"})
+        metadata.update(
+            {
+                "filename": path.name,
+                "sha256": actual_hash,
+                "model_family": family,
+                "checkpoint_layout": (
+                    "self-contained checkpoint with diffusion model, text encoders, and VAE"
+                    if family == "FLUX"
+                    else "standard checkpoint"
+                ),
+            }
+        )
         self.db.execute(
             "UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100, metadata=?, updated_at=? WHERE alias=?",
             (json.dumps(metadata), utc_now(), alias),
@@ -1662,8 +1798,19 @@ class GenerationService:
                 return
             self._update(job_id, "preparing", 10)
             model = self.engine.model_for_alias(request["model_alias"])
+            model_metadata = json.loads(model["metadata"])
+            model_family = model_metadata.get("model_family", "SDXL")
             self._update(job_id, "loading_model", 15)
-            loras = self._resolve_loras(request)
+            loras = self._resolve_loras(request, model_family)
+            if model_family == "FLUX" and (
+                request.get("operation") != "generate"
+                or request.get("source_generation_id")
+                or request.get("identity_reference_id")
+                or request.get("pose_id")
+            ):
+                raise ValueError(
+                    "The Maximum FLUX profile currently supports native text-to-image and FLUX LoRAs; choose Balanced for editing, identity, or pose control"
+                )
             inpaint_metadata: dict[str, Any] | None = None
             if request.get("operation") == "inpaint":
                 source_image_name, mask_image_name, inpaint_metadata = self._prepare_inpaint_inputs(
@@ -1676,7 +1823,13 @@ class GenerationService:
                 mask_image_name = None
                 identity_image_name = self._prepare_identity_reference(request)
                 pose_image_name, pose_metadata = self._prepare_pose_control(request)
-            if request.get("operation") == "inpaint":
+            if model_family == "FLUX":
+                workflow = FluxWorkflowCompiler().compile(
+                    request,
+                    Path(model["installed_path"]).name,
+                    loras,
+                )
+            elif request.get("operation") == "inpaint":
                 workflow = WorkflowCompiler().compile_inpaint(
                     request,
                     Path(model["installed_path"]).name,
@@ -1707,7 +1860,8 @@ class GenerationService:
 
             prompt_id, history = self.engine.runtime.submit(workflow, progress)
             self._update(job_id, "decoding", 90, prompt_id=prompt_id)
-            output = history.get("outputs", {}).get("7", {}).get("images", [])
+            output_node = "8" if model_family == "FLUX" else "7"
+            output = history.get("outputs", {}).get(output_node, {}).get("images", [])
             if not output:
                 raise RuntimeError("The image engine completed without an output image")
             image = output[0]
@@ -1726,12 +1880,16 @@ class GenerationService:
                 rendered.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
             metadata = {
                 "workflow_version": (
-                    "image-sdxl-inpaint-v1"
-                    if request.get("operation") == "inpaint"
-                    else WorkflowCompiler.workflow_version(
-                        source_image=bool(source_image_name),
-                        identity_image=bool(identity_image_name),
-                        pose_image=bool(pose_image_name),
+                    FluxWorkflowCompiler.version
+                    if model_family == "FLUX"
+                    else (
+                        "image-sdxl-inpaint-v1"
+                        if request.get("operation") == "inpaint"
+                        else WorkflowCompiler.workflow_version(
+                            source_image=bool(source_image_name),
+                            identity_image=bool(identity_image_name),
+                            pose_image=bool(pose_image_name),
+                        )
                     )
                 ),
                 "operation": request.get("operation", "generate"),
@@ -1747,7 +1905,8 @@ class GenerationService:
                     else request.get("negative_prompt", "")
                 ),
                 "model_filename": Path(model["installed_path"]).name,
-                "model_sha256": json.loads(model["metadata"]).get("sha256"),
+                "model_sha256": model_metadata.get("sha256"),
+                "model_family": model_family,
                 "comfyui_revision": self.engine.runtime.revision,
                 "steps": request["steps"],
                 "guidance": request["guidance"],
@@ -1905,7 +2064,9 @@ class GenerationService:
         self.engine.runtime.interrupt(job.get("prompt_id"))
         return self.get(job_id)
 
-    def _resolve_loras(self, request: dict[str, Any]) -> list[dict[str, Any]]:
+    def _resolve_loras(
+        self, request: dict[str, Any], expected_family: str = "SDXL"
+    ) -> list[dict[str, Any]]:
         requested = list(request.get("lora_ids", []))
         if not requested and request.get("character_id"):
             requested = [
@@ -1922,8 +2083,10 @@ class GenerationService:
             row = self.db.query_one("SELECT * FROM lora_packs WHERE id=?", (lora_id,))
             if row is None or not row["enabled"]:
                 raise ValueError("One selected LoRA is no longer available")
-            if row["model_family"] != "SDXL":
-                raise ValueError("The selected LoRA is not compatible with the SDXL workflow")
+            if row["model_family"] != expected_family:
+                raise ValueError(
+                    f"The selected LoRA is not compatible with the {expected_family} workflow"
+                )
             if not Path(row["installed_path"]).is_file():
                 raise ValueError("A selected LoRA file is missing; repair or remove it")
             assignment = self.db.query_one(

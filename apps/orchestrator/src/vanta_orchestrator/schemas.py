@@ -97,7 +97,9 @@ class SettingInput(StrictModel):
 
 class ModelImportInput(StrictModel):
     source_path: str = Field(min_length=1, max_length=32767)
-    alias: Literal["photoreal_balanced"] = "photoreal_balanced"
+    alias: Literal["photoreal_balanced", "preview_fast", "photoreal_max"] = (
+        "photoreal_balanced"
+    )
     license_notes: str = Field(default="", max_length=2000)
 
 

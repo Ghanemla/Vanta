@@ -818,6 +818,10 @@ function CreateScreen({
   const [characterId, setCharacterId] = useState(data.characters[0]?.id ?? '');
   const [steps, setSteps] = useState(30);
   const [guidance, setGuidance] = useState(5.5);
+  const [modelAlias, setModelAlias] = useState(
+    data.packs.find((item) => item.is_default && item.installed && item.verified)?.alias ??
+      'photoreal_balanced',
+  );
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 2_000_000_000));
   const [negativePrompt, setNegativePrompt] = useState(
     'low quality, malformed hands, artificial skin texture',
@@ -832,9 +836,14 @@ function CreateScreen({
     (item) => item.status === 'ready' && (!item.character_id || item.character_id === characterId),
   );
   const runtime = data.components.find((item) => item.id === 'workflow-runtime');
-  const model =
-    data.packs.find((item) => item.is_default) ??
-    data.packs.find((item) => item.alias === 'photoreal_balanced');
+  const selectableModels = data.packs.filter(
+    (item) =>
+      ['photoreal_balanced', 'preview_fast', 'photoreal_max'].includes(item.alias) &&
+      item.installed &&
+      item.verified,
+  );
+  const model = data.packs.find((item) => item.alias === modelAlias);
+  const isFlux = modelAlias === 'photoreal_max';
   const canGenerate = runtime?.state === 'ready' && Boolean(model?.installed && model.verified);
   const categories = [
     'wardrobe',
@@ -879,6 +888,7 @@ function CreateScreen({
     setCharacterId(String(initialDraft.character_id ?? characterId));
     setSteps(Number(initialDraft.steps ?? steps));
     setGuidance(Number(initialDraft.guidance ?? guidance));
+    setModelAlias(String(initialDraft.model_alias ?? modelAlias));
     setSeed(Number(initialDraft.seed ?? seed));
     setNegativePrompt(String(initialDraft.negative_prompt ?? negativePrompt));
     setSourceGenerationId(
@@ -911,10 +921,10 @@ function CreateScreen({
     direction: prompt,
     custom_tags: tags,
     negative_prompt: negativePrompt,
-    model_alias: 'photoreal_balanced',
+    model_alias: modelAlias,
     seed,
-    width: poseId ? 768 : 832,
-    height: poseId ? 1024 : 1216,
+    width: poseId || isFlux ? 768 : 832,
+    height: poseId || isFlux ? 1024 : 1216,
     steps,
     guidance,
     source_generation_id: sourceGenerationId,
@@ -931,7 +941,7 @@ function CreateScreen({
         name: 'Y2K Bedroom Study',
         character_id: characterId || null,
         freeform_prompt: prompt,
-        model_profile: 'photoreal_balanced',
+        model_profile: modelAlias,
         preset_ids: Object.values(selected).filter(Boolean),
       });
       notify('Recipe saved to your local library');
@@ -1017,7 +1027,7 @@ function CreateScreen({
               <small>
                 {runtime?.state !== 'ready'
                   ? 'Install or repair the Local Generation Engine, then complete its health check.'
-                  : 'Import and verify a compatible local SDXL checkpoint in Models & Engine.'}
+                  : 'Import and verify a compatible local checkpoint in Models & Engine.'}
               </small>
             </span>
           </div>
@@ -1051,7 +1061,7 @@ function CreateScreen({
               <span>
                 <FolderLock /> Saved locally with reproducible metadata
               </span>
-              <span>832 × 1216</span>
+              <span>{isFlux || poseId ? '768 × 1024' : '832 × 1216'}</span>
             </footer>
           </Panel>
           <Panel className="prompt-panel">
@@ -1110,6 +1120,36 @@ function CreateScreen({
                 ))}
               </select>
             </label>
+            <label>
+              Model profile
+              <select
+                value={modelAlias}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setModelAlias(next);
+                  if (next === 'photoreal_max') {
+                    setSteps(20);
+                    setGuidance(3.5);
+                    setSourceGenerationId(null);
+                    setPoseId('');
+                  } else {
+                    setSteps(30);
+                    setGuidance(5.5);
+                  }
+                }}
+              >
+                {selectableModels.map((item) => (
+                  <option key={item.alias} value={item.alias}>
+                    {item.display_name}
+                  </option>
+                ))}
+              </select>
+              <small>
+                {isFlux
+                  ? 'Maximum detail · native FLUX · 768 × 1024 hardware-safe profile'
+                  : 'Balanced supports identity, pose, variations, and inpainting.'}
+              </small>
+            </label>
             <div className="form-grid">
               {categories.map((category) => (
                 <label key={category}>
@@ -1130,7 +1170,7 @@ function CreateScreen({
                 </label>
               ))}
             </div>
-            {sourceGenerationId && (
+            {sourceGenerationId && !isFlux && (
               <div className="variation-control">
                 <div className="section-rule">
                   <span>Controlled variation</span>
@@ -1191,7 +1231,11 @@ function CreateScreen({
             <div className="pose-create-control">
               <label>
                 Pose Control
-                <select value={poseId} onChange={(event) => setPoseId(event.target.value)}>
+                <select
+                  value={poseId}
+                  onChange={(event) => setPoseId(event.target.value)}
+                  disabled={isFlux}
+                >
                   <option value="">No saved pose</option>
                   {availablePoses.map((item) => (
                     <option key={item.id} value={item.id}>
@@ -1201,6 +1245,11 @@ function CreateScreen({
                   ))}
                 </select>
               </label>
+              {isFlux && (
+                <p className="field-help">
+                  Pose, identity, variations, and inpainting use the Balanced SDXL profile.
+                </p>
+              )}
               {poseId && (
                 <>
                   <label>
@@ -1416,7 +1465,7 @@ function CharactersScreen({
       clip_strength: imported.default_clip_strength,
       enabled: true,
     });
-    notify(`Verified SDXL LoRA assigned to ${item.name}`);
+    notify(`Verified local LoRA assigned to ${item.name}`);
     await refresh();
   };
   return (
@@ -1434,7 +1483,7 @@ function CharactersScreen({
       <p className="helper character-library-status">
         {loras.length
           ? `${loras.length} verified local LoRA${loras.length === 1 ? '' : 's'} available in this studio.`
-          : 'Import a compatible local SDXL LoRA from a character card when you are ready.'}
+          : 'Import a compatible local SDXL or FLUX LoRA from a character card when you are ready.'}
       </p>
       {items.length === 0 ? (
         <EmptyState
@@ -1507,7 +1556,7 @@ function CharactersScreen({
                     className="icon-button"
                     onClick={() => void importLora(item)}
                     aria-label={`Import LoRA for ${item.name}`}
-                    title="Import and assign a local SDXL LoRA"
+                    title="Import and assign a compatible local LoRA"
                   >
                     <Zap />
                   </button>
@@ -3009,17 +3058,23 @@ function EngineScreen({
       setBusy('');
     }
   };
-  const importLocalModel = async () => {
+  const importLocalModel = async (
+    alias: 'photoreal_balanced' | 'preview_fast' | 'photoreal_max' = 'photoreal_balanced',
+  ) => {
     const sourcePath = await chooseLocalModelFile();
     if (!sourcePath) return;
     setBusy('model-import');
     try {
       await api.post('/engine/models/import', {
         source_path: sourcePath,
-        alias: 'photoreal_balanced',
+        alias,
         license_notes: '',
       });
-      notify('Local SDXL checkpoint imported and verified');
+      notify(
+        alias === 'photoreal_max'
+          ? 'Self-contained FLUX checkpoint imported and verified'
+          : 'Local SDXL checkpoint imported and verified',
+      );
       await refresh();
     } finally {
       setBusy('');
@@ -3231,16 +3286,21 @@ function EngineScreen({
                     <span style={{ width: `${item.progress}%` }} />
                   </div>
                 )}
-                {!item.installed && item.alias === 'photoreal_balanced' && (
-                  <Button
-                    onClick={() => void importLocalModel()}
-                    disabled={busy === 'model-import'}
-                  >
-                    <Upload /> Import local model
-                  </Button>
-                )}
                 {!item.installed &&
-                  item.alias !== 'photoreal_balanced' &&
+                  ['photoreal_balanced', 'preview_fast', 'photoreal_max'].includes(item.alias) && (
+                    <Button
+                      onClick={() =>
+                        void importLocalModel(
+                          item.alias as 'photoreal_balanced' | 'preview_fast' | 'photoreal_max',
+                        )
+                      }
+                      disabled={busy === 'model-import'}
+                    >
+                      <Upload /> Import local {item.alias === 'photoreal_max' ? 'FLUX' : 'model'}
+                    </Button>
+                  )}
+                {!item.installed &&
+                  !['photoreal_balanced', 'preview_fast', 'photoreal_max'].includes(item.alias) &&
                   (item.alias === 'identity_plus_face_sdxl' ? (
                     <Button
                       onClick={() => void packAction(item, 'install')}
