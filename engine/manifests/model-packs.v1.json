@@ -115,6 +115,29 @@
       "target_path": "models/upscale_models/4xUltrasharp_4xUltrasharpV10.pt",
       "compatible_workflows": ["image-upscale-realesrgan-v1"],
       "active_default": false
+    },
+    {
+      "id": "vanta-identity-plus-face-sdxl-v1",
+      "alias": "identity_plus_face_sdxl",
+      "display_name": "Identity — Plus Face SDXL",
+      "model_family": "SDXL IP-Adapter Plus Face",
+      "capabilities": ["Character Reference Conditioning", "Identity Lock"],
+      "hardware": { "minimum_vram_gb": 10, "recommended_vram_gb": 12, "minimum_ram_gb": 24 },
+      "disk_gb": 1.98,
+      "download": {
+        "source_name": "IP-Adapter official local model source",
+        "url": "https://huggingface.co/h94/IP-Adapter",
+        "authentication": "none"
+      },
+      "license": {
+        "name": "Apache-2.0 (IP-Adapter source); verify model-card terms on import",
+        "acceptance_required": true,
+        "source_url": "https://huggingface.co/h94/IP-Adapter"
+      },
+      "sha256": "677ad8860204f7d0bfba12d29e6c31ded9beefdf3e4bbd102518357d31a292c1",
+      "target_path": "models/ipadapter/ip-adapter-plus-face_sdxl_vit-h.safetensors",
+      "compatible_workflows": ["image-sdxl-identity-ipadapter-v1"],
+      "active_default": false
     }
   ]
 }

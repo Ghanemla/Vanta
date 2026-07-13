@@ -100,3 +100,22 @@ def test_upscale_workflow_uses_the_local_model_loader_and_native_tiled_execution
     assert workflow["2"]["inputs"]["model_name"] == "RealESRGAN_x2plus.pth"
     assert workflow["3"]["class_type"] == "ImageUpscaleWithModel"
     assert workflow["4"]["class_type"] == "SaveImage"
+
+
+def test_identity_workflow_uses_the_managed_ipadapter_not_a_prompt_only_substitute():
+    request = {
+        "direction": "original adult editorial portrait",
+        "negative_prompt": "",
+        "seed": 9,
+        "width": 832,
+        "height": 1216,
+        "steps": 2,
+        "guidance": 5.5,
+    }
+    workflow = WorkflowCompiler().compile(
+        request, "model.safetensors", identity_image_name="Vanta/identity-reference.png"
+    )
+    assert workflow["21"]["class_type"] == "IPAdapterUnifiedLoader"
+    assert workflow["21"]["inputs"]["preset"] == "PLUS FACE (portraits)"
+    assert workflow["22"]["class_type"] == "IPAdapterAdvanced"
+    assert workflow["5"]["inputs"]["model"] == ["22", 0]

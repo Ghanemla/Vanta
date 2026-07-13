@@ -94,6 +94,10 @@ class Settings:
         return self.engine_root / "models" / "clip_vision"
 
     @property
+    def ipadapter_root(self) -> Path:
+        return self.engine_root / "models" / "ipadapter"
+
+    @property
     def reference_root(self) -> Path:
         return self.data_dir / "media" / "references"
 
@@ -134,5 +138,6 @@ class Settings:
         self.upscale_root.mkdir(parents=True, exist_ok=True)
         self.controlnet_root.mkdir(parents=True, exist_ok=True)
         self.clip_vision_root.mkdir(parents=True, exist_ok=True)
+        self.ipadapter_root.mkdir(parents=True, exist_ok=True)
         self.reference_root.mkdir(parents=True, exist_ok=True)
         self.media_root.mkdir(parents=True, exist_ok=True)

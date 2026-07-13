@@ -28,6 +28,7 @@ from .schemas import (
     CharacterInput,
     CharacterLoraInput,
     GenerationInput,
+    IdentityAdapterImportInput,
     LoraImportInput,
     ModelImportInput,
     PresetInput,
@@ -465,6 +466,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def import_upscaler(payload: UpscalerImportInput) -> dict:
         try:
             return engine.import_upscaler(payload.source_path, payload.alias, payload.license_notes)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/engine/identity-adapter/import")
+    def import_identity_adapter(payload: IdentityAdapterImportInput) -> dict:
+        try:
+            return engine.import_identity_adapter(
+                payload.adapter_source_path, payload.clip_vision_source_path, payload.license_notes
+            )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 

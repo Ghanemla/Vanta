@@ -184,6 +184,7 @@ class WorkflowCompiler:
         checkpoint_name: str,
         loras: list[dict[str, Any]] | None = None,
         source_image_name: str | None = None,
+        identity_image_name: str | None = None,
     ) -> dict[str, Any]:
         positive = self.compile_prompt(request)
         if not positive:
@@ -244,6 +245,30 @@ class WorkflowCompiler:
             }
             workflow["5"]["inputs"]["latent_image"] = ["10", 0]
             workflow["5"]["inputs"]["denoise"] = request["variation_strength"]
+        if identity_image_name:
+            workflow["20"] = {"class_type": "LoadImage", "inputs": {"image": identity_image_name}}
+            workflow["21"] = {
+                "class_type": "IPAdapterUnifiedLoader",
+                "inputs": {
+                    "model": workflow["5"]["inputs"]["model"],
+                    "preset": "PLUS FACE (portraits)",
+                },
+            }
+            workflow["22"] = {
+                "class_type": "IPAdapterAdvanced",
+                "inputs": {
+                    "model": ["21", 0],
+                    "ipadapter": ["21", 1],
+                    "image": ["20", 0],
+                    "weight": 0.6,
+                    "weight_type": "linear",
+                    "combine_embeds": "concat",
+                    "start_at": 0.0,
+                    "end_at": 1.0,
+                    "embeds_scaling": "V only",
+                },
+            }
+            workflow["5"]["inputs"]["model"] = ["22", 0]
         return workflow
 
     def diagnostic(self, checkpoint_name: str) -> dict[str, Any]:
@@ -482,6 +507,119 @@ class EngineService:
         )
         return self._pack_row(alias)
 
+    def import_identity_adapter(
+        self, adapter_source_path: str, clip_vision_source_path: str, license_notes: str = ""
+    ) -> dict[str, Any]:
+        adapter_source = Path(adapter_source_path).expanduser().resolve()
+        clip_source = Path(clip_vision_source_path).expanduser().resolve()
+        for source, label in (
+            (adapter_source, "identity adapter"),
+            (clip_source, "CLIP Vision encoder"),
+        ):
+            if not source.is_file():
+                raise ValueError(f"Choose an existing local {label} file")
+            validate_safetensors(source)
+        adapter_target = (
+            self.settings.ipadapter_root / "ip-adapter-plus-face_sdxl_vit-h.safetensors"
+        )
+        clip_target = self.settings.clip_vision_root / "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+        self.settings.ipadapter_root.mkdir(parents=True, exist_ok=True)
+        self.settings.clip_vision_root.mkdir(parents=True, exist_ok=True)
+        if adapter_source != adapter_target:
+            shutil.copy2(adapter_source, adapter_target)
+        if clip_source != clip_target:
+            shutil.copy2(clip_source, clip_target)
+        metadata = json.loads(self._pack_row("identity_plus_face_sdxl")["metadata"])
+        metadata.update(
+            {
+                "filename": adapter_target.name,
+                "sha256": sha256_file(adapter_target),
+                "clip_vision_filename": clip_target.name,
+                "clip_vision_sha256": sha256_file(clip_target),
+                "source_information": "Imported from user-selected local adapter and CLIP Vision files",
+            }
+        )
+        self.db.execute(
+            """UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100,
+            metadata=?, installed_path=?, original_path=?, file_size=?, license_notes=?, imported_at=?, updated_at=?
+            WHERE alias='identity_plus_face_sdxl'""",
+            (
+                json.dumps(metadata),
+                str(adapter_target),
+                str(adapter_source),
+                adapter_target.stat().st_size + clip_target.stat().st_size,
+                license_notes,
+                utc_now(),
+                utc_now(),
+            ),
+        )
+        return self.verify_identity_adapter()
+
+    def verify_identity_adapter(self) -> dict[str, Any]:
+        row = self._pack_row("identity_plus_face_sdxl")
+        adapter = self.settings.ipadapter_root / "ip-adapter-plus-face_sdxl_vit-h.safetensors"
+        encoder = self.settings.clip_vision_root / "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+        if not adapter.is_file() or not encoder.is_file():
+            raise ValueError(
+                "Identity Lock is missing its adapter or CLIP Vision encoder; import both to repair"
+            )
+        validate_safetensors(adapter)
+        validate_safetensors(encoder)
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=45):
+            raise ValueError("Start the Local Generation Engine before verifying Identity Lock")
+        nodes = self.runtime._request_json("/object_info")
+        if not {"IPAdapterUnifiedLoader", "IPAdapterAdvanced"}.issubset(nodes):
+            raise ValueError("Vanta's compatible identity adapter runtime is not installed")
+        metadata = json.loads(row["metadata"])
+        metadata.update(
+            {
+                "filename": adapter.name,
+                "sha256": sha256_file(adapter),
+                "clip_vision_filename": encoder.name,
+                "clip_vision_sha256": sha256_file(encoder),
+                "verification": "adapter and encoder validated; compatible local runtime nodes available",
+            }
+        )
+        self.db.execute(
+            "UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100, metadata=?, updated_at=? WHERE alias='identity_plus_face_sdxl'",
+            (json.dumps(metadata), utc_now()),
+        )
+        return self._pack_row("identity_plus_face_sdxl")
+
+    def verify_upscaler(self, alias: str) -> dict[str, Any]:
+        names = {
+            "realesrgan_x2plus": "RealESRGAN_x2plus.pth",
+            "ultrasharp_x4": "4xUltrasharp_4xUltrasharpV10.pt",
+        }
+        filename = names[alias]
+        path = self.settings.upscale_root / filename
+        if not path.is_file() or path.stat().st_size < 1_000_000:
+            raise ValueError(
+                "The selected local upscale model is missing; import it again to repair the pack"
+            )
+        self.runtime.start()
+        if not self.runtime.wait_healthy(timeout=45):
+            raise ValueError("Start the Local Generation Engine before verifying this upscale pack")
+        model_names = (
+            self.runtime._request_json("/object_info")
+            .get("UpscaleModelLoader", {})
+            .get("input", {})
+            .get("required", {})
+            .get("model_name", [[]])[0]
+        )
+        if filename not in model_names:
+            raise ValueError(
+                "The Local Generation Engine cannot see this upscale model; repair the pack"
+            )
+        metadata = json.loads(self._pack_row(alias)["metadata"])
+        metadata.update({"filename": filename, "sha256": sha256_file(path)})
+        self.db.execute(
+            "UPDATE model_packs SET state='ready', installed=1, verified=1, progress=100, metadata=?, updated_at=? WHERE alias=?",
+            (json.dumps(metadata), utc_now(), alias),
+        )
+        return self._pack_row(alias)
+
     def verify_model(self, alias: str) -> dict[str, Any]:
         row = self._pack_row(alias)
         path = Path(row.get("installed_path") or "")
@@ -554,6 +692,10 @@ class EngineService:
         if row is None:
             raise KeyError(item_id)
         if action in {"verify", "repair"}:
+            if row["alias"] == "identity_plus_face_sdxl":
+                return self.verify_identity_adapter()
+            if row["alias"] in {"realesrgan_x2plus", "ultrasharp_x4"}:
+                return self.verify_upscaler(row["alias"])
             return self.verify_model(row["alias"])
         if action == "remove":
             if row["is_default"]:
@@ -696,8 +838,13 @@ class GenerationService:
             self._update(job_id, "loading_model", 15)
             loras = self._resolve_loras(request)
             source_image_name = self._prepare_variation_source(request)
+            identity_image_name = self._prepare_identity_reference(request)
             workflow = WorkflowCompiler().compile(
-                request, Path(model["installed_path"]).name, loras, source_image_name
+                request,
+                Path(model["installed_path"]).name,
+                loras,
+                source_image_name,
+                identity_image_name,
             )
 
             def progress(value: int, maximum: int) -> None:
@@ -741,6 +888,7 @@ class GenerationService:
                 "loras": loras,
                 "source_generation_id": request.get("source_generation_id"),
                 "variation_strength": request.get("variation_strength"),
+                "identity_reference_id": request.get("identity_reference_id"),
                 "disclosure": True,
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
@@ -932,6 +1080,36 @@ class GenerationService:
         input_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{generation_id}.png"
         shutil.copy2(source["image_path"], input_dir / filename)
+        return f"Vanta/{filename}"
+
+    def _prepare_identity_reference(self, request: dict[str, Any]) -> str | None:
+        reference_id = request.get("identity_reference_id")
+        if not reference_id and request.get("character_id"):
+            reference = self.db.query_one(
+                "SELECT id FROM character_references WHERE character_id=? AND is_primary=1",
+                (request["character_id"],),
+            )
+            reference_id = reference["id"] if reference else None
+        if not reference_id:
+            return None
+        request["identity_reference_id"] = reference_id
+        pack = self.engine._pack_row("identity_plus_face_sdxl")
+        if not pack["installed"] or not pack["verified"]:
+            raise ValueError(
+                "Install and verify the Identity — Plus Face SDXL pack before using a reference"
+            )
+        reference = self.db.query_one(
+            "SELECT image_path FROM character_references WHERE id=?", (reference_id,)
+        )
+        if reference is None or not Path(reference["image_path"]).is_file():
+            raise ValueError("The selected identity reference is no longer available")
+        layout = self.engine.runtime.installed_layout()
+        if layout is None:
+            raise ValueError("Start the Local Generation Engine before using an identity reference")
+        input_dir = layout[0].parent / "input" / "Vanta"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"identity-{reference_id}.png"
+        shutil.copy2(reference["image_path"], input_dir / filename)
         return f"Vanta/{filename}"
 
     def get(self, job_id: str) -> dict[str, Any]:

@@ -248,6 +248,7 @@ class ManagedComfyRuntime:
             "  loras: models/loras\n"
             "  controlnet: models/controlnet\n"
             "  clip_vision: models/clip_vision\n"
+            "  ipadapter: models/ipadapter\n"
             "  upscale_models: models/upscale_models\n",
             encoding="utf-8",
         )

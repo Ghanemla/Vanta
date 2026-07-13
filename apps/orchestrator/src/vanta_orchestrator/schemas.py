@@ -88,6 +88,12 @@ class UpscalerImportInput(StrictModel):
     license_notes: str = Field(default="", max_length=2000)
 
 
+class IdentityAdapterImportInput(StrictModel):
+    adapter_source_path: str = Field(min_length=1, max_length=32767)
+    clip_vision_source_path: str = Field(min_length=1, max_length=32767)
+    license_notes: str = Field(default="", max_length=2000)
+
+
 class GenerationInput(StrictModel):
     operation: Literal["generate", "upscale"] = "generate"
     character_id: str | None = None
@@ -113,5 +119,6 @@ class GenerationInput(StrictModel):
     guidance: float = Field(default=5.5, ge=1, le=15)
     lora_ids: list[str] = Field(default_factory=list, max_length=8)
     source_generation_id: str | None = None
+    identity_reference_id: str | None = None
     variation_strength: float = Field(default=0.45, ge=0.05, le=0.95)
     upscale_profile: Literal["realesrgan_x2plus", "ultrasharp_x4"] | None = None

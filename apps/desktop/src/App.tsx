@@ -2084,6 +2084,24 @@ function EngineScreen({
       setBusy('');
     }
   };
+  const importIdentityAdapter = async () => {
+    const adapterPath = await chooseLocalModelFile();
+    if (!adapterPath) return;
+    const clipVisionPath = await chooseLocalModelFile();
+    if (!clipVisionPath) return;
+    setBusy('identity-import');
+    try {
+      await api.post('/engine/identity-adapter/import', {
+        adapter_source_path: adapterPath,
+        clip_vision_source_path: clipVisionPath,
+        license_notes: '',
+      });
+      notify('Local identity adapter and CLIP Vision encoder verified');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
   return (
     <div className="screen engine-screen">
       <PageTitle
@@ -2269,7 +2287,14 @@ function EngineScreen({
                 )}
                 {!item.installed &&
                   item.alias !== 'photoreal_balanced' &&
-                  (item.alias === 'realesrgan_x2plus' || item.alias === 'ultrasharp_x4' ? (
+                  (item.alias === 'identity_plus_face_sdxl' ? (
+                    <Button
+                      onClick={() => void importIdentityAdapter()}
+                      disabled={busy === 'identity-import'}
+                    >
+                      <Upload /> Import adapter + encoder
+                    </Button>
+                  ) : item.alias === 'realesrgan_x2plus' || item.alias === 'ultrasharp_x4' ? (
                     <Button
                       onClick={() =>
                         void importUpscaler(item.alias as 'realesrgan_x2plus' | 'ultrasharp_x4')
