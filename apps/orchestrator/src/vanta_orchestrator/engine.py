@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import logging
+import math
 import os
 import platform
 import shutil
@@ -42,6 +43,8 @@ from .video import (
     VIDEO_TEXT_ENCODER_FILENAME,
     LtxVideoWorkflowCompiler,
     encode_mp4,
+    extract_last_frame,
+    is_owned_path,
 )
 
 logger = logging.getLogger("vanta.orchestrator.engine")
@@ -2085,7 +2088,7 @@ class GenerationService:
 
     def recover(self) -> None:
         self.db.execute(
-            "UPDATE generation_jobs SET status='failed', error_message='Vanta closed before this generation finished', updated_at=? WHERE status IN ('checking_engine', 'preparing', 'loading_model', 'generating', 'decoding', 'encoding', 'saving', 'cancelling')",
+            "UPDATE generation_jobs SET status='failed', error_message='Vanta closed before this generation finished', updated_at=? WHERE status IN ('checking_engine', 'starting_engine', 'preparing', 'preparing_prompt', 'applying_loras', 'applying_identity', 'applying_pose', 'loading_model', 'generating', 'decoding', 'encoding', 'saving', 'creating_thumbnail', 'finalizing_metadata', 'cancelling')",
             (utc_now(),),
         )
         if self.db.query_one("SELECT id FROM generation_jobs WHERE status='queued' LIMIT 1"):
@@ -2146,8 +2149,11 @@ class GenerationService:
         request = json.loads(job["request_json"])
         started = time.monotonic()
         try:
-            self._update(job_id, "checking_engine", 5, started_at=utc_now())
-            self.engine.runtime.start()
+            self._update(job_id, "checking_engine", 0, started_at=utc_now())
+            if self.engine.runtime.snapshot().state != "ready":
+                self._update(job_id, "starting_engine", 0)
+                self.engine.runtime.start()
+            self._update(job_id, "checking_engine", 0)
             if not self.engine.runtime.wait_healthy(timeout=45):
                 raise RuntimeError("The Local Generation Engine is not ready")
             if request.get("operation") == "video":
@@ -2156,11 +2162,12 @@ class GenerationService:
             if request.get("operation") == "upscale":
                 self._run_upscale(job_id, request, started)
                 return
-            self._update(job_id, "preparing", 10)
+            self._update(job_id, "preparing_prompt", 8)
             model = self.engine.model_for_alias(request["model_alias"])
             model_metadata = json.loads(model["metadata"])
             model_family = model_metadata.get("model_family", "SDXL")
-            self._update(job_id, "loading_model", 15)
+            if request.get("lora_ids") or request.get("character_id"):
+                self._update(job_id, "applying_loras", 10)
             loras = self._resolve_loras(request, model_family)
             if model_family == "FLUX" and (
                 request.get("operation") != "generate"
@@ -2181,7 +2188,11 @@ class GenerationService:
             else:
                 source_image_name = self._prepare_variation_source(request)
                 mask_image_name = None
+                if request.get("identity_reference_id"):
+                    self._update(job_id, "applying_identity", 12)
                 identity_image_name = self._prepare_identity_reference(request)
+                if request.get("pose_id"):
+                    self._update(job_id, "applying_pose", 14)
                 pose_image_name, pose_metadata = self._prepare_pose_control(request)
             if model_family == "FLUX":
                 workflow = FluxWorkflowCompiler().compile(
@@ -2207,6 +2218,8 @@ class GenerationService:
                     pose_image_name,
                     request.get("pose_strength"),
                 )
+
+            self._update(job_id, "loading_model", 15)
 
             def progress(value: int, maximum: int) -> None:
                 if self.get(job_id)["status"] == "cancelling":
@@ -2239,6 +2252,7 @@ class GenerationService:
             destination = self.engine.settings.media_root / f"{generation_id}.png"
             thumbnail = self.engine.settings.media_root / f"{generation_id}.thumb.jpg"
             shutil.copy2(source, destination)
+            self._update(job_id, "creating_thumbnail", 97)
             with Image.open(destination) as rendered:
                 rendered.thumbnail((480, 480))
                 rendered.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
@@ -2289,6 +2303,7 @@ class GenerationService:
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
             }
+            self._update(job_id, "finalizing_metadata", 99)
             self.db.execute(
                 """INSERT INTO generations(id, character_id, recipe_id, image_path, thumbnail_path, prompt, negative_prompt, seed, model_alias, width, height, metadata, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -2333,11 +2348,32 @@ class GenerationService:
 
     def _run_video(self, job_id: str, request: dict[str, Any], started: float) -> None:
         source_id = str(request.get("source_generation_id") or "")
-        source = self.db.query_one(
-            "SELECT * FROM generations WHERE id=? AND media_type='image'", (source_id,)
-        )
-        if source is None or not Path(source["image_path"]).is_file():
+        source = self.db.query_one("SELECT * FROM generations WHERE id=?", (source_id,))
+        source_path = Path(source["image_path"]) if source else Path()
+        if (
+            source is None
+            or not source_path.is_file()
+            or not is_owned_path(source_path, self.engine.settings.media_root)
+        ):
             raise ValueError("Choose an available Gallery image as the first video frame")
+        if source.get("media_type") == "video":
+            source_metadata = json.loads(source.get("metadata") or "{}")
+            continuation_value = source_metadata.get("continuation_frame_path")
+            recorded_continuation = Path(continuation_value) if continuation_value else None
+            continuation = (
+                recorded_continuation
+                if recorded_continuation
+                and is_owned_path(recorded_continuation, self.engine.settings.media_root)
+                else self.engine.settings.media_root / f"{source_id}.last.png"
+            )
+            if not continuation.is_file():
+                extract_last_frame(source_path, continuation)
+            source_metadata["continuation_frame_path"] = str(continuation)
+            self.db.execute(
+                "UPDATE generations SET metadata=? WHERE id=?",
+                (json.dumps(source_metadata), source_id),
+            )
+            source_path = continuation
         pack = self.engine.model_for_alias(VIDEO_MODEL_ALIAS)
         pack_metadata = json.loads(pack["metadata"])
         profile = VIDEO_PROFILES[request["profile"]]
@@ -2372,10 +2408,11 @@ class GenerationService:
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         source_name = f"{job_id}-video-source.png"
-        with Image.open(source["image_path"]) as image:
+        with Image.open(source_path) as image:
             image.convert("RGB").save(input_dir / source_name, "PNG")
-        self._update(job_id, "preparing", 12)
+        self._update(job_id, "preparing_prompt", 12)
         workflow = LtxVideoWorkflowCompiler().compile(request, f"Vanta/{source_name}")
+        self._update(job_id, "loading_model", 15)
 
         def progress(value: int, maximum: int) -> None:
             if self.get(job_id)["status"] == "cancelling":
@@ -2403,13 +2440,17 @@ class GenerationService:
         generation_id = f"generation-{uuid.uuid4().hex}"
         destination = self.engine.settings.media_root / f"{generation_id}.mp4"
         thumbnail = self.engine.settings.media_root / f"{generation_id}.thumb.jpg"
+        continuation = self.engine.settings.media_root / f"{generation_id}.last.png"
         encode_mp4(frame_paths, destination, profile["fps"])
+        self._update(job_id, "creating_thumbnail", 96)
         with Image.open(frame_paths[0]) as first:
             first.thumbnail((480, 480))
             first.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
+        shutil.copy2(frame_paths[-1], continuation)
         if self.get(job_id)["status"] == "cancelling":
             destination.unlink(missing_ok=True)
             thumbnail.unlink(missing_ok=True)
+            continuation.unlink(missing_ok=True)
             raise RuntimeError("Generation cancelled")
         duration = request["duration_seconds"]
         metadata = {
@@ -2434,6 +2475,8 @@ class GenerationService:
             "fps": profile["fps"],
             "frame_count": len(frame_paths),
             "duration_seconds": duration,
+            "duration_profile": request.get("duration_profile", "custom"),
+            "continuation_frame_path": str(continuation),
             "motion_reference": motion_reference,
             "ffmpeg_version": __import__("imageio_ffmpeg").get_ffmpeg_version(),
             "ffmpeg_sha256": VIDEO_FFMPEG_SHA256,
@@ -2442,6 +2485,7 @@ class GenerationService:
             "duration_render_seconds": round(time.monotonic() - started, 2),
             "request": request,
         }
+        self._update(job_id, "finalizing_metadata", 99)
         self.db.execute(
             """INSERT INTO generations(id, character_id, recipe_id, image_path, thumbnail_path, prompt, negative_prompt, seed, model_alias, width, height, metadata, created_at, media_type)
             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'video')""",
@@ -2495,8 +2539,9 @@ class GenerationService:
         input_dir.mkdir(parents=True, exist_ok=True)
         source_name = f"{source_id}-upscale-source.png"
         shutil.copy2(source_row["image_path"], input_dir / source_name)
-        self._update(job_id, "preparing", 15)
+        self._update(job_id, "preparing_prompt", 12)
         workflow = WorkflowCompiler.upscale(f"Vanta/{source_name}", model_name)
+        self._update(job_id, "loading_model", 15)
 
         def progress(value: int, maximum: int) -> None:
             if self.get(job_id)["status"] == "cancelling":
@@ -2521,6 +2566,7 @@ class GenerationService:
         destination = self.engine.settings.media_root / f"{generation_id}.png"
         thumbnail = self.engine.settings.media_root / f"{generation_id}.thumb.jpg"
         shutil.copy2(rendered, destination)
+        self._update(job_id, "creating_thumbnail", 97)
         with Image.open(destination) as final_image:
             width, height = final_image.size
             final_image.thumbnail((480, 480))
@@ -2542,6 +2588,7 @@ class GenerationService:
             "duration_seconds": round(time.monotonic() - started, 2),
             "request": request,
         }
+        self._update(job_id, "finalizing_metadata", 99)
         self.db.execute(
             """INSERT INTO generations(id, character_id, recipe_id, image_path, thumbnail_path, prompt, negative_prompt, seed, model_alias, width, height, metadata, created_at)
             VALUES (?, NULL, NULL, ?, ?, ?, '', 0, 'photoreal_balanced', ?, ?, ?, ?)""",
@@ -2832,6 +2879,7 @@ class GenerationService:
 
     def _present(self, job: dict[str, Any]) -> dict[str, Any]:
         result = dict(job)
+        request = json.loads(result.get("request_json") or "{}")
         if result["status"] == "queued":
             result["queue_position"] = (
                 int(
@@ -2845,16 +2893,51 @@ class GenerationService:
         else:
             result["queue_position"] = None
         result["eta_seconds"] = None
+        result["elapsed_seconds"] = 0
+        started_at = result.get("started_at")
+        completed_at = result.get("completed_at")
+        if started_at:
+            end = datetime.fromisoformat(completed_at) if completed_at else datetime.now(UTC)
+            result["elapsed_seconds"] = max(
+                0, round((end - datetime.fromisoformat(started_at)).total_seconds())
+            )
         if (
-            result.get("started_at")
+            started_at
             and result.get("current_step")
             and result.get("total_steps")
             and 0 < result["current_step"] < result["total_steps"]
         ):
-            elapsed = (
-                datetime.now(UTC) - datetime.fromisoformat(result["started_at"])
-            ).total_seconds()
-            result["eta_seconds"] = round(
-                elapsed * (result["total_steps"] - result["current_step"]) / result["current_step"]
+            elapsed = result["elapsed_seconds"]
+            result["eta_seconds"] = math.ceil(
+                1.1
+                * elapsed
+                * (result["total_steps"] - result["current_step"])
+                / result["current_step"]
             )
+        operation = request.get("operation") or "generate"
+        model_alias = request.get("model_alias") or (
+            VIDEO_MODEL_ALIAS if operation == "video" else "photoreal_balanced"
+        )
+        width, height = request.get("width"), request.get("height")
+        if operation == "video":
+            profile = VIDEO_PROFILES.get(request.get("profile", "safe"), VIDEO_PROFILES["safe"])
+            width, height = profile["width"], profile["height"]
+        elif operation == "upscale" and request.get("source_generation_id"):
+            source = self.db.query_one(
+                "SELECT width,height FROM generations WHERE id=?",
+                (request["source_generation_id"],),
+            )
+            if source:
+                scale = 4 if request.get("upscale_profile") == "ultrasharp_x4" else 2
+                width, height = source["width"] * scale, source["height"] * scale
+        result["operation"] = operation
+        result["model_alias"] = model_alias
+        result["model_family"] = (
+            "FLUX"
+            if model_alias == "photoreal_max"
+            else ("LTX-Video" if model_alias == VIDEO_MODEL_ALIAS else "SDXL")
+        )
+        result["output_width"] = width
+        result["output_height"] = height
+        result["progress_determinate"] = result["status"] in {"generating", "completed"}
         return result

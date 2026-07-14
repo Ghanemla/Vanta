@@ -2,6 +2,14 @@
 
 Last updated: 2026-07-14
 
+## V1.0.1 movable storage and Gallery export process
+
+Vanta has a stable bootstrap record outside the movable studio-data root. The desktop shell resolves this record before launching the sidecar and passes the selected root through `VANTA_DATA_DIR`; all orchestrator subsystems derive paths from that one setting.
+
+To move installed data to `F:\VantaData`, open **Settings → Storage**, choose **Move existing studio data**, select the empty local folder, and confirm. Vanta stops managed child processes, scans the original, checks free space, copies real files with byte/file progress, verifies counts, validates the copied SQLite presence, restarts the sidecar against the destination, then atomically writes the bootstrap record only after health succeeds. The original is retained; Vanta never silently deletes it. Cancellation before switching and any verification/restart failure restore the original root and restart the sidecar there. Existing redirected/junction defaults are detected and can be adopted without recursive copying.
+
+Gallery actions are native typed operations. React supplies only the media entity/id/variant; the desktop shell obtains a capability-protected owned path, checks it is inside the active studio root, then opens, reveals, copies, or places the path on the clipboard. **Save a copy** uses a native dialog, defaults to Pictures or the configured export folder, and refuses overwrite.
+
 ## Repository audit
 
 - Branch: `master`; working tree was clean at audit start.
@@ -300,3 +308,42 @@ Run the documented native installer and visual acceptance checklist on a clean W
 ## Final acceptance status
 
 **Not accepted. Essential V1 remains in progress.**
+
+## V1.0.1 installed-release repair (2026-07-14)
+
+This section supersedes the older release-status statements above for the current repair. Historical V0.1.0 evidence and hashes remain intentionally unchanged.
+
+### Confirmed shared media root cause
+
+The existing AppData records and sampled files are healthy. The installed renderer fetched media with the current `X-Vanta-Token` and created Blob URLs, but production CSP allowed neither `blob:` images nor a `media-src` policy. Each surface also owned and revoked its Blob URL independently during React unmounts, so navigation/remounts could invalidate a URL while it was still in use. Failures were swallowed into permanent placeholders. Media routing was fragmented and did not consistently expose typed video/poster/derivative variants or one Vanta-root ownership check.
+
+The V1.0.1 repair therefore:
+
+- adds typed authenticated media resolution for generation original/thumbnail/video/poster/continuation/mask, pose source/control, training image/validation, character reference and motion media;
+- validates every database record and resolved path against its specific Vanta-owned root, returns structured errors and correct MIME, and advertises byte ranges for video;
+- uses one frontend Blob cache keyed by entity, ID and variant, coalesces requests, retries after service-info/port changes, falls back from thumbnail to original, and revokes only on eviction, deletion or app shutdown;
+- permits `blob:` only for image/media CSP destinations;
+- adds migration `011_media_index.sql` and a non-destructive repair that normalizes owned paths, verifies/decode-checks originals, indexes dimensions/MIME/size, restores thumbnails/posters/continuation frames, and reports missing originals without fabricating or deleting files.
+
+Real AppData samples inspected before editing:
+
+| Surface             | Stored evidence                                                                    | Result                              |
+| ------------------- | ---------------------------------------------------------------------------------- | ----------------------------------- |
+| Gallery image       | 832×1216 PNG, 1,177,761 bytes; 328×480 JPEG thumbnail, 33,989 bytes                | Both exist and decode               |
+| Gallery video       | 49-frame H.264 MP4, 77,845 bytes, 2.04 seconds; 320×480 JPEG poster, 10,602 bytes  | Both exist; MP4 probes successfully |
+| Pose                | 832×1216 JPEG source, 206,331 bytes; 512×748 PNG control, 24,393 bytes             | Both exist and decode               |
+| Training            | 832×1216 PNG dataset image, 1,100,143 bytes; 512×512 PNG validation, 214,781 bytes | Both exist and decode               |
+| Character reference | 832×1216 JPEG, 206,331 bytes                                                       | Exists and decodes                  |
+
+The dynamic service log showed authenticated `/api/jobs` and training requests succeeding across changing loopback ports. Source inspection confirmed authenticated media requests used the centralized current base URL/token. No raw Windows path was intentionally assigned as a media `src`, no token was placed in a query string, and stored MIME/file contents were valid. A packaged WebView console/status capture with the new build remains an installed-acceptance action, not automated evidence.
+
+### Progress, training and video repair
+
+- Generation jobs now expose real queued, engine-check/start, prompt/control preparation, model load, sampling, decode/encode, save, thumbnail and metadata-finalization stages. Only sampling/completion is determinate. Elapsed time, conservative ETA, queue, model/family and output dimensions are presented inline and in Jobs. The tracked job survives navigation/restart until dismissed or replaced.
+- Training failures are categorized and explained without raw CLI output. Retry creates a fresh preserved run; saved-state resume remains separate. Full on-demand trainer output is path/token-sanitized and collapsible. Run-state and dataset filters preserve rather than hide history.
+- Migration `012_video_sequences.sql` persists sequences and segments. Safe 2-second and Standard 4-second single-pass profiles remain available; Extended 6–8 seconds is rejected unless a successful 12 GB hardware verification is explicitly recorded. Estimates use recent local render history when available. A sequence can continue from the final or a selected frame, retain a motion prompt per segment, reorder/remove segments and join same-profile completed segments into a disclosed MP4 with reproducible segment metadata.
+- Reference Motion accepts a source up to two minutes while enforcing a four-second-or-shorter selected extraction range.
+
+### Installed acceptance constraint
+
+Writing migrations/repairs or launching the new installed build against `%APPDATA%\studio.vanta.desktop` requires execution outside the workspace sandbox. The approval request on 2026-07-14 was rejected by the execution service because its usage limit had been reached (next indicated availability: 2026-07-20). No AppData file, model or user media was changed. Source-isolated migration/API/FFmpeg tests continue inside temporary directories; installed-release checks remain blocked until that approval is available.

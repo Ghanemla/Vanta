@@ -27,6 +27,7 @@ class Settings:
     resource_root: Path | None = None
     logs_dir: Path | None = None
     launch_token: str | None = None
+    desktop_capability: str | None = None
     runtime_mode: str = "production"
     diagnostics_enabled: bool = False
 
@@ -49,6 +50,7 @@ class Settings:
             resource_root=bundled_resource_root(),
             logs_dir=Path(os.getenv("VANTA_LOGS_DIR", data_dir / "logs")),
             launch_token=os.getenv("VANTA_LAUNCH_TOKEN") or None,
+            desktop_capability=os.getenv("VANTA_DESKTOP_CAPABILITY") or None,
             runtime_mode=runtime_mode,
             diagnostics_enabled=os.getenv("VANTA_DIAGNOSTICS") == "1",
         )

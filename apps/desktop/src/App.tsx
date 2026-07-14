@@ -53,6 +53,8 @@ import {
 import { Button, Drawer, EmptyState, Panel, StatusPill } from '@vanta/ui';
 import {
   api,
+  adoptRedirectedStorage,
+  cancelStorageMove,
   chooseLocalImageFile,
   chooseLocalLoraFile,
   chooseLocalModelFile,
@@ -60,12 +62,22 @@ import {
   chooseLocalVideoFile,
   chooseLocalTrainingImages,
   exportDiagnostics,
+  getStorageInfo,
   getLocalServiceInfo,
   openLocalPath,
+  openManagedMedia,
   repairApplicationRuntime,
+  revealManagedMedia,
   restartLocalService,
+  saveManagedMediaCopy,
+  setDefaultExportFolder,
+  startStorageMove,
+  chooseStorageLocation,
+  copyManagedMediaPath,
   type LocalServiceInfo,
+  type StorageInfo,
 } from './api';
+import { AuthenticatedImage, AuthenticatedVideo, mediaCache } from './media';
 import type {
   CharacterRecord,
   Diagnostics,
@@ -81,6 +93,8 @@ import type {
   SettingsRecord,
   TrainingDataset,
   TrainingRun,
+  VideoCapabilities,
+  VideoSequence,
 } from './types';
 
 type Screen =
@@ -133,11 +147,22 @@ const stateLabels: Record<string, string> = {
   verifying: 'Verifying',
   stopped: 'Stopped',
   starting: 'Starting',
+  starting_engine: 'Starting engine',
+  checking_engine: 'Checking engine',
   crashed: 'Crashed',
   queued: 'Queued',
   extracting: 'Extracting motion',
   encoding: 'Encoding MP4',
-  preparing: 'Preparing',
+  preparing: 'Preparing prompt',
+  preparing_prompt: 'Preparing prompt',
+  applying_loras: 'Applying LoRAs',
+  applying_identity: 'Applying identity',
+  applying_pose: 'Applying pose',
+  loading_model: 'Loading model',
+  decoding: 'Decoding',
+  saving: 'Saving',
+  creating_thumbnail: 'Creating thumbnail',
+  finalizing_metadata: 'Finalizing metadata',
   training: 'Training',
   cancelling: 'Cancelling',
   restarting: 'Restarting',
@@ -147,13 +172,168 @@ const stateLabels: Record<string, string> = {
   cancelled: 'Cancelled',
 };
 const stateTone = (state: string): 'ready' | 'warning' | 'danger' | 'neutral' =>
-  state === 'ready'
+  ['ready', 'completed'].includes(state)
     ? 'ready'
-    : state === 'repair_needed'
+    : ['repair_needed', 'failed', 'crashed'].includes(state)
       ? 'danger'
-      : ['installing', 'update_available', 'paused'].includes(state)
+      : [
+            'installing',
+            'update_available',
+            'paused',
+            'queued',
+            'preparing',
+            'training',
+            'cancelling',
+          ].includes(state)
         ? 'warning'
         : 'neutral';
+
+const terminalJobStates = ['completed', 'failed', 'cancelled'];
+const activeJobStorageKey = 'vanta.active-generation-job';
+const isActiveJob = (job: GenerationJob | null | undefined) =>
+  Boolean(job && !terminalJobStates.includes(job.status));
+
+function jobFailureSummary(message: string | null | undefined): string {
+  const normalized = (message ?? '').toLowerCase();
+  if (normalized.includes('out of memory') || normalized.includes('cuda oom')) {
+    return 'The GPU ran out of memory. Try a smaller canvas, fewer controls, or the balanced model.';
+  }
+  if (
+    normalized.includes('model') &&
+    (normalized.includes('missing') || normalized.includes('not found'))
+  ) {
+    return 'A required local model is unavailable. Verify the selected model in Models & Engine.';
+  }
+  if (normalized.includes('engine') || normalized.includes('comfy')) {
+    return 'The local generation engine stopped responding. Open diagnostics, then verify or restart it.';
+  }
+  return 'The local job could not finish. Your existing media and settings are unchanged.';
+}
+
+function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null) return '—';
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  return `${minutes}m ${remainder.toString().padStart(2, '0')}s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index < 2 ? 0 : 1)} ${units[index]}`;
+}
+
+function JobProgressPanel({
+  job,
+  onCancel,
+  onDismiss,
+  onDetails,
+  onViewResult,
+  onDiagnostics,
+  compact = false,
+}: {
+  job: GenerationJob;
+  onCancel?: () => void;
+  onDismiss?: () => void;
+  onDetails?: () => void;
+  onViewResult?: () => void;
+  onDiagnostics?: () => void;
+  compact?: boolean;
+}) {
+  const active = isActiveJob(job);
+  const determinate = Boolean(job.progress_determinate);
+  const percentage = job.status === 'completed' ? 100 : determinate ? job.progress : null;
+  return (
+    <section
+      className={`job-progress-panel ${compact ? 'job-progress-panel--compact' : ''}`}
+      aria-live="polite"
+      aria-label="Local generation progress"
+    >
+      <header>
+        <div>
+          <span className="eyebrow">Local job</span>
+          <h2>{stateLabels[job.status] ?? job.status.replaceAll('_', ' ')}</h2>
+        </div>
+        <StatusPill tone={job.status === 'failed' ? 'danger' : active ? 'warning' : 'ready'}>
+          {percentage == null ? (active ? 'Working' : stateLabels[job.status]) : `${percentage}%`}
+        </StatusPill>
+      </header>
+      <div
+        className={`progress ${determinate ? '' : 'progress--indeterminate'}`}
+        role="progressbar"
+        aria-valuemin={determinate ? 0 : undefined}
+        aria-valuemax={determinate ? 100 : undefined}
+        aria-valuenow={percentage ?? undefined}
+        aria-label={
+          determinate ? `${percentage}% complete` : `${stateLabels[job.status]} in progress`
+        }
+      >
+        <span style={determinate ? { width: `${percentage}%` } : undefined} />
+      </div>
+      <dl className="job-progress-metrics">
+        <div>
+          <dt>Step</dt>
+          <dd>
+            {job.current_step != null && job.total_steps != null
+              ? `${job.current_step} / ${job.total_steps}`
+              : '—'}
+          </dd>
+        </div>
+        <div>
+          <dt>Elapsed</dt>
+          <dd>{formatDuration(job.elapsed_seconds)}</dd>
+        </div>
+        <div>
+          <dt>ETA</dt>
+          <dd>{job.eta_seconds != null ? `~${formatDuration(job.eta_seconds)}` : '—'}</dd>
+        </div>
+        <div>
+          <dt>Queue</dt>
+          <dd>{job.queue_position ? `#${job.queue_position}` : active ? 'Active' : '—'}</dd>
+        </div>
+      </dl>
+      <div className="job-progress-context">
+        <span>
+          <strong>{job.model_alias ?? 'Local model'}</strong>
+          {job.model_family ? ` · ${job.model_family}` : ''}
+        </span>
+        <span>
+          {job.output_width && job.output_height
+            ? `${job.output_width} × ${job.output_height}`
+            : 'Output size resolves locally'}
+        </span>
+      </div>
+      {job.status === 'failed' && job.error_message && (
+        <p className="inline-error">{jobFailureSummary(job.error_message)}</p>
+      )}
+      <footer>
+        {active && onCancel && (
+          <Button onClick={onCancel}>
+            <X /> Cancel
+          </Button>
+        )}
+        {job.status === 'completed' && job.result_generation_id && onViewResult && (
+          <Button variant="primary" onClick={onViewResult}>
+            <Image /> View result
+          </Button>
+        )}
+        {onDetails && <Button onClick={onDetails}>View job details</Button>}
+        {job.status === 'failed' && onDiagnostics && (
+          <Button onClick={onDiagnostics}>
+            <Gauge /> Open diagnostics
+          </Button>
+        )}
+        {!active && onDismiss && (
+          <Button variant="ghost" onClick={onDismiss}>
+            Dismiss
+          </Button>
+        )}
+      </footer>
+    </section>
+  );
+}
 
 function PageTitle({
   eyebrow,
@@ -307,6 +487,16 @@ export function App() {
   const [navOpen, setNavOpen] = useState(false);
   const [generationDraft, setGenerationDraft] = useState<Record<string, unknown> | null>(null);
   const [showJobs, setShowJobs] = useState(false);
+  const [createJobId, setCreateJobId] = useState<string | null>(() => {
+    try {
+      return window.localStorage.getItem(activeJobStorageKey);
+    } catch {
+      return null;
+    }
+  });
+  const [gallerySelectionId, setGallerySelectionId] = useState<string | null>(null);
+  const [diagnosticsRequest, setDiagnosticsRequest] = useState(0);
+  const completedJobNotifications = useRef(new Set<string>());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -405,6 +595,44 @@ export function App() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const createJob = data?.jobs.find((job) => job.id === createJobId) ?? null;
+  const recordCreateJob = useCallback((job: GenerationJob) => {
+    setCreateJobId(job.id);
+    try {
+      window.localStorage.setItem(activeJobStorageKey, job.id);
+    } catch {
+      // The job remains visible for this session when browser storage is unavailable.
+    }
+    setData((current) => {
+      if (!current) return current;
+      const jobs = current.jobs.some((item) => item.id === job.id)
+        ? current.jobs.map((item) => (item.id === job.id ? job : item))
+        : [job, ...current.jobs];
+      return { ...current, jobs };
+    });
+  }, []);
+  const dismissCreateJob = useCallback(() => {
+    setCreateJobId(null);
+    try {
+      window.localStorage.removeItem(activeJobStorageKey);
+    } catch {
+      // In-memory dismissal still succeeds.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (
+      !createJob ||
+      createJob.status !== 'completed' ||
+      completedJobNotifications.current.has(createJob.id)
+    ) {
+      return;
+    }
+    completedJobNotifications.current.add(createJob.id);
+    void load();
+    setToast('Generation saved to your local Gallery');
+  }, [createJob, load]);
+
   const notify = (message: string) => setToast(message);
   const navigate = (next: Screen) => {
     setScreen(next);
@@ -481,7 +709,10 @@ export function App() {
         </aside>
         <main id="main-content" tabIndex={-1}>
           {data && (
-            <button className="jobs-button" onClick={() => setShowJobs(true)}>
+            <button
+              className={`jobs-button ${data.jobs.some(isActiveJob) ? 'jobs-button--active' : ''}`}
+              onClick={() => setShowJobs(true)}
+            >
               <Zap /> Jobs
               {data.jobs.some(
                 (job) => !['completed', 'failed', 'cancelled'].includes(job.status),
@@ -575,6 +806,18 @@ export function App() {
                   goPoses={() => navigate('poses')}
                   initialDraft={generationDraft}
                   onDraftUsed={() => setGenerationDraft(null)}
+                  job={createJob}
+                  onJob={recordCreateJob}
+                  onDismissJob={dismissCreateJob}
+                  onJobDetails={() => setShowJobs(true)}
+                  onViewResult={(generationId) => {
+                    setGallerySelectionId(generationId);
+                    navigate('gallery');
+                  }}
+                  onDiagnostics={() => {
+                    setDiagnosticsRequest((value) => value + 1);
+                    navigate('engine');
+                  }}
                 />
               )}
               {screen === 'characters' && (
@@ -597,7 +840,12 @@ export function App() {
                 <MotionLibraryScreen items={data.motion} refresh={load} notify={notify} />
               )}
               {screen === 'training' && (
-                <TrainingScreen data={data} refresh={load} notify={notify} />
+                <TrainingScreen
+                  data={data}
+                  refresh={load}
+                  notify={notify}
+                  goEngine={() => navigate('engine')}
+                />
               )}
               {screen === 'presets' && (
                 <PresetsScreen
@@ -637,18 +885,33 @@ export function App() {
                     navigate('create');
                   }}
                   onUpscale={async (generation) => {
-                    await api.post('/generations', {
+                    const job = await api.post<GenerationJob>('/generations', {
                       operation: 'upscale',
                       source_generation_id: generation.id,
                       seed: 0,
                       upscale_profile: 'realesrgan_x2plus',
                     });
+                    recordCreateJob(job);
                     notify('2× upscale queued locally');
-                    await load();
+                    navigate('create');
+                  }}
+                  initialSelectionId={gallerySelectionId}
+                  onSelectionHandled={() => setGallerySelectionId(null)}
+                  onJob={recordCreateJob}
+                  onDiagnostics={() => {
+                    setDiagnosticsRequest((value) => value + 1);
+                    navigate('engine');
                   }}
                 />
               )}
-              {screen === 'engine' && <EngineScreen data={data} refresh={load} notify={notify} />}
+              {screen === 'engine' && (
+                <EngineScreen
+                  data={data}
+                  refresh={load}
+                  notify={notify}
+                  diagnosticsRequest={diagnosticsRequest}
+                />
+              )}
               {screen === 'settings' && (
                 <SettingsScreen
                   settings={data.settings}
@@ -664,34 +927,34 @@ export function App() {
           <div className="metadata-drawer">
             {data?.jobs.length ? (
               data.jobs.map((job) => (
-                <Panel key={job.id} className="job-card">
-                  <div>
-                    <strong>{stateLabels[job.status] ?? job.status}</strong>
-                    <span>
-                      {job.current_step && job.total_steps
-                        ? `Step ${job.current_step} / ${job.total_steps}`
-                        : job.queue_position
-                          ? `Queue position ${job.queue_position}`
-                          : `${job.progress}%`}
-                    </span>
-                  </div>
-                  <div className="progress">
-                    <span style={{ width: `${job.progress}%` }} />
-                  </div>
-                  {job.error_message && <small>{job.error_message}</small>}
-                  <footer>
-                    {!['completed', 'failed', 'cancelled'].includes(job.status) && (
-                      <Button onClick={() => void api.post(`/generations/${job.id}/cancel`)}>
-                        Cancel
-                      </Button>
-                    )}
-                    {['failed', 'cancelled'].includes(job.status) && (
-                      <Button onClick={() => void api.post(`/generations/${job.id}/retry`)}>
-                        Retry
-                      </Button>
-                    )}
-                  </footer>
-                </Panel>
+                <JobProgressPanel
+                  key={job.id}
+                  job={job}
+                  compact
+                  {...(isActiveJob(job)
+                    ? {
+                        onCancel: () => {
+                          void api
+                            .post<GenerationJob>(`/generations/${job.id}/cancel`)
+                            .then(recordCreateJob);
+                        },
+                      }
+                    : {})}
+                  {...(job.result_generation_id
+                    ? {
+                        onViewResult: () => {
+                          setGallerySelectionId(job.result_generation_id ?? null);
+                          setShowJobs(false);
+                          navigate('gallery');
+                        },
+                      }
+                    : {})}
+                  onDiagnostics={() => {
+                    setShowJobs(false);
+                    setDiagnosticsRequest((value) => value + 1);
+                    navigate('engine');
+                  }}
+                />
               ))
             ) : (
               <EmptyState
@@ -871,6 +1134,12 @@ function CreateScreen({
   goPoses,
   initialDraft,
   onDraftUsed,
+  job,
+  onJob,
+  onDismissJob,
+  onJobDetails,
+  onViewResult,
+  onDiagnostics,
 }: {
   data: AppData;
   refresh: () => Promise<void>;
@@ -879,6 +1148,12 @@ function CreateScreen({
   goPoses: () => void;
   initialDraft: Record<string, unknown> | null;
   onDraftUsed: () => void;
+  job: GenerationJob | null;
+  onJob: (job: GenerationJob) => void;
+  onDismissJob: () => void;
+  onJobDetails: () => void;
+  onViewResult: (generationId: string) => void;
+  onDiagnostics: () => void;
 }) {
   const [mode, setMode] = useState<'simple' | 'studio'>(
     data.settings.values.default_mode === 'studio' ? 'studio' : 'simple',
@@ -890,7 +1165,6 @@ function CreateScreen({
   );
   const [tags, setTags] = useState(['Cinematic', 'Film grain']);
   const [saving, setSaving] = useState(false);
-  const [job, setJob] = useState<GenerationJob | null>(null);
   const [characterId, setCharacterId] = useState(data.characters[0]?.id ?? '');
   const [steps, setSteps] = useState(30);
   const [guidance, setGuidance] = useState(5.5);
@@ -1150,25 +1424,12 @@ function CreateScreen({
       goEngine();
       return;
     }
-    setJob(await api.post<GenerationJob>('/generations', generationRequest()));
+    onJob(await api.post<GenerationJob>('/generations', generationRequest()));
     notify('Generation queued locally');
   };
   const cancel = async () => {
-    if (job) setJob(await api.post<GenerationJob>(`/generations/${job.id}/cancel`));
+    if (job) onJob(await api.post<GenerationJob>(`/generations/${job.id}/cancel`));
   };
-  useEffect(() => {
-    if (!job || ['completed', 'cancelled', 'failed'].includes(job.status)) return;
-    const timer = window.setInterval(() => {
-      void api.get<GenerationJob>(`/generations/${job.id}`).then(async (next) => {
-        setJob(next);
-        if (next.status === 'completed') {
-          await refresh();
-          notify('Real image saved to your local Gallery');
-        }
-      });
-    }, 900);
-    return () => window.clearInterval(timer);
-  }, [job, notify, refresh]);
   const toggleTag = (tag: string) =>
     setTags((current) =>
       current.includes(tag) ? current.filter((item) => item !== tag) : [...current, tag],
@@ -1200,8 +1461,11 @@ function CreateScreen({
             <Button onClick={() => void saveRecipe()} disabled={saving}>
               {saving ? 'Saving…' : 'Save recipe'}
             </Button>
-            <Button variant="primary" onClick={() => void (job ? cancel() : generate())}>
-              {job && !['completed', 'cancelled', 'failed'].includes(job.status) ? (
+            <Button
+              variant="primary"
+              onClick={() => void (isActiveJob(job) ? cancel() : generate())}
+            >
+              {isActiveJob(job) ? (
                 <>
                   <X /> Cancel
                 </>
@@ -1214,6 +1478,18 @@ function CreateScreen({
           </>
         }
       />
+      {job && (
+        <JobProgressPanel
+          job={job}
+          onCancel={() => void cancel()}
+          onDismiss={onDismissJob}
+          onDetails={onJobDetails}
+          {...(job.result_generation_id
+            ? { onViewResult: () => onViewResult(job.result_generation_id as string) }
+            : {})}
+          onDiagnostics={onDiagnostics}
+        />
+      )}
       {!canGenerate && (
         <div className="capability-banner">
           <div>
@@ -2101,23 +2377,14 @@ function CharactersScreen({
 }
 
 function LocalReferenceImage({ referenceId, alt }: { referenceId: string; alt: string }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api.referenceImageUrl(referenceId).then((next) => {
-      objectUrl = next;
-      if (active) setUrl(next);
-    });
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [referenceId]);
-  return url ? (
-    <img className="character-reference-image" src={url} alt={alt} />
-  ) : (
-    <div className="portrait-silhouette" />
+  return (
+    <AuthenticatedImage
+      className="character-reference-image"
+      media={{ entity: 'character-reference', id: referenceId, variant: 'thumbnail' }}
+      fallbackVariant="original"
+      placeholderClassName="portrait-silhouette"
+      alt={alt}
+    />
   );
 }
 
@@ -2130,23 +2397,14 @@ function LocalPoseImage({
   variant: 'source-thumbnail' | 'control-thumbnail';
   alt: string;
 }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api
-      .poseImageUrl(poseId, variant)
-      .then((next) => {
-        objectUrl = next;
-        if (active) setUrl(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [poseId, variant]);
-  return url ? <img src={url} alt={alt} /> : <div className="pose-image-placeholder" />;
+  return (
+    <AuthenticatedImage
+      media={{ entity: 'pose', id: poseId, variant }}
+      fallbackVariant={variant === 'source-thumbnail' ? 'source' : 'control'}
+      placeholderClassName="pose-image-placeholder"
+      alt={alt}
+    />
+  );
 }
 
 function PoseLibraryScreen({
@@ -2342,6 +2600,7 @@ function PoseLibraryScreen({
                   onClick={async () => {
                     if (!window.confirm(`Delete ${item.name}?`)) return;
                     await api.delete(`/poses/${item.id}`);
+                    mediaCache.invalidateEntity('pose', item.id);
                     await refresh();
                     notify('Pose deleted');
                   }}
@@ -2460,32 +2719,22 @@ function LocalMotionMedia({
   variant: 'preview' | 'thumbnail';
   label: string;
 }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api
-      .motionMediaUrl(motionId, variant)
-      .then((next) => {
-        objectUrl = next;
-        if (active) setUrl(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [motionId, variant]);
-  if (!url)
-    return (
-      <div className="motion-placeholder">
-        <Film />
-      </div>
-    );
   return variant === 'thumbnail' ? (
-    <img src={url} alt={label} loading="lazy" />
+    <AuthenticatedImage
+      media={{ entity: 'motion', id: motionId, variant }}
+      placeholderClassName="motion-placeholder"
+      alt={label}
+      loading="lazy"
+    />
   ) : (
-    <video src={url} aria-label={label} controls playsInline preload="metadata" />
+    <AuthenticatedVideo
+      media={{ entity: 'motion', id: motionId, variant }}
+      placeholderClassName="motion-placeholder"
+      aria-label={label}
+      controls
+      playsInline
+      preload="metadata"
+    />
   );
 }
 
@@ -2576,7 +2825,7 @@ function MotionLibraryScreen({
       <PageTitle
         eyebrow="Reference Motion"
         title="Borrow movement, never identity."
-        body="Trim an owned clip to four seconds or less. Vanta extracts broad pose movement locally and excludes face, voice, branding, and reference-person identity."
+        body="Import an owned source up to two minutes, then select a four-second-or-shorter motion segment. Vanta extracts broad pose movement locally and excludes face, voice, branding, and reference-person identity."
         actions={
           <Button variant="primary" onClick={() => setEditing('new')}>
             <Plus /> Import motion
@@ -2662,6 +2911,7 @@ function MotionLibraryScreen({
                   onClick={async () => {
                     if (!window.confirm(`Delete ${item.name}?`)) return;
                     await api.delete(`/motion-assets/${item.id}`);
+                    mediaCache.invalidateEntity('motion', item.id);
                     await refresh();
                     notify('Motion reference deleted');
                   }}
@@ -2694,7 +2944,9 @@ function MotionLibraryScreen({
               <div className="pose-drop-zone">
                 <Film />
                 <strong>{sourcePath || 'Choose or drop a video'}</strong>
-                <span>MP4, MOV, WebM, or MKV · the source stays inside Vanta storage</span>
+                <span>
+                  MP4, MOV, WebM, or MKV · sources up to two minutes stay inside Vanta storage
+                </span>
                 <Button
                   type="button"
                   onClick={async () => {
@@ -2829,50 +3081,40 @@ function LocalTrainingImage({
   alt: string;
   variant?: 'image' | 'thumbnail';
 }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api.trainingImageUrl(imageId, variant).then((next) => {
-      objectUrl = next;
-      if (active) setUrl(next);
-    });
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [imageId, variant]);
-  return url ? <img src={url} alt={alt} /> : <div className="training-image-placeholder" />;
+  return (
+    <AuthenticatedImage
+      media={{
+        entity: 'training-image',
+        id: imageId,
+        variant: variant === 'image' ? 'original' : variant,
+      }}
+      fallbackVariant={variant === 'thumbnail' ? 'original' : undefined}
+      placeholderClassName="training-image-placeholder"
+      alt={alt}
+    />
+  );
 }
 
 function TrainingValidationImage({ checkpointId }: { checkpointId: string }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api
-      .trainingValidationUrl(checkpointId)
-      .then((next) => {
-        objectUrl = next;
-        if (active) setUrl(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [checkpointId]);
-  return url ? <img src={url} alt="Local checkpoint validation sample" /> : null;
+  return (
+    <AuthenticatedImage
+      media={{ entity: 'training-validation', id: checkpointId, variant: 'sample' }}
+      placeholderClassName="training-image-placeholder"
+      alt="Local checkpoint validation sample"
+    />
+  );
 }
 
 function TrainingScreen({
   data,
   refresh,
   notify,
+  goEngine,
 }: {
   data: AppData;
   refresh: () => Promise<void>;
   notify: (message: string) => void;
+  goEngine: () => void;
 }) {
   const [selectedId, setSelectedId] = useState(data.trainingDatasets[0]?.id ?? '');
   const [creating, setCreating] = useState(false);
@@ -2882,6 +3124,12 @@ function TrainingScreen({
   const [epochs, setEpochs] = useState(4);
   const [validationPrompt, setValidationPrompt] = useState('');
   const [installCharacterId, setInstallCharacterId] = useState('');
+  const [runFilter, setRunFilter] = useState<'current' | 'completed' | 'failed' | 'all'>('all');
+  const [runDatasetFilter, setRunDatasetFilter] = useState(data.trainingDatasets[0]?.id ?? 'all');
+  const [technicalDetails, setTechnicalDetails] = useState<
+    Record<string, { content: string; truncated: boolean }>
+  >({});
+  const [loadingDetails, setLoadingDetails] = useState('');
   const selected =
     data.trainingDatasets.find((item) => item.id === selectedId) ?? data.trainingDatasets[0];
   const trainerReady =
@@ -2890,6 +3138,14 @@ function TrainingScreen({
   const activeRun = data.trainingRuns.find((run) =>
     ['queued', 'preparing', 'training', 'cancelling'].includes(run.status),
   );
+  const visibleRuns = data.trainingRuns.filter((run) => {
+    if (runDatasetFilter !== 'all' && run.dataset_id !== runDatasetFilter) return false;
+    if (runFilter === 'current')
+      return ['queued', 'preparing', 'training', 'cancelling'].includes(run.status);
+    if (runFilter === 'completed') return run.status === 'completed';
+    if (runFilter === 'failed') return run.status === 'failed';
+    return true;
+  });
 
   useEffect(() => {
     if (selected && !selectedId) setSelectedId(selected.id);
@@ -3023,7 +3279,10 @@ function TrainingScreen({
                 type="button"
                 key={dataset.id}
                 className={selected?.id === dataset.id ? 'active' : ''}
-                onClick={() => setSelectedId(dataset.id)}
+                onClick={() => {
+                  setSelectedId(dataset.id);
+                  setRunDatasetFilter(dataset.id);
+                }}
               >
                 <span>{dataset.name}</span>
                 <small>
@@ -3111,6 +3370,7 @@ function TrainingScreen({
                           variant="ghost"
                           onClick={async () => {
                             await api.delete(`/training/images/${image.id}`);
+                            mediaCache.invalidateEntity('training-image', image.id);
                             await refresh();
                           }}
                         >
@@ -3218,10 +3478,39 @@ function TrainingScreen({
             disk.
           </p>
         </div>
-        {data.trainingRuns.length ? (
+        <div className="training-run-filters" aria-label="Filter training history">
+          <label>
+            Run state
+            <select
+              value={runFilter}
+              onChange={(event) => setRunFilter(event.target.value as typeof runFilter)}
+            >
+              <option value="all">Recent runs</option>
+              <option value="current">Current</option>
+              <option value="completed">Completed</option>
+              <option value="failed">Failed</option>
+            </select>
+          </label>
+          <label>
+            Dataset
+            <select
+              value={runDatasetFilter}
+              onChange={(event) => setRunDatasetFilter(event.target.value)}
+            >
+              <option value="all">All datasets</option>
+              {data.trainingDatasets.map((dataset) => (
+                <option key={dataset.id} value={dataset.id}>
+                  {dataset.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {visibleRuns.length ? (
           <div className="training-run-list">
-            {data.trainingRuns.map((run) => {
+            {visibleRuns.map((run) => {
               const dataset = data.trainingDatasets.find((item) => item.id === run.dataset_id);
+              const runDetails = technicalDetails[run.id];
               return (
                 <Panel className="training-run-card" key={run.id}>
                   <header>
@@ -3241,13 +3530,32 @@ function TrainingScreen({
                   </div>
                   <div className="training-run-meta">
                     <span>{run.progress}%</span>
+                    <span>{formatDuration(run.elapsed_seconds)} elapsed</span>
                     <span>
                       {run.eta_seconds != null
                         ? `${Math.ceil(run.eta_seconds / 60)} min remaining`
                         : `${run.estimates.vram_gb} GB estimated VRAM`}
                     </span>
                   </div>
-                  {run.error_message && <p className="inline-error">{run.error_message}</p>}
+                  {run.failure && (
+                    <div className="training-failure" role="alert">
+                      <span className="eyebrow">{run.failure.category.replaceAll('_', ' ')}</span>
+                      <strong>{run.failure.title}</strong>
+                      <p>{run.failure.explanation}</p>
+                      <small>{run.failure.recommended_recovery}</small>
+                    </div>
+                  )}
+                  {runDetails && (
+                    <details className="training-technical-details" open>
+                      <summary>Sanitized trainer details</summary>
+                      <pre>{runDetails.content}</pre>
+                      {runDetails.truncated && (
+                        <small>
+                          The oldest output was omitted; the complete local log remains on disk.
+                        </small>
+                      )}
+                    </details>
+                  )}
                   <div className="training-checkpoints">
                     {run.checkpoints.map((checkpoint) => (
                       <article
@@ -3291,6 +3599,52 @@ function TrainingScreen({
                       >
                         <RotateCcw /> Resume saved state
                       </Button>
+                    )}
+                    {['failed', 'cancelled'].includes(run.status) && (
+                      <Button
+                        onClick={async () => {
+                          await api.post(`/training/runs/${run.id}/retry`);
+                          notify(
+                            'A fresh local training run was queued; the prior run was preserved',
+                          );
+                          await refresh();
+                        }}
+                      >
+                        <RotateCcw /> Retry from start
+                      </Button>
+                    )}
+                    {run.status === 'failed' && (
+                      <>
+                        <Button
+                          disabled={loadingDetails === run.id}
+                          onClick={async () => {
+                            setLoadingDetails(run.id);
+                            try {
+                              const details = await api.get<{
+                                technical_details: string;
+                                truncated: boolean;
+                              }>(`/training/runs/${run.id}/failure-details`);
+                              setTechnicalDetails((current) => ({
+                                ...current,
+                                [run.id]: {
+                                  content: details.technical_details,
+                                  truncated: details.truncated,
+                                },
+                              }));
+                            } finally {
+                              setLoadingDetails('');
+                            }
+                          }}
+                        >
+                          <Info />
+                          {loadingDetails === run.id
+                            ? 'Loading details…'
+                            : 'Open technical details'}
+                        </Button>
+                        <Button onClick={goEngine}>
+                          <Gauge /> Open diagnostics
+                        </Button>
+                      </>
                     )}
                     {run.status === 'completed' &&
                       run.checkpoints.length > 0 &&
@@ -3338,6 +3692,11 @@ function TrainingScreen({
               );
             })}
           </div>
+        ) : data.trainingRuns.length ? (
+          <EmptyState
+            title="No runs match these filters"
+            body="Choose another run state or dataset. No history has been removed."
+          />
         ) : (
           <EmptyState
             title="No training runs"
@@ -4118,59 +4477,36 @@ function LocalGenerationImage({
   generationId,
   alt,
   thumbnail = false,
+  mediaType = 'image',
 }: {
   generationId: string;
   alt: string;
   thumbnail?: boolean;
+  mediaType?: 'image' | 'video';
 }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api.imageUrl(generationId, thumbnail ? 'thumbnail' : 'image').then((next) => {
-      objectUrl = next;
-      if (active) setUrl(next);
-    });
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [generationId, thumbnail]);
-  return url ? (
-    <img className="generation-image" src={url} alt={alt} />
-  ) : (
-    <div className="generated-study" aria-label="Loading local image" />
+  const variant = thumbnail ? (mediaType === 'video' ? 'poster' : 'thumbnail') : 'original';
+  return (
+    <AuthenticatedImage
+      className="generation-image"
+      media={{ entity: 'generation', id: generationId, variant }}
+      fallbackVariant={thumbnail && mediaType === 'image' ? 'original' : undefined}
+      placeholderClassName="generated-study"
+      alt={alt}
+    />
   );
 }
 
 function LocalGenerationVideo({ generationId, label }: { generationId: string; label: string }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api
-      .imageUrl(generationId)
-      .then((next) => {
-        objectUrl = next;
-        if (active) setUrl(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [generationId]);
-  return url ? (
-    <video
+  return (
+    <AuthenticatedVideo
       className="generation-video"
-      src={url}
+      media={{ entity: 'generation', id: generationId, variant: 'video' }}
+      placeholderClassName="generated-study"
       aria-label={label}
       controls
       playsInline
       preload="metadata"
     />
-  ) : (
-    <div className="generated-study" aria-label="Loading local video" />
   );
 }
 
@@ -4181,6 +4517,8 @@ function VideoWorkspace({
   refresh,
   notify,
   onClose,
+  onJob,
+  onDiagnostics,
 }: {
   source: GenerationRecord;
   motion: MotionAsset[];
@@ -4188,6 +4526,8 @@ function VideoWorkspace({
   refresh: () => Promise<void>;
   notify: (message: string) => void;
   onClose: () => void;
+  onJob: (job: GenerationJob) => void;
+  onDiagnostics: () => void;
 }) {
   const [motionPrompt, setMotionPrompt] = useState(
     'subtle natural breathing, a gentle shift of posture, restrained cinematic camera movement',
@@ -4196,19 +4536,34 @@ function VideoWorkspace({
     'text, watermark, logo, identity change, face distortion, sudden camera shake',
   );
   const [profile, setProfile] = useState<'safe' | 'balanced' | 'quality'>('safe');
-  const [duration, setDuration] = useState<2 | 3 | 4>(2);
+  const [durationProfile, setDurationProfile] = useState<
+    'safe' | 'standard' | 'extended' | 'custom'
+  >('safe');
+  const [duration, setDuration] = useState(2);
+  const [capabilities, setCapabilities] = useState<VideoCapabilities | null>(null);
   const [motionAssetId, setMotionAssetId] = useState('');
   const [strength, setStrength] = useState(0.65);
   const [job, setJob] = useState<GenerationJob | null>(null);
   const [error, setError] = useState('');
   const readyMotion = motion.filter((item) => item.status === 'ready');
   const active = job && !['completed', 'failed', 'cancelled'].includes(job.status);
+  const durationEstimate =
+    capabilities?.profiles.find((item) => item.id === durationProfile) ??
+    capabilities?.profiles.find((item) => item.duration_seconds === duration) ??
+    capabilities?.profiles[0];
+
+  useEffect(() => {
+    void api
+      .get<VideoCapabilities>(`/videos/capabilities?quality_profile=${profile}`)
+      .then(setCapabilities);
+  }, [profile]);
 
   useEffect(() => {
     if (!job || !active) return;
     const timer = window.setInterval(() => {
       void api.get<GenerationJob>(`/generations/${job.id}`).then(async (next) => {
         setJob(next);
+        onJob(next);
         if (next.status === 'completed') {
           notify('Local video saved to Gallery');
           await refresh();
@@ -4216,7 +4571,7 @@ function VideoWorkspace({
       });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [active, job, notify, refresh]);
+  }, [active, job, notify, onJob, refresh]);
 
   const submit = async () => {
     setError('');
@@ -4230,12 +4585,14 @@ function VideoWorkspace({
         motion_prompt: motionPrompt,
         negative_prompt: negativePrompt,
         profile,
+        duration_profile: durationProfile,
         duration_seconds: duration,
         seed: Math.floor(Math.random() * 2_000_000_000),
         motion_asset_id: motionAssetId || null,
         motion_strength: strength,
       });
       setJob(next);
+      onJob(next);
       notify('Image-to-video queued locally');
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Local video could not start.');
@@ -4254,7 +4611,10 @@ function VideoWorkspace({
           <div>
             <span className="eyebrow">Native local image-to-video</span>
             <h2>Give this frame a pulse.</h2>
-            <p>Two to four seconds, rendered locally. The source image remains untouched.</p>
+            <p>
+              Hardware-safe clips are rendered locally. Longer work is assembled from short,
+              controllable segments.
+            </p>
           </div>
           <Button variant="ghost" onClick={onClose}>
             <X /> Close
@@ -4308,17 +4668,82 @@ function VideoWorkspace({
                 </select>
               </label>
               <label>
-                Duration
+                Duration profile
                 <select
-                  value={duration}
-                  onChange={(event) => setDuration(Number(event.target.value) as 2 | 3 | 4)}
+                  value={durationProfile}
+                  onChange={(event) => {
+                    const next = event.target.value as typeof durationProfile;
+                    setDurationProfile(next);
+                    if (next === 'safe') setDuration(2);
+                    if (next === 'standard') setDuration(4);
+                    if (next === 'extended') setDuration(6);
+                  }}
                 >
-                  <option value={2}>2 seconds</option>
-                  <option value={3}>3 seconds</option>
-                  <option value={4}>4 seconds</option>
+                  <option value="safe">Safe · 2 seconds</option>
+                  <option value="standard">Standard · 4 seconds</option>
+                  <option value="extended" disabled={!capabilities?.extended_verified}>
+                    Extended · 6–8 seconds{' '}
+                    {capabilities?.extended_verified ? '' : '· not verified on this hardware'}
+                  </option>
+                  <option value="custom">Custom · within verified limit</option>
                 </select>
               </label>
             </div>
+            {(durationProfile === 'custom' || durationProfile === 'extended') && (
+              <label>
+                Duration <span>{duration} seconds</span>
+                <input
+                  type="range"
+                  min={durationProfile === 'extended' ? 6 : 2}
+                  max={durationProfile === 'extended' ? 8 : (capabilities?.max_custom_seconds ?? 4)}
+                  step={1}
+                  value={duration}
+                  onChange={(event) => setDuration(Number(event.target.value))}
+                />
+              </label>
+            )}
+            {durationEstimate && (
+              <dl className="video-duration-estimates">
+                <div>
+                  <dt>Frames</dt>
+                  <dd>{duration * 24 + 1}</dd>
+                </div>
+                <div>
+                  <dt>Expected time</dt>
+                  <dd>
+                    ~
+                    {formatDuration(
+                      Math.round(
+                        (durationEstimate.expected_generation_seconds /
+                          durationEstimate.duration_seconds) *
+                          duration,
+                      ),
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>VRAM / RAM</dt>
+                  <dd>
+                    ~{durationEstimate.estimated_vram_gb} / {durationEstimate.estimated_ram_gb} GB
+                  </dd>
+                </div>
+                <div>
+                  <dt>Working disk</dt>
+                  <dd>
+                    ~
+                    {Math.round(
+                      (durationEstimate.estimated_disk_mb / durationEstimate.duration_seconds) *
+                        duration,
+                    )}{' '}
+                    MB
+                  </dd>
+                </div>
+              </dl>
+            )}
+            <p className="video-duration-warning">
+              Longer clips become substantially slower and less predictable. Sequence mode keeps
+              each pass inside the verified hardware envelope.
+            </p>
             <label>
               Reference Motion · optional
               <select
@@ -4351,18 +4776,17 @@ function VideoWorkspace({
               </label>
             )}
             {job && (
-              <div className="inpaint-progress" role="status" aria-live="polite">
-                <strong>{stateLabels[job.status] ?? job.status}</strong>
-                <div className="progress">
-                  <span style={{ width: `${job.progress}%` }} />
-                </div>
-                <small>
-                  {job.current_step && job.total_steps
-                    ? `Step ${job.current_step} / ${job.total_steps}`
-                    : `${job.progress}%`}
-                  {job.eta_seconds ? ` · about ${job.eta_seconds}s remaining` : ''}
-                </small>
-              </div>
+              <JobProgressPanel
+                job={job}
+                compact
+                onCancel={() => {
+                  void api.post<GenerationJob>(`/generations/${job.id}/cancel`).then((next) => {
+                    setJob(next);
+                    onJob(next);
+                  });
+                }}
+                onDiagnostics={onDiagnostics}
+              />
             )}
             {error && (
               <p className="inline-error" role="alert">
@@ -4393,23 +4817,413 @@ function VideoWorkspace({
   );
 }
 
-function LocalInpaintMask({ generationId }: { generationId: string }) {
-  const [url, setUrl] = useState('');
+function VideoSequenceWorkspace({
+  source,
+  motion,
+  videoReady,
+  refresh,
+  notify,
+  onClose,
+  onJob,
+  onDiagnostics,
+}: {
+  source: GenerationRecord;
+  motion: MotionAsset[];
+  videoReady: boolean;
+  refresh: () => Promise<void>;
+  notify: (message: string) => void;
+  onClose: () => void;
+  onJob: (job: GenerationJob) => void;
+  onDiagnostics: () => void;
+}) {
+  const creating = useRef(false);
+  const [sequence, setSequence] = useState<VideoSequence | null>(null);
+  const [motionPrompt, setMotionPrompt] = useState(
+    'continue the restrained natural movement while preserving identity, styling, and camera mood',
+  );
+  const [negativePrompt, setNegativePrompt] = useState(
+    'text, watermark, logo, identity change, face distortion, sudden camera shake',
+  );
+  const [profile, setProfile] = useState<'safe' | 'balanced' | 'quality'>('safe');
+  const [durationProfile, setDurationProfile] = useState<'safe' | 'standard'>('safe');
+  const [duration, setDuration] = useState(2);
+  const [motionAssetId, setMotionAssetId] = useState('');
+  const [capabilities, setCapabilities] = useState<VideoCapabilities | null>(null);
+  const [continuationSourceId, setContinuationSourceId] = useState<string | null>(null);
+  const [continuationTimes, setContinuationTimes] = useState<Record<string, number>>({});
+  const [excludedSegmentIds, setExcludedSegmentIds] = useState<string[]>([]);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const readyMotion = motion.filter((item) => item.status === 'ready');
+
   useEffect(() => {
-    let active = true;
-    let objectUrl = '';
-    void api.imageUrl(generationId, 'mask').then((next) => {
-      objectUrl = next;
-      if (active) setUrl(next);
-    });
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [generationId]);
-  return url ? (
-    <img className="inpaint-mask-preview" src={url} alt="Persisted inpaint mask" />
-  ) : null;
+    if (creating.current) return;
+    creating.current = true;
+    void api
+      .post<VideoSequence>('/video-sequences', {
+        name: source.media_type === 'video' ? 'Extended clip' : 'Character motion sequence',
+        source_generation_id: source.id,
+      })
+      .then(setSequence)
+      .catch((caught) =>
+        setError(caught instanceof Error ? caught.message : 'The sequence could not be created.'),
+      );
+  }, [source.id, source.media_type]);
+
+  useEffect(() => {
+    void api
+      .get<VideoCapabilities>(`/videos/capabilities?quality_profile=${profile}`)
+      .then(setCapabilities);
+  }, [profile]);
+
+  useEffect(() => {
+    if (!sequence || !sequence.segments.some((item) => !terminalJobStates.includes(item.status)))
+      return;
+    const timer = window.setInterval(() => {
+      void api.get<VideoSequence>(`/video-sequences/${sequence.id}`).then(async (next) => {
+        setSequence(next);
+        const completedNow = next.segments.some(
+          (item) =>
+            item.status === 'completed' &&
+            !sequence.segments.some(
+              (previous) => previous.id === item.id && previous.status === 'completed',
+            ),
+        );
+        if (completedNow) {
+          notify('Sequence segment saved with its continuation frame');
+          await refresh();
+        }
+      });
+    }, 1100);
+    return () => window.clearInterval(timer);
+  }, [notify, refresh, sequence]);
+
+  const addSegment = async () => {
+    if (!sequence || !videoReady) return;
+    setBusy('segment');
+    setError('');
+    try {
+      const next = await api.post<VideoSequence>(`/video-sequences/${sequence.id}/segments`, {
+        source_generation_id: continuationSourceId,
+        motion_prompt: motionPrompt,
+        negative_prompt: negativePrompt,
+        profile,
+        duration_profile: durationProfile,
+        duration_seconds: duration,
+        seed: Math.floor(Math.random() * 2_000_000_000),
+        motion_asset_id: motionAssetId || null,
+        motion_strength: 0.65,
+      });
+      setSequence(next);
+      setContinuationSourceId(null);
+      const jobId = next.segments.at(-1)?.job_id;
+      if (jobId) onJob(await api.get<GenerationJob>(`/generations/${jobId}`));
+      notify('Hardware-safe sequence segment queued locally');
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The segment could not be queued.');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const reorder = async (index: number, offset: number) => {
+    if (!sequence) return;
+    const target = index + offset;
+    if (target < 0 || target >= sequence.segments.length) return;
+    const ids = sequence.segments.map((item) => item.id);
+    const [moved] = ids.splice(index, 1);
+    if (!moved) return;
+    ids.splice(target, 0, moved);
+    setSequence(
+      await api.put<VideoSequence>(`/video-sequences/${sequence.id}/order`, {
+        segment_ids: ids,
+      }),
+    );
+  };
+
+  const selectContinuation = async (segmentId: string, generationId: string) => {
+    setBusy(`continuation-${segmentId}`);
+    try {
+      const frame = await api.post<GenerationRecord>(`/videos/${generationId}/continuation-frame`, {
+        timestamp_seconds: continuationTimes[segmentId] ?? 1,
+      });
+      setContinuationSourceId(frame.id);
+      notify('Selected frame will begin the next segment');
+      await refresh();
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const completedSegments = sequence?.segments.filter((item) => item.status === 'completed') ?? [];
+  const selectedSegments = completedSegments.filter(
+    (item) => !excludedSegmentIds.includes(item.id),
+  );
+  return (
+    <div className="inpaint-overlay" role="dialog" aria-modal="true" aria-label="Video sequence">
+      <div className="video-sequence-workspace">
+        <header>
+          <div>
+            <span className="eyebrow">Hardware-safe sequence</span>
+            <h2>Build a longer story, one controlled segment at a time.</h2>
+            <p>
+              Each segment keeps its own motion direction and feeds its final—or selected—frame into
+              the next pass.
+            </p>
+          </div>
+          <Button variant="ghost" onClick={onClose}>
+            <X /> Close
+          </Button>
+        </header>
+        {!sequence && !error && <LoadingView />}
+        {sequence && (
+          <div className="video-sequence-layout">
+            <section className="video-segment-timeline">
+              <article className="video-segment-card video-segment-card--source">
+                {source.media_type === 'video' ? (
+                  <LocalGenerationVideo generationId={source.id} label="Sequence source video" />
+                ) : (
+                  <LocalGenerationImage generationId={source.id} alt="Sequence source image" />
+                )}
+                <div>
+                  <span className="eyebrow">Sequence source</span>
+                  <strong>
+                    {source.media_type === 'video' ? 'Existing generated clip' : 'First frame'}
+                  </strong>
+                </div>
+              </article>
+              {sequence.segments.map((segment, index) => (
+                <article className="video-segment-card" key={segment.id}>
+                  {segment.generation_id ? (
+                    <LocalGenerationVideo
+                      generationId={segment.generation_id}
+                      label={`Sequence segment ${index + 1}`}
+                    />
+                  ) : (
+                    <div className="video-segment-pending">
+                      <Film />
+                      <span>{stateLabels[segment.status] ?? segment.status}</span>
+                    </div>
+                  )}
+                  <div className="video-segment-card__body">
+                    <div>
+                      <span className="eyebrow">Segment {index + 1}</span>
+                      <strong>
+                        {segment.duration_seconds}s · {segment.quality_profile}
+                      </strong>
+                    </div>
+                    <p>{segment.motion_prompt}</p>
+                    {segment.status === 'failed' && (
+                      <p className="inline-error">{jobFailureSummary(segment.metadata.error)}</p>
+                    )}
+                    {segment.status === 'completed' && segment.generation_id && (
+                      <div className="continuation-frame-control">
+                        <label className="checkbox-row">
+                          <input
+                            type="checkbox"
+                            checked={!excludedSegmentIds.includes(segment.id)}
+                            onChange={(event) =>
+                              setExcludedSegmentIds((current) =>
+                                event.target.checked
+                                  ? current.filter((id) => id !== segment.id)
+                                  : [...current, segment.id],
+                              )
+                            }
+                          />
+                          Include in joined MP4
+                        </label>
+                        <label>
+                          Selected continuation frame ·{' '}
+                          {(continuationTimes[segment.id] ?? 1).toFixed(1)}s
+                          <input
+                            type="range"
+                            min={0}
+                            max={Math.max(0.1, segment.duration_seconds - 0.1)}
+                            step={0.1}
+                            value={continuationTimes[segment.id] ?? 1}
+                            onChange={(event) =>
+                              setContinuationTimes((current) => ({
+                                ...current,
+                                [segment.id]: Number(event.target.value),
+                              }))
+                            }
+                          />
+                        </label>
+                        <Button
+                          disabled={busy === `continuation-${segment.id}`}
+                          onClick={() =>
+                            void selectContinuation(segment.id, segment.generation_id as string)
+                          }
+                        >
+                          Use selected frame next
+                        </Button>
+                      </div>
+                    )}
+                    <footer>
+                      <Button
+                        variant="ghost"
+                        disabled={index === 0}
+                        onClick={() => void reorder(index, -1)}
+                        aria-label={`Move segment ${index + 1} earlier`}
+                      >
+                        Earlier
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        disabled={index === sequence.segments.length - 1}
+                        onClick={() => void reorder(index, 1)}
+                        aria-label={`Move segment ${index + 1} later`}
+                      >
+                        Later
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        onClick={async () => {
+                          setSequence(
+                            await api.delete<VideoSequence>(
+                              `/video-sequences/${sequence.id}/segments/${segment.id}`,
+                            ),
+                          );
+                        }}
+                      >
+                        <Trash2 /> Remove
+                      </Button>
+                    </footer>
+                  </div>
+                </article>
+              ))}
+              {sequence.final_generation_id && (
+                <article className="video-segment-card video-segment-card--final">
+                  <LocalGenerationVideo
+                    generationId={sequence.final_generation_id}
+                    label="Joined final sequence"
+                  />
+                  <div>
+                    <span className="eyebrow">Joined result</span>
+                    <strong>Saved to Gallery with segment metadata</strong>
+                  </div>
+                </article>
+              )}
+            </section>
+            <aside className="video-sequence-settings">
+              <span className="eyebrow">Next segment</span>
+              <h3>
+                {continuationSourceId ? 'Selected frame ready' : 'Continue from the final frame'}
+              </h3>
+              <label>
+                Motion direction
+                <textarea
+                  value={motionPrompt}
+                  onChange={(event) => setMotionPrompt(event.target.value)}
+                />
+              </label>
+              <label>
+                Avoid
+                <textarea
+                  value={negativePrompt}
+                  onChange={(event) => setNegativePrompt(event.target.value)}
+                />
+              </label>
+              <div className="form-grid">
+                <label>
+                  Quality
+                  <select
+                    value={profile}
+                    onChange={(event) => setProfile(event.target.value as typeof profile)}
+                  >
+                    <option value="safe">Safe · 512 × 768</option>
+                    <option value="balanced">Balanced · 576 × 768</option>
+                    <option value="quality">Quality · 640 × 832</option>
+                  </select>
+                </label>
+                <label>
+                  Duration
+                  <select
+                    value={durationProfile}
+                    onChange={(event) => {
+                      const next = event.target.value as typeof durationProfile;
+                      setDurationProfile(next);
+                      setDuration(next === 'safe' ? 2 : 4);
+                    }}
+                  >
+                    <option value="safe">Safe · 2 seconds</option>
+                    <option value="standard">Standard · 4 seconds</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                Reference Motion · optional
+                <select
+                  value={motionAssetId}
+                  onChange={(event) => setMotionAssetId(event.target.value)}
+                >
+                  <option value="">Prompt direction only</option>
+                  {readyMotion.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="video-duration-warning">
+                {capabilities?.historical_samples
+                  ? 'Time estimates use recent renders on this computer.'
+                  : 'First-run estimates are conservative. Longer clips become substantially slower.'}
+              </p>
+              {error && <p className="inline-error">{error}</p>}
+              <Button
+                variant="primary"
+                disabled={
+                  !videoReady ||
+                  !motionPrompt.trim() ||
+                  busy === 'segment' ||
+                  sequence.status === 'rendering'
+                }
+                onClick={() => void addSegment()}
+              >
+                <Plus /> Add and render segment
+              </Button>
+              <Button
+                disabled={!selectedSegments.length || sequence.status === 'rendering'}
+                onClick={async () => {
+                  setBusy('join');
+                  try {
+                    const next = await api.post<VideoSequence>(
+                      `/video-sequences/${sequence.id}/join`,
+                      {
+                        segment_ids: selectedSegments.map((item) => item.id),
+                      },
+                    );
+                    setSequence(next);
+                    await refresh();
+                    notify('Selected segments joined into one local MP4');
+                  } finally {
+                    setBusy('');
+                  }
+                }}
+              >
+                <Film /> {busy === 'join' ? 'Joining…' : 'Join selected segments'}
+              </Button>
+              <Button variant="ghost" onClick={onDiagnostics}>
+                <Gauge /> Open diagnostics
+              </Button>
+            </aside>
+          </div>
+        )}
+        {error && !sequence && <p className="inline-error">{error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function LocalInpaintMask({ generationId }: { generationId: string }) {
+  return (
+    <AuthenticatedImage
+      className="inpaint-mask-preview"
+      media={{ entity: 'generation', id: generationId, variant: 'mask' }}
+      alt="Persisted inpaint mask"
+    />
+  );
 }
 
 function InpaintWorkspace({
@@ -4417,11 +5231,15 @@ function InpaintWorkspace({
   refresh,
   notify,
   onClose,
+  onJob,
+  onDiagnostics,
 }: {
   source: GenerationRecord;
   refresh: () => Promise<void>;
   notify: (message: string) => void;
   onClose: () => void;
+  onJob: (job: GenerationJob) => void;
+  onDiagnostics: () => void;
 }) {
   const maskRef = useRef<HTMLCanvasElement>(null);
   const drawingRef = useRef(false);
@@ -4450,15 +5268,14 @@ function InpaintWorkspace({
   const active = Boolean(job && !['completed', 'failed', 'cancelled'].includes(job.status));
 
   useEffect(() => {
-    let objectUrl = '';
     let mounted = true;
-    void api.imageUrl(source.id).then((url) => {
-      objectUrl = url;
-      if (mounted) setSourceUrl(url);
-    });
+    void mediaCache
+      .get({ entity: 'generation', id: source.id, variant: 'original' })
+      .then((url) => {
+        if (mounted) setSourceUrl(url);
+      });
     return () => {
       mounted = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [source.id]);
 
@@ -4467,6 +5284,7 @@ function InpaintWorkspace({
     const timer = window.setInterval(() => {
       void api.get<GenerationJob>(`/generations/${job.id}`).then(async (next) => {
         setJob(next);
+        onJob(next);
         if (next.status === 'completed' && next.result_generation_id) {
           setResultGenerationId(next.result_generation_id);
           await refresh();
@@ -4476,7 +5294,7 @@ function InpaintWorkspace({
       });
     }, 900);
     return () => window.clearInterval(timer);
-  }, [active, job, notify, refresh]);
+  }, [active, job, notify, onJob, refresh]);
 
   const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const canvas = maskRef.current;
@@ -4590,6 +5408,7 @@ function InpaintWorkspace({
         guidance: 5.5,
       });
       setJob(next);
+      onJob(next);
       notify('Local inpaint queued');
     } catch (nextError) {
       setError(
@@ -4745,17 +5564,17 @@ function InpaintWorkspace({
                 mask.
               </p>
               {job && (
-                <div className="inpaint-progress" role="status" aria-live="polite">
-                  <strong>{stateLabels[job.status] ?? job.status}</strong>
-                  <div className="progress">
-                    <span style={{ width: `${job.progress}%` }} />
-                  </div>
-                  <small>
-                    {job.current_step && job.total_steps
-                      ? `Step ${job.current_step} / ${job.total_steps}`
-                      : `${job.progress}%`}
-                  </small>
-                </div>
+                <JobProgressPanel
+                  job={job}
+                  compact
+                  onCancel={() => {
+                    void api.post<GenerationJob>(`/generations/${job.id}/cancel`).then((next) => {
+                      setJob(next);
+                      onJob(next);
+                    });
+                  }}
+                  onDiagnostics={onDiagnostics}
+                />
               )}
               {error && <p className="error-text">{error}</p>}
               <Button
@@ -4793,6 +5612,10 @@ function GalleryScreen({
   onGenerateSimilar,
   onCreateVariation,
   onUpscale,
+  initialSelectionId,
+  onSelectionHandled,
+  onJob,
+  onDiagnostics,
 }: {
   items: GenerationRecord[];
   motion: MotionAsset[];
@@ -4803,12 +5626,23 @@ function GalleryScreen({
   onGenerateSimilar: (draft: Record<string, unknown>) => void;
   onCreateVariation: (generation: GenerationRecord) => void;
   onUpscale: (generation: GenerationRecord) => Promise<void>;
+  initialSelectionId: string | null;
+  onSelectionHandled: () => void;
+  onJob: (job: GenerationJob) => void;
+  onDiagnostics: () => void;
 }) {
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState<GenerationRecord | null>(null);
   const [inpaintSource, setInpaintSource] = useState<GenerationRecord | null>(null);
   const [videoSource, setVideoSource] = useState<GenerationRecord | null>(null);
+  const [sequenceSource, setSequenceSource] = useState<GenerationRecord | null>(null);
   const filtered = filter === 'all' ? items : items.filter((item) => item.model_alias === filter);
+  useEffect(() => {
+    if (!initialSelectionId) return;
+    const generation = items.find((item) => item.id === initialSelectionId);
+    if (generation) setSelected(generation);
+    onSelectionHandled();
+  }, [initialSelectionId, items, onSelectionHandled]);
   return (
     <div className="screen gallery-screen">
       {inpaintSource && (
@@ -4817,6 +5651,8 @@ function GalleryScreen({
           refresh={refresh}
           notify={notify}
           onClose={() => setInpaintSource(null)}
+          onJob={onJob}
+          onDiagnostics={onDiagnostics}
         />
       )}
       {videoSource && (
@@ -4827,6 +5663,20 @@ function GalleryScreen({
           refresh={refresh}
           notify={notify}
           onClose={() => setVideoSource(null)}
+          onJob={onJob}
+          onDiagnostics={onDiagnostics}
+        />
+      )}
+      {sequenceSource && (
+        <VideoSequenceWorkspace
+          source={sequenceSource}
+          motion={motion}
+          videoReady={videoReady}
+          refresh={refresh}
+          notify={notify}
+          onClose={() => setSequenceSource(null)}
+          onJob={onJob}
+          onDiagnostics={onDiagnostics}
         />
       )}
       <PageTitle
@@ -4868,6 +5718,7 @@ function GalleryScreen({
                   generationId={item.id}
                   alt={`Generated image ${item.id}`}
                   thumbnail
+                  mediaType={item.media_type}
                 />
                 <span className="disclosure">
                   {item.media_type === 'video' ? <Film /> : <Sparkles />} AI-created{' '}
@@ -5006,6 +5857,58 @@ function GalleryScreen({
                 <small>SHA-256 {selected.metadata.inpaint.mask_sha256}</small>
               </div>
             )}
+            <div className="gallery-file-actions" aria-label="Managed file actions">
+              <Button
+                variant="ghost"
+                onClick={() =>
+                  void openManagedMedia({
+                    entity: 'generation',
+                    id: selected.id,
+                    variant: selected.media_type === 'video' ? 'video' : 'original',
+                  })
+                }
+              >
+                <Play /> Open {selected.media_type === 'video' ? 'video' : 'file'}
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() =>
+                  void revealManagedMedia({
+                    entity: 'generation',
+                    id: selected.id,
+                    variant: selected.media_type === 'video' ? 'video' : 'original',
+                  })
+                }
+              >
+                <FolderLock /> Show in folder
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={async () => {
+                  const destination = await saveManagedMediaCopy({
+                    entity: 'generation',
+                    id: selected.id,
+                    variant: selected.media_type === 'video' ? 'video' : 'original',
+                  });
+                  notify(`Saved a copy to ${destination}`);
+                }}
+              >
+                <FileDown /> Save a copy
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={async () => {
+                  await copyManagedMediaPath({
+                    entity: 'generation',
+                    id: selected.id,
+                    variant: selected.media_type === 'video' ? 'video' : 'original',
+                  });
+                  notify('Managed file path copied to the clipboard');
+                }}
+              >
+                <Copy /> Copy file path
+              </Button>
+            </div>
             {selected.media_type === 'image' && (
               <>
                 <Button
@@ -5060,8 +5963,19 @@ function GalleryScreen({
             )}
             <Button
               variant="ghost"
+              disabled={!videoReady}
+              onClick={() => {
+                setSequenceSource(selected);
+                setSelected(null);
+              }}
+            >
+              <Film /> {selected.media_type === 'video' ? 'Extend clip' : 'Create sequence'}
+            </Button>
+            <Button
+              variant="ghost"
               onClick={async () => {
                 await api.delete(`/generations/${selected.id}`);
+                mediaCache.invalidateEntity('generation', selected.id);
                 setSelected(null);
                 await refresh();
                 notify('Generation removed from your local library');
@@ -5080,13 +5994,19 @@ function EngineScreen({
   data,
   refresh,
   notify,
+  diagnosticsRequest,
 }: {
   data: AppData;
   refresh: () => Promise<void>;
   notify: (message: string) => void;
+  diagnosticsRequest: number;
 }) {
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [busy, setBusy] = useState('');
+  useEffect(() => {
+    if (!diagnosticsRequest) return;
+    void api.get<Diagnostics>('/engine/diagnostics').then(setDiagnostics);
+  }, [diagnosticsRequest]);
   const componentAction = async (item: EngineComponent, action: string) => {
     setBusy(item.id);
     try {
@@ -5654,6 +6574,33 @@ function SettingsScreen({
   refresh: () => Promise<void>;
   notify: (message: string) => void;
 }) {
+  const [storage, setStorage] = useState<StorageInfo | null>(null);
+  const [mediaRepair, setMediaRepair] = useState<{
+    records_scanned: number;
+    ready_files: number;
+    regenerated_derivatives: number;
+    normalized_paths: number;
+    missing_originals: unknown[];
+    invalid_files: unknown[];
+  } | null>(null);
+  const [repairingMedia, setRepairingMedia] = useState(false);
+  useEffect(() => {
+    let active = true;
+    const loadStorage = async () => {
+      try {
+        const next = await getStorageInfo();
+        if (active) setStorage(next);
+      } catch {
+        // Storage controls are native-only; development web preview keeps Settings usable.
+      }
+    };
+    void loadStorage();
+    const interval = window.setInterval(() => void loadStorage(), 1000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, []);
   const update = async (key: string, value: string) => {
     await api.put(`/settings/${key}`, { value });
     notify('Setting saved locally');
@@ -5738,7 +6685,119 @@ function SettingsScreen({
               </span>
               <span>{hardware.free_disk_gb.toFixed(1)} GB free</span>
             </div>
-            <Button onClick={() => void openLocalPath('data')}>Review local storage</Button>
+            {storage && (
+              <div className="media-repair-summary" role="status">
+                <strong>
+                  {formatBytes(storage.current_bytes)} across {storage.current_files} files
+                </strong>
+                <span>Studio data: {storage.current_root}</span>
+                {storage.destination && (
+                  <span>
+                    {storage.phase} · {storage.copied_files} / {storage.total_files} files ·{' '}
+                    {formatBytes(storage.copied_bytes)} / {formatBytes(storage.total_bytes)}
+                    {storage.eta_seconds != null
+                      ? ` · ~${formatDuration(storage.eta_seconds)} remaining`
+                      : ''}
+                  </span>
+                )}
+                {storage.last_error && <span className="inline-error">{storage.last_error}</span>}
+              </div>
+            )}
+            <div className="gallery-file-actions">
+              <Button onClick={() => void openLocalPath('data')}>
+                <FolderLock /> Open storage folder
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={async () => {
+                  const destination = await chooseStorageLocation();
+                  if (!destination) return;
+                  if (
+                    !window.confirm(
+                      `Move studio data to ${destination}? Vanta will copy, verify, switch only after a healthy restart, and keep the original until you remove it yourself.`,
+                    )
+                  )
+                    return;
+                  setStorage(await startStorageMove(destination));
+                  notify(
+                    'Safe studio-data move started; Vanta will keep the original until verification succeeds.',
+                  );
+                }}
+                disabled={storage?.can_cancel}
+              >
+                <Move /> Move existing studio data
+              </Button>
+              {storage?.can_cancel && (
+                <Button variant="ghost" onClick={() => void cancelStorageMove().then(setStorage)}>
+                  <X /> Cancel before switch
+                </Button>
+              )}
+              {storage?.redirected_target && (
+                <Button
+                  variant="ghost"
+                  onClick={() => void adoptRedirectedStorage().then(setStorage)}
+                >
+                  <Check /> Adopt existing redirected location
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                onClick={async () => {
+                  const folder = await chooseStorageLocation();
+                  if (!folder) return;
+                  setStorage(await setDefaultExportFolder(folder));
+                  notify('Default export folder saved locally');
+                }}
+              >
+                <FileDown /> Default export folder
+              </Button>
+            </div>
+            <div className="recovery-note">
+              <Info />
+              <span>
+                <strong>Application binaries and studio data are separate.</strong> Moving storage
+                includes models, media, SQLite, training, logs, and managed runtime assets. The
+                small bootstrap record stays local so upgrades and Repair Installation keep using
+                the selected root.
+                {storage?.default_export_folder
+                  ? ` Exports open in ${storage.default_export_folder} by default.`
+                  : ''}
+              </span>
+            </div>
+            <Button
+              disabled={repairingMedia}
+              onClick={async () => {
+                setRepairingMedia(true);
+                try {
+                  const report = await api.post<typeof mediaRepair>('/media/repair');
+                  if (report) setMediaRepair(report);
+                  mediaCache.clear();
+                  await refresh();
+                  notify(
+                    report
+                      ? `Media checked · ${report.ready_files} valid files · ${report.regenerated_derivatives} derivatives repaired`
+                      : 'Media library checked',
+                  );
+                } finally {
+                  setRepairingMedia(false);
+                }
+              }}
+            >
+              <RotateCcw /> {repairingMedia ? 'Checking media…' : 'Repair media library'}
+            </Button>
+            {mediaRepair && (
+              <div className="media-repair-summary" role="status">
+                <strong>{mediaRepair.records_scanned} records checked</strong>
+                <span>
+                  {mediaRepair.normalized_paths} paths normalized ·{' '}
+                  {mediaRepair.regenerated_derivatives} previews restored
+                </span>
+                <span>
+                  {mediaRepair.missing_originals.length} originals missing ·{' '}
+                  {mediaRepair.invalid_files.length} invalid files
+                </span>
+              </div>
+            )}
           </Panel>
         </div>
         <div>
@@ -5820,7 +6879,7 @@ function SettingsScreen({
               <Info />
               <div>
                 <h2>About Vanta</h2>
-                <p>Essential V1 · desktop 0.1.0 · local orchestrator 0.1.0</p>
+                <p>V1.0.1 repair · desktop 0.1.1 · local orchestrator 0.1.1</p>
               </div>
             </div>
             <dl className="about-facts">

@@ -81,4 +81,31 @@ def test_checkpoint_epoch_cancel_and_resume_state(tmp_path: Path, monkeypatch) -
     resumed = service.resume_run(run_id)
     assert resumed["status"] == "queued"
     assert resumed["cancellation_requested"] is False
+
+    db.execute(
+        "UPDATE training_runs SET status='failed',error_message=? WHERE id=?",
+        ("CUDA out of memory while allocating tensor", run_id),
+    )
+    log_path = settings.training_run_root / run_id / "training.log"
+    log_path.write_text(
+        f"model={settings.data_dir / 'models' / 'base.safetensors'}\nX-Vanta-Token: secret-value\n",
+        encoding="utf-8",
+    )
+    failed = service.get_run(run_id)
+    assert failed["failure"]["category"] == "out_of_memory"
+    details = service.failure_details(run_id)
+    assert "<VANTA_DATA>" in details["technical_details"]
+    assert "secret-value" not in details["technical_details"]
+
+    monkeypatch.setattr(
+        service,
+        "start_run",
+        lambda payload: {
+            "dataset_id": payload.dataset_id,
+            "profile": payload.profile,
+            "epochs": payload.epochs,
+        },
+    )
+    retried = service.retry_run(run_id)
+    assert retried == {"dataset_id": dataset_id, "profile": "safe_12gb", "epochs": 1}
     service.close()

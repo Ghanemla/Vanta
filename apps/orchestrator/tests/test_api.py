@@ -187,6 +187,13 @@ def test_recipe_and_real_generation_queue_are_not_seeded_with_fixtures(client):
     assert jobs.status_code == 200
     assert jobs.json()[0]["id"] == job.json()["id"]
     assert "queue_position" in jobs.json()[0]
+    assert jobs.json()[0]["operation"] == "generate"
+    assert jobs.json()[0]["model_alias"] == "photoreal_balanced"
+    assert jobs.json()[0]["model_family"] == "SDXL"
+    assert jobs.json()[0]["output_width"] == 832
+    assert jobs.json()[0]["output_height"] == 1216
+    assert isinstance(jobs.json()[0]["elapsed_seconds"], int)
+    assert isinstance(jobs.json()[0]["progress_determinate"], bool)
 
 
 def test_engine_manifest_and_model_pack_services(client):
@@ -405,11 +412,19 @@ def test_video_request_is_persisted_as_a_local_generation_job(client, tmp_path):
     import json
     import sqlite3
     from datetime import UTC, datetime
+    from pathlib import Path
 
     from PIL import Image
 
-    database_path = client.get("/api/settings").json()["paths"]["database"]
-    source = tmp_path / "video-source.png"
+    settings_paths = client.get("/api/settings").json()["paths"]
+    database_path = settings_paths["database"]
+    capabilities = client.get("/api/videos/capabilities?quality_profile=safe").json()
+    assert capabilities["profiles"][0]["duration_seconds"] == 2
+    assert capabilities["profiles"][1]["duration_seconds"] == 4
+    assert capabilities["extended_verified"] is False
+    assert capabilities["max_custom_seconds"] == 4
+    source = Path(settings_paths["data"]) / "media" / "generations" / "video-source.png"
+    source.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (512, 768), "navy").save(source)
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -425,6 +440,7 @@ def test_video_request_is_persisted_as_a_local_generation_job(client, tmp_path):
             "source_generation_id": "generation-video-source",
             "motion_prompt": "subtle breathing and a gentle posture shift",
             "profile": "safe",
+            "duration_profile": "safe",
             "duration_seconds": 2,
             "seed": 99,
             "motion_strength": 0.65,
@@ -440,6 +456,161 @@ def test_video_request_is_persisted_as_a_local_generation_job(client, tmp_path):
     assert request["operation"] == "video"
     assert request["model_alias"] == "video_ltx_2b"
     assert request["duration_seconds"] == 2
+    assert request["duration_profile"] == "safe"
+
+    sequence = client.post(
+        "/api/video-sequences",
+        json={"name": "Editorial continuation", "source_generation_id": "generation-video-source"},
+    )
+    assert sequence.status_code == 201
+    sequence_id = sequence.json()["id"]
+    segment = client.post(
+        f"/api/video-sequences/{sequence_id}/segments",
+        json={
+            "motion_prompt": "a restrained turn toward the window",
+            "profile": "safe",
+            "duration_profile": "safe",
+            "duration_seconds": 2,
+            "seed": 100,
+        },
+    )
+    assert segment.status_code == 202
+    assert segment.json()["segments"][0]["source_generation_id"] == "generation-video-source"
+    assert segment.json()["segments"][0]["motion_prompt"].startswith("a restrained")
+    assert (
+        client.post(
+            "/api/videos",
+            json={
+                "source_generation_id": "generation-video-source",
+                "motion_prompt": "too long for unverified hardware",
+                "profile": "safe",
+                "duration_profile": "extended",
+                "duration_seconds": 6,
+                "seed": 101,
+            },
+        ).status_code
+        == 422
+    )
+
+
+def test_video_sequence_reorders_deletes_and_joins_completed_segments(client, tmp_path):
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from PIL import Image
+
+    from vanta_orchestrator.video import encode_mp4
+
+    settings_paths = client.get("/api/settings").json()["paths"]
+    database_path = settings_paths["database"]
+    generation_root = Path(settings_paths["data"]) / "media" / "generations"
+    generation_root.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC).isoformat()
+    still = generation_root / "sequence-source.png"
+    Image.new("RGB", (64, 64), "plum").save(still)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO generations
+            (id,image_path,prompt,seed,model_alias,width,height,metadata,created_at)
+            VALUES('sequence-source',?,'owned original',1,'photoreal_balanced',64,64,'{}',?)""",
+            (str(still), now),
+        )
+    sequence = client.post(
+        "/api/video-sequences",
+        json={"name": "Joined study", "source_generation_id": "sequence-source"},
+    ).json()
+    generation_ids: list[str] = []
+    segment_ids: list[str] = []
+    with sqlite3.connect(database_path) as connection:
+        for index, color in enumerate(("#9f3f68", "navy")):
+            frames = []
+            for frame_index in range(2):
+                frame = tmp_path / f"segment-{index}-frame-{frame_index}.png"
+                Image.new("RGB", (64, 64), color).save(frame)
+                frames.append(frame)
+            video = generation_root / f"segment-{index}.mp4"
+            poster = generation_root / f"segment-{index}.jpg"
+            continuation = generation_root / f"segment-{index}-last.png"
+            encode_mp4(frames, video, 2)
+            Image.open(frames[0]).save(poster)
+            Image.open(frames[-1]).save(continuation)
+            generation_id = f"sequence-video-{index}"
+            segment_id = f"sequence-segment-{index}"
+            generation_ids.append(generation_id)
+            segment_ids.append(segment_id)
+            connection.execute(
+                """INSERT INTO generations
+                (id,image_path,thumbnail_path,prompt,seed,model_alias,width,height,metadata,created_at,media_type)
+                VALUES(?,?,?,?,?,'video_ltx_2b',64,64,?,?,'video')""",
+                (
+                    generation_id,
+                    str(video),
+                    str(poster),
+                    f"motion {index}",
+                    index + 2,
+                    json.dumps(
+                        {
+                            "duration_seconds": 1,
+                            "frame_count": 2,
+                            "fps": 2,
+                            "continuation_frame_path": str(continuation),
+                        }
+                    ),
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO video_sequence_segments
+                (id,sequence_id,position,source_generation_id,generation_id,motion_prompt,
+                quality_profile,duration_profile,duration_seconds,seed,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,'safe','safe',2,?,'completed',?,?)""",
+                (
+                    segment_id,
+                    sequence["id"],
+                    index,
+                    "sequence-source" if index == 0 else generation_ids[index - 1],
+                    generation_id,
+                    f"motion {index}",
+                    index + 20,
+                    now,
+                    now,
+                ),
+            )
+    reordered = client.put(
+        f"/api/video-sequences/{sequence['id']}/order",
+        json={"segment_ids": list(reversed(segment_ids))},
+    )
+    assert [item["id"] for item in reordered.json()["segments"]] == list(reversed(segment_ids))
+    duplicate = client.post(
+        f"/api/video-sequences/{sequence['id']}/join",
+        json={"segment_ids": [segment_ids[0], segment_ids[0]]},
+    )
+    assert duplicate.status_code == 409
+    joined = client.post(
+        f"/api/video-sequences/{sequence['id']}/join",
+        json={"segment_ids": list(reversed(segment_ids))},
+    )
+    assert joined.status_code == 200
+    assert joined.json()["status"] == "joined"
+    final_id = joined.json()["final_generation_id"]
+    with sqlite3.connect(database_path) as connection:
+        final_path, metadata = connection.execute(
+            "SELECT image_path,metadata FROM generations WHERE id=?", (final_id,)
+        ).fetchone()
+    assert Path(final_path).is_file()
+    assert json.loads(metadata)["segment_ids"] == list(reversed(segment_ids))
+    continuation = client.post(
+        f"/api/videos/{generation_ids[0]}/continuation-frame",
+        json={"timestamp_seconds": 0.25},
+    )
+    assert continuation.status_code == 201
+    assert continuation.json()["media_type"] == "image"
+    assert Path(continuation.json()["image_path"]).is_file()
+    removed = client.delete(f"/api/video-sequences/{sequence['id']}/segments/{segment_ids[0]}")
+    assert removed.status_code == 200
+    assert len(removed.json()["segments"]) == 1
 
 
 def test_training_dataset_quality_checks_captions_and_truthful_readiness(client, tmp_path):
@@ -523,3 +694,114 @@ def test_training_dataset_rejects_corrupt_and_low_rights_inputs(client, tmp_path
     )
     assert not_confirmed.status_code == 422
     assert "permission" in not_confirmed.json()["detail"].lower()
+
+
+def test_typed_media_routes_enforce_owned_roots_repair_derivatives_and_support_ranges(
+    client, tmp_path
+):
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from PIL import Image
+
+    from vanta_orchestrator.video import encode_mp4
+
+    paths = client.get("/api/settings").json()["paths"]
+    database_path = paths["database"]
+    data_root = Path(paths["data"])
+    generation_root = data_root / "media" / "generations"
+    generation_root.mkdir(parents=True, exist_ok=True)
+
+    image_id = "generation-media-repair"
+    image_path = generation_root / f"{image_id}.png"
+    thumbnail_path = generation_root / f"{image_id}.thumb.jpg"
+    Image.new("RGB", (320, 480), "plum").save(image_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO generations
+            (id,image_path,thumbnail_path,prompt,seed,model_alias,width,height,metadata,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                image_id,
+                str(image_path),
+                str(thumbnail_path),
+                "owned fictional portrait",
+                1,
+                "photoreal_balanced",
+                1,
+                1,
+                "{}",
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+    missing = client.get(f"/api/media/generation/{image_id}/thumbnail")
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "media_missing"
+    repaired = client.post("/api/media/repair")
+    assert repaired.status_code == 200
+    assert repaired.json()["regenerated_derivatives"] >= 1
+    thumbnail = client.get(f"/api/media/generation/{image_id}/thumbnail")
+    assert thumbnail.status_code == 200
+    assert thumbnail.headers["content-type"] == "image/jpeg"
+    assert thumbnail.headers["x-content-type-options"] == "nosniff"
+    with sqlite3.connect(database_path) as connection:
+        dimensions = connection.execute(
+            "SELECT width,height FROM generations WHERE id=?", (image_id,)
+        ).fetchone()
+        indexed = connection.execute(
+            "SELECT mime_type,state FROM media_assets WHERE entity_type='generation' AND entity_id=? AND variant='thumbnail'",
+            (image_id,),
+        ).fetchone()
+    assert dimensions == (320, 480)
+    assert indexed == ("image/jpeg", "ready")
+
+    frames = []
+    for index in range(4):
+        frame = tmp_path / f"video-frame-{index}.png"
+        Image.new("RGB", (64, 64), (80 + index * 20, 10, 70)).save(frame)
+        frames.append(frame)
+    video_id = "generation-range-video"
+    video_path = generation_root / f"{video_id}.mp4"
+    poster_path = generation_root / f"{video_id}.thumb.jpg"
+    encode_mp4(frames, video_path, 8)
+    Image.open(frames[0]).save(poster_path, "JPEG")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO generations
+            (id,image_path,thumbnail_path,prompt,seed,model_alias,width,height,metadata,created_at,media_type)
+            VALUES(?,?,?,?,?,?,?,?,?,?, 'video')""",
+            (
+                video_id,
+                str(video_path),
+                str(poster_path),
+                "local motion",
+                2,
+                "video_ltx_2b",
+                64,
+                64,
+                json.dumps({"duration_seconds": 0.5}),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+    ranged = client.get(f"/api/media/generation/{video_id}/video", headers={"Range": "bytes=0-99"})
+    assert ranged.status_code == 206
+    assert ranged.headers["content-type"] == "video/mp4"
+    assert ranged.headers["accept-ranges"] == "bytes"
+    assert ranged.headers["content-range"].startswith("bytes 0-99/")
+
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (32, 32), "black").save(outside)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE generations SET image_path=? WHERE id=?", (str(outside), image_id)
+        )
+    blocked = client.get(f"/api/media/generation/{image_id}/original")
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"]["code"] == "media_outside_vanta_storage"
+    unsafe_sequence = client.post(
+        "/api/video-sequences",
+        json={"name": "Unsafe source", "source_generation_id": image_id},
+    )
+    assert unsafe_sequence.status_code == 409

@@ -34,3 +34,22 @@ it('uses the dynamic local service URL and per-launch token header', async () =>
     }),
   );
 });
+
+it('authenticates typed media requests and rejects non-media responses', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce(
+    new Response('<html>not media</html>', {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    }),
+  );
+
+  await expect(
+    api.mediaBlob({ entity: 'generation', id: 'generation-1', variant: 'thumbnail' }),
+  ).rejects.toMatchObject({ code: 'media_mime_invalid' });
+  expect(fetch).toHaveBeenCalledWith(
+    'http://127.0.0.1:58123/api/media/generation/generation-1/thumbnail',
+    expect.objectContaining({
+      headers: expect.objectContaining({ [VANTA_TOKEN_HEADER]: 'test-launch-token' }),
+    }),
+  );
+});

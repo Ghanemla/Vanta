@@ -1,8 +1,10 @@
 # Project Vanta
 
-Vanta is a premium, local-only Windows desktop studio for original AI characters. The desktop renderer talks to one loopback FastAPI orchestrator, which owns SQLite data, safe engine manifests, model-pack selection, workflow compilation, and eventually the hidden ComfyUI lifecycle.
+Vanta is a premium, local-only Windows desktop studio for original AI characters. The desktop renderer talks to one authenticated loopback FastAPI orchestrator, which owns SQLite data, safe engine manifests, model-pack selection, workflow compilation, and the hidden ComfyUI lifecycle.
 
-The current image-generation release includes real local SDXL generation: Vanta manages a pinned ComfyUI runtime, imports user-selected `.safetensors` checkpoints into managed storage, verifies them with a diagnostic workflow, persists real jobs and outputs, and keeps ComfyUI internal. No arbitrary remote code is executed.
+V1.0.1 includes real local SDXL and FLUX image generation, identity and pose controls, inpainting, variations, upscaling, image-to-video, Reference Motion, LoRA training, persistent recipes, and reproducible Gallery metadata. Media is loaded through typed authenticated endpoints and a shared object-URL cache; raw local paths and launch tokens never become browser URLs. No inference API, account, telemetry, or arbitrary remote-code path is present.
+
+Generation progress is persisted across navigation and restart with honest engine, model, sampling, decoding, saving, and finalization states. Video defaults to a verified two-second Safe profile, exposes a four-second Standard profile, keeps unverified 6–8 second single-pass rendering disabled, and provides a persisted multi-segment sequence workflow for longer work.
 
 ## Prerequisites on Windows
 
@@ -84,9 +86,11 @@ Run `.\scripts\diagnose.ps1` to verify tool versions, loopback configuration, lo
 
 ## Local paths and recovery
 
-By default, development data is stored under `data/runtime/` and SQLite uses `data/runtime/vanta.db`. Production packaging uses the per-user application data directory selected by Tauri. Its managed runtime is under `engine/comfyui`, imported checkpoints under `engine/models/checkpoints`, and generated media under `media/generations`.
+By default, development data is stored under `data/runtime/` and SQLite uses `data/runtime/vanta.db`. Production initially uses `%APPDATA%\studio.vanta.desktop`. Settings can safely relocate the complete studio-data root (including SQLite, managed runtime, models, media, training, logs, and diagnostics) to a local folder such as `F:\VantaData`. Vanta copies and verifies the destination, restarts its managed local service against it, and keeps the original until the user removes it manually. A small bootstrap record outside studio storage preserves the selected root across upgrades and Repair Installation. Application binaries and studio data are separate.
 
-Back up the entire studio data directory to preserve user content. Database upgrades are applied through numbered, transactional migrations recorded in `schema_migrations`. Built-in presets seed idempotently and can be restored without overwriting user-owned copies. If the development database becomes unusable, stop Vanta, preserve it for diagnosis, rename `vanta.db`, and restart to create a clean database.
+Gallery details offer Open file, Show in folder, Save a copy, and Copy file path. These are typed native actions: Vanta resolves the selected record inside its owned storage before Windows opens, reveals, or copies it. Exports always copy the original and never move Vanta-managed media.
+
+Back up the entire studio data directory to preserve user content. Database upgrades are applied through numbered, transactional migrations recorded in `schema_migrations`. Built-in presets seed idempotently and can be restored without overwriting user-owned copies. Settings includes a non-destructive media repair that validates originals, normalizes owned paths, restores missing derivatives and reports truly missing files without fabricating or deleting media. If a database becomes unusable, stop Vanta, preserve it for diagnosis, rename `vanta.db`, and restart to create a clean database.
 
 ## Safety and rights
 

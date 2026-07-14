@@ -227,8 +227,18 @@ export interface GenerationJob {
   total_steps?: number | null;
   queue_position?: number | null;
   eta_seconds?: number | null;
+  elapsed_seconds?: number;
   result_generation_id?: string | null;
   created_at?: string;
+  updated_at?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  operation?: 'generate' | 'inpaint' | 'upscale' | 'video';
+  model_alias?: string;
+  model_family?: string;
+  output_width?: number | null;
+  output_height?: number | null;
+  progress_determinate?: boolean;
 }
 export interface MotionAsset {
   id: string;
@@ -257,6 +267,47 @@ export interface MotionAsset {
   };
   created_at: string;
   updated_at: string;
+}
+export interface VideoDurationProfile {
+  id: 'safe' | 'standard' | 'extended';
+  name: string;
+  verified: boolean;
+  enabled: boolean;
+  duration_seconds: number;
+  range_seconds?: [number, number];
+  frame_count: number;
+  expected_generation_seconds: number;
+  estimated_vram_gb: number;
+  estimated_ram_gb: number;
+  estimated_disk_mb: number;
+}
+export interface VideoCapabilities {
+  quality_profile: 'safe' | 'balanced' | 'quality';
+  max_custom_seconds: number;
+  extended_verified: boolean;
+  historical_samples: number;
+  profiles: VideoDurationProfile[];
+}
+export interface VideoSequenceSegment {
+  id: string;
+  position: number;
+  source_generation_id: string;
+  generation_id: string | null;
+  job_id: string | null;
+  motion_prompt: string;
+  quality_profile: 'safe' | 'balanced' | 'quality';
+  duration_profile: 'safe' | 'standard' | 'extended' | 'custom';
+  duration_seconds: number;
+  status: string;
+  metadata: { error?: string | null };
+}
+export interface VideoSequence {
+  id: string;
+  name: string;
+  source_generation_id: string;
+  status: string;
+  final_generation_id: string | null;
+  segments: VideoSequenceSegment[];
 }
 export interface TrainingImage {
   id: string;
@@ -311,9 +362,20 @@ export interface TrainingRun {
   current_step: number;
   total_steps: number;
   eta_seconds: number | null;
+  elapsed_seconds: number;
   error_message: string | null;
+  failure: {
+    category: string;
+    title: string;
+    explanation: string;
+    recommended_recovery: string;
+  } | null;
   resume_state_path: string | null;
   installed_lora_id: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
   estimates: {
     profile: string;
     seconds: number;

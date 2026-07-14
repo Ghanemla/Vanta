@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -7,7 +7,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, RunEvent, State};
 use uuid::Uuid;
@@ -31,6 +31,77 @@ struct ServiceInfo {
     last_sanitized_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct StorageInfo {
+    current_root: String,
+    default_root: String,
+    bootstrap_config: String,
+    current_bytes: u64,
+    current_files: u64,
+    destination_free_bytes: u64,
+    redirected_target: Option<String>,
+    operation: String,
+    phase: String,
+    destination: Option<String>,
+    current_file: Option<String>,
+    copied_bytes: u64,
+    total_bytes: u64,
+    copied_files: u64,
+    total_files: u64,
+    elapsed_seconds: u64,
+    eta_seconds: Option<u64>,
+    can_cancel: bool,
+    last_error: Option<String>,
+    previous_root: Option<String>,
+    default_export_folder: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct StorageBootstrap {
+    studio_data_root: Option<PathBuf>,
+    default_export_folder: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct NativeMediaLocation {
+    path: String,
+    mime_type: String,
+}
+
+struct StorageOperation {
+    state: String,
+    phase: String,
+    destination: Option<PathBuf>,
+    current_file: Option<String>,
+    copied_bytes: u64,
+    total_bytes: u64,
+    copied_files: u64,
+    total_files: u64,
+    started_at: Option<Instant>,
+    cancel_requested: bool,
+    last_error: Option<String>,
+    previous_root: Option<PathBuf>,
+}
+
+impl Default for StorageOperation {
+    fn default() -> Self {
+        Self {
+            state: "idle".into(),
+            phase: "Studio data is ready".into(),
+            destination: None,
+            current_file: None,
+            copied_bytes: 0,
+            total_bytes: 0,
+            copied_files: 0,
+            total_files: 0,
+            started_at: None,
+            cancel_requested: false,
+            last_error: None,
+            previous_root: None,
+        }
+    }
+}
+
 struct RuntimeInner {
     state: String,
     phase: String,
@@ -38,7 +109,11 @@ struct RuntimeInner {
     token: Option<String>,
     sidecar_path: Option<PathBuf>,
     data_dir: PathBuf,
+    default_data_dir: PathBuf,
+    bootstrap_path: PathBuf,
     logs_dir: PathBuf,
+    desktop_capability: String,
+    storage: StorageOperation,
     child: Option<Child>,
     job: Option<ProcessJob>,
     health_check_state: String,
@@ -80,7 +155,12 @@ impl Drop for ProcessJob {
 struct ProcessJob;
 
 impl RuntimeManager {
-    fn new(data_dir: PathBuf, logs_dir: PathBuf) -> Self {
+    fn new(
+        data_dir: PathBuf,
+        default_data_dir: PathBuf,
+        bootstrap_path: PathBuf,
+        logs_dir: PathBuf,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
                 state: "not_started".into(),
@@ -89,7 +169,12 @@ impl RuntimeManager {
                 token: None,
                 sidecar_path: None,
                 data_dir,
+                default_data_dir,
+                bootstrap_path,
                 logs_dir,
+                desktop_capability: Uuid::new_v4().simple().to_string()
+                    + &Uuid::new_v4().simple().to_string(),
+                storage: StorageOperation::default(),
                 child: None,
                 job: None,
                 health_check_state: "not_started".into(),
@@ -122,6 +207,62 @@ impl RuntimeManager {
             last_sanitized_error: inner.last_sanitized_error.clone(),
         }
     }
+
+    fn storage_snapshot(&self) -> StorageInfo {
+        let inner = self.inner.lock().expect("runtime state lock");
+        let (files, bytes) = tree_totals(&inner.data_dir).unwrap_or((0, 0));
+        let elapsed = inner
+            .storage
+            .started_at
+            .map(|start| start.elapsed().as_secs())
+            .unwrap_or(0);
+        let eta = if inner.storage.copied_bytes > 0
+            && inner.storage.total_bytes > inner.storage.copied_bytes
+            && elapsed > 0
+        {
+            Some(
+                ((inner.storage.total_bytes - inner.storage.copied_bytes) as f64
+                    / (inner.storage.copied_bytes as f64 / elapsed as f64))
+                    .ceil() as u64,
+            )
+        } else {
+            None
+        };
+        StorageInfo {
+            current_root: inner.data_dir.display().to_string(),
+            default_root: inner.default_data_dir.display().to_string(),
+            bootstrap_config: inner.bootstrap_path.display().to_string(),
+            current_bytes: bytes,
+            current_files: files,
+            destination_free_bytes: free_bytes(&inner.data_dir).unwrap_or(0),
+            redirected_target: redirected_target(&inner.default_data_dir)
+                .map(|path| path.display().to_string()),
+            operation: inner.storage.state.clone(),
+            phase: inner.storage.phase.clone(),
+            destination: inner
+                .storage
+                .destination
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            current_file: inner.storage.current_file.clone(),
+            copied_bytes: inner.storage.copied_bytes,
+            total_bytes: inner.storage.total_bytes,
+            copied_files: inner.storage.copied_files,
+            total_files: inner.storage.total_files,
+            elapsed_seconds: elapsed,
+            eta_seconds: eta,
+            can_cancel: matches!(inner.storage.state.as_str(), "scanning" | "copying"),
+            last_error: inner.storage.last_error.clone(),
+            previous_root: inner
+                .storage
+                .previous_root
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            default_export_folder: read_bootstrap(&inner.bootstrap_path)
+                .default_export_folder
+                .map(|path| path.display().to_string()),
+        }
+    }
 }
 
 fn allocate_loopback_port() -> Result<u16, String> {
@@ -140,6 +281,198 @@ fn sanitize_error(message: impl ToString) -> String {
         .chars()
         .take(300)
         .collect()
+}
+
+fn read_bootstrap(path: &Path) -> StorageBootstrap {
+    fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<StorageBootstrap>(&text).ok()).unwrap_or_default()
+}
+
+fn bootstrap_root(default_root: &Path, bootstrap_path: &Path) -> PathBuf {
+    let configured = read_bootstrap(bootstrap_path).studio_data_root
+        .filter(|path| path.is_absolute());
+    configured.unwrap_or_else(|| {
+        redirected_target(default_root).unwrap_or_else(|| default_root.to_path_buf())
+    })
+}
+
+fn write_bootstrap(path: &Path, root: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Storage bootstrap has no parent directory".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to prepare storage bootstrap: {error}"))?;
+    let temporary = path.with_extension("json.pending");
+    let mut bootstrap = read_bootstrap(path);
+    bootstrap.studio_data_root = Some(root.to_path_buf());
+    let content = serde_json::to_vec_pretty(&bootstrap)
+    .map_err(|error| format!("Unable to encode storage bootstrap: {error}"))?;
+    fs::write(&temporary, content)
+        .map_err(|error| format!("Unable to write storage bootstrap: {error}"))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("Unable to activate storage bootstrap: {error}"))
+}
+
+fn is_reparse_point(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_attributes() & 0x400 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+}
+
+fn redirected_target(path: &Path) -> Option<PathBuf> {
+    is_reparse_point(path)
+        .then(|| path.canonicalize().ok())
+        .flatten()
+        .filter(|target| target != path)
+}
+
+fn tree_totals(root: &Path) -> Result<(u64, u64), String> {
+    fn visit(path: &Path, files: &mut u64, bytes: &mut u64) -> Result<(), String> {
+        if is_reparse_point(path) {
+            return Err(format!(
+                "Storage contains a junction or link that must be adopted instead of copied: {}",
+                path.display()
+            ));
+        }
+        for entry in
+            fs::read_dir(path).map_err(|error| format!("Unable to scan storage: {error}"))?
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let child = entry.path();
+            let metadata = fs::symlink_metadata(&child).map_err(|error| error.to_string())?;
+            if metadata.is_dir() {
+                visit(&child, files, bytes)?;
+            } else if metadata.is_file() {
+                *files += 1;
+                *bytes += metadata.len();
+            }
+        }
+        Ok(())
+    }
+    if !root.exists() {
+        return Ok((0, 0));
+    }
+    let mut files = 0;
+    let mut bytes = 0;
+    visit(root, &mut files, &mut bytes)?;
+    Ok((files, bytes))
+}
+
+fn free_bytes(path: &Path) -> Result<u64, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut available = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err("Unable to determine free space for this destination".into());
+        }
+        Ok(available)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(0)
+    }
+}
+
+fn validate_storage_destination(source: &Path, destination: &Path) -> Result<(), String> {
+    if !destination.is_absolute() || destination.to_string_lossy().starts_with("\\\\") {
+        return Err("Choose a local absolute folder, not a network location".into());
+    }
+    if destination.starts_with(source) || source.starts_with(destination) {
+        return Err(
+            "The destination cannot contain the current studio data or contain its parent".into(),
+        );
+    }
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    let destination = destination
+        .canonicalize()
+        .unwrap_or_else(|_| destination.to_path_buf());
+    if source == destination || destination.starts_with(&source) || source.starts_with(&destination)
+    {
+        return Err(
+            "The destination cannot contain the current studio data or contain its parent".into(),
+        );
+    }
+    if destination.exists()
+        && (is_reparse_point(&destination)
+            || fs::read_dir(&destination)
+                .map_err(|error| error.to_string())?
+                .next()
+                .is_some())
+    {
+        return Err("The destination already contains data or is redirected. Choose an empty local folder or adopt its existing target.".into());
+    }
+    Ok(())
+}
+
+fn copy_storage_tree(
+    manager: &RuntimeManager,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    fn copy_dir(manager: &RuntimeManager, source: &Path, destination: &Path) -> Result<(), String> {
+        fs::create_dir_all(destination)
+            .map_err(|error| format!("Unable to create destination folder: {error}"))?;
+        for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let from = entry.path();
+            let to = destination.join(entry.file_name());
+            if is_reparse_point(&from) {
+                return Err(format!(
+                    "Refusing to follow redirected storage item: {}",
+                    from.display()
+                ));
+            }
+            let metadata = entry.metadata().map_err(|error| error.to_string())?;
+            if metadata.is_dir() {
+                copy_dir(manager, &from, &to)?;
+                continue;
+            }
+            let cancelled = manager
+                .inner
+                .lock()
+                .expect("runtime state lock")
+                .storage
+                .cancel_requested;
+            if cancelled {
+                return Err("Storage move cancelled before switching locations".into());
+            }
+            {
+                let mut inner = manager.inner.lock().expect("runtime state lock");
+                inner.storage.current_file = Some(from.display().to_string());
+            }
+            fs::copy(&from, &to)
+                .map_err(|error| format!("Unable to copy {}: {error}", from.display()))?;
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            inner.storage.copied_files += 1;
+            inner.storage.copied_bytes += metadata.len();
+        }
+        Ok(())
+    }
+    copy_dir(manager, source, destination)
 }
 
 fn sidecar_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -189,6 +522,62 @@ fn service_is_healthy(port: u16, token: &str) -> bool {
     }
     let mut response = String::new();
     stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+}
+
+fn resolve_native_media(
+    manager: &RuntimeManager,
+    entity: &str,
+    id: &str,
+    variant: &str,
+) -> Result<PathBuf, String> {
+    let (port, token, capability, root) = {
+        let inner = manager
+            .inner
+            .lock()
+            .map_err(|_| "Runtime state is unavailable")?;
+        (
+            inner.port,
+            inner.token.clone(),
+            inner.desktop_capability.clone(),
+            inner.data_dir.clone(),
+        )
+    };
+    let (port, token) = match (port, token) {
+        (Some(port), Some(token)) => (port, token),
+        _ => return Err("The local Vanta service is not ready".into()),
+    };
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}")
+            .parse()
+            .map_err(|_| "Invalid local service address")?,
+        Duration::from_secs(2),
+    )
+    .map_err(|_| "Unable to reach the local Vanta service")?;
+    let request = format!("GET /api/native-media/{}/{}/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Vanta-Token: {}\r\nX-Vanta-Desktop-Capability: {}\r\nConnection: close\r\n\r\n", entity, id, variant, token, capability);
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| error.to_string())?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "Invalid native media response".to_string())?;
+    if !head.starts_with("HTTP/1.1 200") {
+        return Err(
+            "The selected managed media file is unavailable. Run Repair media from Settings."
+                .into(),
+        );
+    }
+    let location: NativeMediaLocation =
+        serde_json::from_str(body).map_err(|_| "Invalid native media response")?;
+    let path = PathBuf::from(location.path);
+    if !path.is_file() || !path.starts_with(&root) {
+        return Err("The requested file is not inside the current Vanta storage root".into());
+    }
+    let _ = location.mime_type;
+    Ok(path)
 }
 
 fn health_backoff(attempt: u32) -> Duration {
@@ -257,13 +646,17 @@ fn write_runtime_log(logs_dir: &Path, message: &str) {
 }
 
 fn launch_sidecar(app: AppHandle, manager: &RuntimeManager, restart: bool) -> Result<(), String> {
-    let (data_dir, logs_dir) = {
+    let (data_dir, logs_dir, desktop_capability) = {
         let mut inner = manager.inner.lock().expect("runtime state lock");
         inner.state = if restart { "restarting" } else { "preparing" }.into();
         inner.phase = "Preparing local workspace".into();
         inner.health_check_state = "pending".into();
         inner.last_sanitized_error = None;
-        (inner.data_dir.clone(), inner.logs_dir.clone())
+        (
+            inner.data_dir.clone(),
+            inner.logs_dir.clone(),
+            inner.desktop_capability.clone(),
+        )
     };
     fs::create_dir_all(&data_dir)
         .and_then(|_| fs::create_dir_all(&logs_dir))
@@ -285,6 +678,7 @@ fn launch_sidecar(app: AppHandle, manager: &RuntimeManager, restart: bool) -> Re
         .env("VANTA_HOST", "127.0.0.1")
         .env("VANTA_PORT", port.to_string())
         .env("VANTA_LAUNCH_TOKEN", &token)
+        .env("VANTA_DESKTOP_CAPABILITY", &desktop_capability)
         .env(
             "VANTA_RUNTIME_MODE",
             if cfg!(debug_assertions) {
@@ -317,6 +711,7 @@ fn launch_sidecar(app: AppHandle, manager: &RuntimeManager, restart: bool) -> Re
         .env("VANTA_HOST", "127.0.0.1")
         .env("VANTA_PORT", port.to_string())
         .env("VANTA_LAUNCH_TOKEN", &token)
+        .env("VANTA_DESKTOP_CAPABILITY", &desktop_capability)
         .env(
             "VANTA_RUNTIME_MODE",
             if cfg!(debug_assertions) {
@@ -507,6 +902,203 @@ fn repair_application_runtime(
 }
 
 #[tauri::command]
+fn storage_info(manager: State<'_, RuntimeManager>) -> StorageInfo {
+    manager.storage_snapshot()
+}
+
+#[tauri::command]
+fn choose_storage_location() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.display().to_string())
+}
+
+#[tauri::command]
+fn start_storage_move(
+    app: AppHandle,
+    destination: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<StorageInfo, String> {
+    let destination = PathBuf::from(destination);
+    let source = {
+        let mut inner = manager
+            .inner
+            .lock()
+            .map_err(|_| "Storage state is unavailable")?;
+        if matches!(
+            inner.storage.state.as_str(),
+            "scanning" | "copying" | "switching"
+        ) {
+            return Err("A storage move is already in progress".into());
+        }
+        validate_storage_destination(&inner.data_dir, &destination)?;
+        fs::create_dir_all(&destination)
+            .map_err(|error| format!("Unable to create storage destination: {error}"))?;
+        let probe = destination.join(".vanta-write-test");
+        fs::write(&probe, b"vanta")
+            .map_err(|error| format!("The destination is not writable: {error}"))?;
+        fs::remove_file(&probe).map_err(|error| error.to_string())?;
+        inner.storage = StorageOperation {
+            state: "scanning".into(),
+            phase: "Scanning studio data before safe copy".into(),
+            destination: Some(destination.clone()),
+            started_at: Some(Instant::now()),
+            previous_root: Some(inner.data_dir.clone()),
+            ..StorageOperation::default()
+        };
+        inner.data_dir.clone()
+    };
+    let manager_clone = RuntimeManager {
+        inner: manager.inner.clone(),
+    };
+    thread::spawn(move || execute_storage_move(app, manager_clone, source, destination));
+    Ok(manager.storage_snapshot())
+}
+
+#[tauri::command]
+fn cancel_storage_move(manager: State<'_, RuntimeManager>) -> Result<StorageInfo, String> {
+    let mut inner = manager
+        .inner
+        .lock()
+        .map_err(|_| "Storage state is unavailable")?;
+    if !matches!(inner.storage.state.as_str(), "scanning" | "copying") {
+        return Err("There is no cancellable storage move".into());
+    }
+    inner.storage.cancel_requested = true;
+    inner.storage.phase = "Cancelling before storage switch".into();
+    drop(inner);
+    Ok(manager.storage_snapshot())
+}
+
+#[tauri::command]
+fn adopt_redirected_storage(manager: State<'_, RuntimeManager>) -> Result<StorageInfo, String> {
+    let mut inner = manager
+        .inner
+        .lock()
+        .map_err(|_| "Storage state is unavailable")?;
+    let target = redirected_target(&inner.default_data_dir)
+        .ok_or_else(|| "No existing redirected default storage was found".to_string())?;
+    write_bootstrap(&inner.bootstrap_path, &target)?;
+    inner.data_dir = target.clone();
+    inner.logs_dir = target.join("logs");
+    inner.storage.phase = "Adopted existing redirected storage target".into();
+    drop(inner);
+    Ok(manager.storage_snapshot())
+}
+
+#[tauri::command]
+fn set_default_export_folder(folder: String, manager: State<'_, RuntimeManager>) -> Result<StorageInfo, String> {
+    let folder = PathBuf::from(folder);
+    if !folder.is_absolute() || folder.to_string_lossy().starts_with("\\\\") || !folder.is_dir() {
+        return Err("Choose an existing local export folder".into());
+    }
+    let bootstrap_path = manager.inner.lock().map_err(|_| "Storage state is unavailable")?.bootstrap_path.clone();
+    let mut bootstrap = read_bootstrap(&bootstrap_path);
+    bootstrap.default_export_folder = Some(folder);
+    let parent = bootstrap_path.parent().ok_or_else(|| "Storage bootstrap has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = bootstrap_path.with_extension("json.pending");
+    fs::write(&temporary, serde_json::to_vec_pretty(&bootstrap).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+    fs::rename(temporary, bootstrap_path).map_err(|error| error.to_string())?;
+    Ok(manager.storage_snapshot())
+}
+
+fn execute_storage_move(
+    app: AppHandle,
+    manager: RuntimeManager,
+    source: PathBuf,
+    destination: PathBuf,
+) {
+    let result = (|| -> Result<(), String> {
+        let (total_files, total_bytes) = tree_totals(&source)?;
+        let free = free_bytes(&destination)?;
+        if free < total_bytes {
+            return Err(format!("The destination has insufficient free space. Need {total_bytes} bytes, found {free}."));
+        }
+        {
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            inner.storage.state = "copying".into();
+            inner.storage.phase = "Copying studio data; the original remains untouched".into();
+            inner.storage.total_files = total_files;
+            inner.storage.total_bytes = total_bytes;
+        }
+        shutdown_sidecar(&manager);
+        copy_storage_tree(&manager, &source, &destination)?;
+        let (copied_files, copied_bytes) = tree_totals(&destination)?;
+        if copied_files != total_files || copied_bytes != total_bytes {
+            return Err(
+                "Copied storage verification failed; the original location was preserved".into(),
+            );
+        }
+        if !destination.join("vanta.db").is_file() {
+            return Err("Copied storage is missing its SQLite database; the original location was preserved".into());
+        }
+        {
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            inner.storage.state = "switching".into();
+            inner.storage.phase = "Verifying copied storage and restarting local services".into();
+            inner.data_dir = destination.clone();
+            inner.logs_dir = destination.join("logs");
+        }
+        launch_sidecar(app.clone(), &manager, true)?;
+        let mut ready = false;
+        for attempt in 0..HEALTH_ATTEMPTS {
+            let (port, token) = {
+                let inner = manager.inner.lock().expect("runtime state lock");
+                (inner.port, inner.token.clone())
+            };
+            if let (Some(port), Some(token)) = (port, token) {
+                if service_is_healthy(port, &token) {
+                    ready = true;
+                    break;
+                }
+            }
+            thread::sleep(health_backoff(attempt));
+        }
+        if !ready {
+            return Err("The copied storage did not pass the local service health check".into());
+        }
+        let bootstrap = manager
+            .inner
+            .lock()
+            .expect("runtime state lock")
+            .bootstrap_path
+            .clone();
+        write_bootstrap(&bootstrap, &destination)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        shutdown_sidecar(&manager);
+        let (previous, app_for_restart) = {
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            let previous = inner
+                .storage
+                .previous_root
+                .clone()
+                .unwrap_or_else(|| source.clone());
+            inner.data_dir = previous.clone();
+            inner.logs_dir = previous.join("logs");
+            inner.storage.state = if inner.storage.cancel_requested {
+                "cancelled".into()
+            } else {
+                "failed".into()
+            };
+            inner.storage.phase = "Original studio data remains active".into();
+            inner.storage.last_error = Some(sanitize_error(error));
+            (previous, app.clone())
+        };
+        let _ = launch_sidecar(app_for_restart, &manager, true);
+        let _ = previous;
+    } else {
+        let mut inner = manager.inner.lock().expect("runtime state lock");
+        inner.storage.state = "completed".into();
+        inner.storage.phase =
+            "Storage moved and verified. The original remains until you remove it manually.".into();
+        inner.storage.current_file = None;
+    }
+}
+
+#[tauri::command]
 fn choose_local_model_file() -> Option<String> {
     rfd::FileDialog::new()
         .add_filter("SafeTensors checkpoints", &["safetensors"])
@@ -581,6 +1173,102 @@ fn open_local_path(kind: String, manager: State<'_, RuntimeManager>) -> Result<(
         .map_err(|error| format!("Unable to open Windows Explorer: {error}"))
 }
 
+#[tauri::command]
+fn open_managed_media(
+    entity: String,
+    id: String,
+    variant: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<(), String> {
+    let path = resolve_native_media(&manager, &entity, &id, &variant)?;
+    let mut command = Command::new("explorer.exe");
+    command.arg(&path);
+    hide_console(&mut command);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open the selected file: {error}"))
+}
+
+#[tauri::command]
+fn reveal_managed_media(
+    entity: String,
+    id: String,
+    variant: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<(), String> {
+    let path = resolve_native_media(&manager, &entity, &id, &variant)?;
+    let mut command = Command::new("explorer.exe");
+    command.arg("/select,").arg(&path);
+    hide_console(&mut command);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to reveal the selected file: {error}"))
+}
+
+#[tauri::command]
+fn save_managed_media_copy(
+    entity: String,
+    id: String,
+    variant: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<String, String> {
+    let source = resolve_native_media(&manager, &entity, &id, &variant)?;
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let initial = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("vanta-media");
+    let configured_folder = { let inner = manager.inner.lock().map_err(|_| "Runtime state is unavailable")?; read_bootstrap(&inner.bootstrap_path).default_export_folder };
+    let pictures = configured_folder.or_else(|| std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|root| root.join("Pictures")));
+    let mut dialog = rfd::FileDialog::new()
+        .set_file_name(initial)
+        .add_filter("Vanta media", &[extension]);
+    if let Some(folder) = pictures.filter(|path| path.is_dir()) {
+        dialog = dialog.set_directory(folder);
+    }
+    let Some(mut destination) = dialog.save_file() else {
+        return Err("Export cancelled".into());
+    };
+    if destination.extension().is_none() {
+        destination.set_extension(extension);
+    }
+    if destination.exists() {
+        return Err("Choose a new filename; Vanta will not overwrite an existing export".into());
+    }
+    fs::copy(&source, &destination).map_err(|error| format!("Unable to save a copy: {error}"))?;
+    Ok(destination.display().to_string())
+}
+
+#[tauri::command]
+fn copy_managed_media_path(
+    entity: String,
+    id: String,
+    variant: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<(), String> {
+    let path = resolve_native_media(&manager, &entity, &id, &variant)?;
+    let mut command = Command::new("cmd.exe");
+    command.args(["/C", "clip"]).stdin(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Unable to access the clipboard: {error}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(path.to_string_lossy().as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    child.wait().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn acquire_desktop_lock(data_dir: &Path) -> Result<DesktopLock, String> {
     let path = data_dir.join("desktop-instance.lock");
     let open_lock = || OpenOptions::new().write(true).create_new(true).open(&path);
@@ -635,14 +1323,27 @@ fn process_is_running(_pid: u32) -> bool {
 pub fn run() {
     let builder = tauri::Builder::default()
         .setup(|app| {
-            let data_dir = app
+            let default_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| format!("Unable to resolve Vanta application data: {error}"))?;
+            let bootstrap_dir = app
+                .path()
+                .app_local_data_dir()
+                .map_err(|error| format!("Unable to resolve Vanta storage bootstrap: {error}"))?
+                .join("storage-bootstrap");
+            let bootstrap_path = bootstrap_dir.join("studio-data.json");
+            let data_dir = bootstrap_root(&default_data_dir, &bootstrap_path);
             let logs_dir = data_dir.join("logs");
             fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
-            app.manage(acquire_desktop_lock(&data_dir)?);
-            app.manage(RuntimeManager::new(data_dir, logs_dir));
+            fs::create_dir_all(&bootstrap_dir).map_err(|error| error.to_string())?;
+            app.manage(acquire_desktop_lock(&bootstrap_dir)?);
+            app.manage(RuntimeManager::new(
+                data_dir,
+                default_data_dir,
+                bootstrap_path,
+                logs_dir,
+            ));
             let manager = app.state::<RuntimeManager>();
             if let Err(error) = launch_sidecar(app.handle().clone(), &manager, false) {
                 let mut inner = manager.inner.lock().expect("runtime state lock");
@@ -666,13 +1367,23 @@ pub fn run() {
             service_info,
             restart_local_service,
             repair_application_runtime,
+            storage_info,
+            choose_storage_location,
+            start_storage_move,
+            cancel_storage_move,
+            adopt_redirected_storage,
+            set_default_export_folder,
             choose_local_model_file,
             choose_local_image_file,
             choose_local_training_images,
             choose_local_video_file,
             choose_local_lora_file,
             choose_local_upscaler_file,
-            open_local_path
+            open_local_path,
+            open_managed_media,
+            reveal_managed_media,
+            save_managed_media_copy,
+            copy_managed_media_path
         ]);
 
     let app = builder
@@ -708,5 +1419,27 @@ mod tests {
         let message = format!("secret\n{}", "x".repeat(400));
         assert!(!sanitize_error(message).contains('\n'));
         assert_eq!(sanitize_error("x".repeat(400)).len(), 300);
+    }
+
+    #[test]
+    fn bootstrap_configuration_preserves_a_selected_storage_root() {
+        let root = std::env::temp_dir().join(format!("vanta-storage-test-{}", Uuid::new_v4()));
+        let selected = root.join("F-drive-style-data");
+        let bootstrap = root.join("bootstrap").join("studio-data.json");
+        write_bootstrap(&bootstrap, &selected).expect("bootstrap writes atomically");
+        assert_eq!(bootstrap_root(&root.join("default"), &bootstrap), selected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_totals_count_real_files_and_reject_nested_destinations() {
+        let root = std::env::temp_dir().join(format!("vanta-storage-test-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(source.join("media")).expect("source directory");
+        fs::write(source.join("vanta.db"), b"SQLite format 3\0").expect("database fixture");
+        fs::write(source.join("media").join("frame.png"), b"pixels").expect("media fixture");
+        assert_eq!(tree_totals(&source).expect("totals"), (2, 22));
+        assert!(validate_storage_destination(&source, &source.join("nested")).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

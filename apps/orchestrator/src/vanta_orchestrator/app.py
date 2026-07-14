@@ -3,12 +3,11 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-import mimetypes
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -17,6 +16,7 @@ from starlette.types import ASGIApp
 from .config import Settings
 from .database import Database, utc_now
 from .engine import EngineService, GenerationService
+from .media import MediaAccessError, MediaService
 from .pose import PoseService
 from .repositories import (
     CharacterRepository,
@@ -47,10 +47,15 @@ from .schemas import (
     TrainingInstallInput,
     TrainingRunInput,
     UpscalerImportInput,
+    VideoContinuationFrameInput,
     VideoGenerationInput,
+    VideoSequenceInput,
+    VideoSequenceJoinInput,
+    VideoSequenceOrderInput,
+    VideoSequenceSegmentInput,
 )
 from .training import TRAINING_PROFILES, TrainingService
-from .video import MotionService
+from .video import MotionService, VideoSequenceService
 
 AUTH_HEADER = "X-Vanta-Token"
 ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
@@ -126,11 +131,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     generation_jobs = GenerationService(db, engine)
     poses = PoseService(db, settings, engine)
     motion = MotionService(db, settings, engine)
+    video_sequences = VideoSequenceService(db, settings, engine, generation_jobs)
     training = TrainingService(db, settings, engine, loras)
+    media = MediaService(db, settings)
     generation_jobs.recover()
     motion.recover()
 
-    app = FastAPI(title="Vanta Local Orchestrator", version="0.1.0", docs_url="/api/docs")
+    app = FastAPI(title="Vanta Local Orchestrator", version="0.1.1", docs_url="/api/docs")
     # Starlette applies the most recently added middleware first. CORS must be
     # outermost so it can answer browser preflight before token authentication.
     app.add_middleware(LaunchTokenMiddleware, launch_token=settings.launch_token)
@@ -150,6 +157,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def missing(error: KeyError) -> HTTPException:
         return HTTPException(status_code=404, detail=f"Item {error.args[0]} was not found")
+
+    def media_response(entity_type: str, entity_id: str, variant: str) -> FileResponse:
+        try:
+            item = media.resolve(entity_type, entity_id, variant)
+        except MediaAccessError as error:
+            raise HTTPException(
+                status_code=error.status,
+                detail={"code": error.code, "message": error.message},
+            ) from error
+        headers = {
+            "Cache-Control": "private, max-age=60",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if item.mime_type.startswith("video/"):
+            headers["Accept-Ranges"] = "bytes"
+        return FileResponse(item.path, media_type=item.mime_type, headers=headers)
 
     @app.get("/api/health")
     def health() -> dict:
@@ -237,16 +260,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/references/{reference_id}/{variant}")
     def reference_image(reference_id: str, variant: str) -> FileResponse:
-        if variant not in {"image", "thumbnail", "crop"}:
-            raise HTTPException(status_code=404, detail="Reference image variant was not found")
-        try:
-            reference = references.get(reference_id)
-        except KeyError as error:
-            raise missing(error) from error
-        path = Path(reference[f"{variant}_path"])
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="Reference image file was not found")
-        return FileResponse(path, media_type="image/jpeg")
+        return media_response(
+            "character-reference", reference_id, "original" if variant == "image" else variant
+        )
 
     @app.get("/api/loras")
     def list_loras() -> list[dict]:
@@ -295,22 +311,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/poses/{pose_id}/{variant}")
     def pose_media(pose_id: str, variant: str) -> FileResponse:
-        field = {
-            "source": "source_path",
-            "source-thumbnail": "source_thumbnail_path",
-            "control": "control_path",
-            "control-thumbnail": "control_thumbnail_path",
-        }.get(variant)
-        if not field:
-            raise HTTPException(status_code=404, detail="Pose media variant was not found")
-        try:
-            item = poses.get(pose_id)
-        except KeyError as error:
-            raise missing(error) from error
-        path = Path(item[field])
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="Pose media is not ready")
-        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "image/png")
+        return media_response("pose", pose_id, variant)
 
     @app.post("/api/loras/import", status_code=201)
     def import_lora(payload: LoraImportInput) -> dict:
@@ -515,30 +516,92 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/motion-assets/{asset_id}/{variant}")
     def motion_asset_media(asset_id: str, variant: str) -> FileResponse:
-        field = {
-            "source": "source_path",
-            "preview": "preview_path",
-            "thumbnail": "thumbnail_path",
-        }.get(variant)
-        if field is None:
-            raise HTTPException(status_code=404, detail="Motion media variant was not found")
-        try:
-            item = motion.get(asset_id)
-        except KeyError as error:
-            raise missing(error) from error
-        path = Path(item.get(field) or "")
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="Motion media is not ready")
-        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "video/mp4")
+        return media_response("motion", asset_id, variant)
 
     @app.post("/api/videos", status_code=202)
     def create_video(payload: VideoGenerationInput) -> dict:
+        try:
+            video_sequences.validate_duration(payload.duration_profile, payload.duration_seconds)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         request = {
             **payload.model_dump(),
             "operation": "video",
             "model_alias": "video_ltx_2b",
         }
         return generation_jobs.queue(request)
+
+    @app.get("/api/videos/capabilities")
+    def video_duration_capabilities(quality_profile: str = Query(default="safe")) -> dict:
+        try:
+            return video_sequences.duration_capabilities(quality_profile)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/videos/{generation_id}/continuation-frame", status_code=201)
+    def create_video_continuation_frame(
+        generation_id: str, payload: VideoContinuationFrameInput
+    ) -> dict:
+        try:
+            return video_sequences.continuation_frame(generation_id, payload.timestamp_seconds)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/video-sequences")
+    def list_video_sequences() -> list[dict]:
+        return video_sequences.list()
+
+    @app.post("/api/video-sequences", status_code=201)
+    def create_video_sequence(payload: VideoSequenceInput) -> dict:
+        try:
+            return video_sequences.create(payload.name, payload.source_generation_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/video-sequences/{sequence_id}")
+    def get_video_sequence(sequence_id: str) -> dict:
+        try:
+            return video_sequences.get(sequence_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/video-sequences/{sequence_id}/segments", status_code=202)
+    def add_video_sequence_segment(sequence_id: str, payload: VideoSequenceSegmentInput) -> dict:
+        try:
+            return video_sequences.add_segment(sequence_id, payload)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.put("/api/video-sequences/{sequence_id}/order")
+    def reorder_video_sequence(sequence_id: str, payload: VideoSequenceOrderInput) -> dict:
+        try:
+            return video_sequences.reorder(sequence_id, payload.segment_ids)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.delete("/api/video-sequences/{sequence_id}/segments/{segment_id}")
+    def delete_video_sequence_segment(sequence_id: str, segment_id: str) -> dict:
+        try:
+            return video_sequences.remove_segment(sequence_id, segment_id)
+        except KeyError as error:
+            raise missing(error) from error
+
+    @app.post("/api/video-sequences/{sequence_id}/join")
+    def join_video_sequence(sequence_id: str, payload: VideoSequenceJoinInput) -> dict:
+        try:
+            return video_sequences.join(sequence_id, payload.segment_ids)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/api/training/profiles")
     def training_profiles() -> dict:
@@ -598,11 +661,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/training/images/{image_id}/{variant}")
     def training_image_media(image_id: str, variant: str) -> FileResponse:
-        try:
-            path = training.dataset_media(image_id, variant)
-        except KeyError as error:
-            raise missing(error) from error
-        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "image/png")
+        return media_response(
+            "training-image", image_id, "original" if variant == "image" else variant
+        )
 
     @app.get("/api/training/runs")
     def list_training_runs() -> list[dict]:
@@ -640,6 +701,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
+    @app.post("/api/training/runs/{run_id}/retry", status_code=202)
+    def retry_training_run(run_id: str) -> dict:
+        try:
+            return training.retry_run(run_id)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/training/runs/{run_id}/failure-details")
+    def training_failure_details(run_id: str) -> dict:
+        try:
+            return training.failure_details(run_id)
+        except KeyError as error:
+            raise missing(error) from error
+
     @app.post("/api/training/runs/{run_id}/checkpoints/{checkpoint_id}/select")
     def select_training_checkpoint(run_id: str, checkpoint_id: str) -> dict:
         try:
@@ -658,11 +735,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/training/checkpoints/{checkpoint_id}/validation")
     def training_validation_sample(checkpoint_id: str) -> FileResponse:
+        return media_response("training-validation", checkpoint_id, "sample")
+
+    @app.get("/api/media/{entity_type}/{entity_id}/{variant}")
+    def authenticated_media(entity_type: str, entity_id: str, variant: str) -> FileResponse:
+        return media_response(entity_type, entity_id, variant)
+
+    @app.get("/api/native-media/{entity_type}/{entity_id}/{variant}")
+    def native_media_location(
+        entity_type: str,
+        entity_id: str,
+        variant: str,
+        desktop_capability: str | None = Header(default=None, alias="X-Vanta-Desktop-Capability"),
+    ) -> dict:
+        if (
+            not settings.desktop_capability
+            or not desktop_capability
+            or not hmac.compare_digest(settings.desktop_capability, desktop_capability)
+        ):
+            raise HTTPException(status_code=403, detail="Native media access is unavailable")
         try:
-            path = training.validation_media(checkpoint_id)
-        except KeyError as error:
-            raise missing(error) from error
-        return FileResponse(path, media_type="image/png")
+            item = media.resolve(entity_type, entity_id, variant)
+        except MediaAccessError as error:
+            raise HTTPException(
+                status_code=error.status,
+                detail={"code": error.code, "message": error.message},
+            ) from error
+        return {"path": str(item.path), "mime_type": item.mime_type}
+
+    @app.post("/api/media/repair")
+    def repair_all_media() -> dict:
+        return media.repair()
 
     @app.post("/api/generations", status_code=202)
     def create_generation(payload: GenerationInput) -> dict:
@@ -706,21 +809,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return json.loads(row["metadata"]).get("request", {})
 
     def generation_media(generation_id: str, variant: str) -> FileResponse:
-        if variant == "mask":
-            row = db.query_one("SELECT metadata FROM generations WHERE id=?", (generation_id,))
-            metadata = json.loads(row["metadata"]) if row else {}
-            path = Path((metadata.get("inpaint") or {}).get("mask_path") or "")
-            if not path.is_file() or path.parent.resolve() != settings.inpaint_root.resolve():
-                raise HTTPException(status_code=404, detail="Generated mask file was not found")
-            return FileResponse(path, media_type="image/png")
-        if variant not in {"image", "thumbnail"}:
+        row = db.query_one("SELECT media_type FROM generations WHERE id=?", (generation_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Generation was not found")
+        typed_variant = {
+            "image": "video" if row.get("media_type") == "video" else "original",
+            "thumbnail": "poster" if row.get("media_type") == "video" else "thumbnail",
+            "mask": "mask",
+        }.get(variant)
+        if typed_variant is None:
             raise HTTPException(status_code=404, detail="Generated media variant was not found")
-        column = "image_path" if variant == "image" else "thumbnail_path"
-        row = db.query_one(f"SELECT {column} FROM generations WHERE id=?", (generation_id,))
-        path = Path(row.get(column) or "") if row else Path()
-        if not row or not path.is_file():
-            raise HTTPException(status_code=404, detail=f"Generated {variant} file was not found")
-        return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "image/png")
+        return media_response("generation", generation_id, typed_variant)
 
     @app.get("/api/generations/{generation_id}/image")
     def generation_image(generation_id: str) -> FileResponse:

@@ -200,10 +200,42 @@ class VideoGenerationInput(StrictModel):
         max_length=4000,
     )
     profile: Literal["safe", "balanced", "quality"] = "safe"
-    duration_seconds: Literal[2, 3, 4] = 2
+    duration_profile: Literal["safe", "standard", "extended", "custom"] = "custom"
+    duration_seconds: int = Field(default=2, ge=2, le=8)
     seed: int = Field(ge=0, le=2**63 - 1)
     motion_asset_id: str | None = None
     motion_strength: float = Field(default=0.65, ge=0, le=1)
+
+
+class VideoSequenceInput(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    source_generation_id: str = Field(min_length=1)
+
+
+class VideoSequenceSegmentInput(StrictModel):
+    source_generation_id: str | None = None
+    motion_prompt: str = Field(min_length=1, max_length=4000)
+    negative_prompt: str = Field(
+        default="text, watermark, logo, identity change, face distortion", max_length=4000
+    )
+    profile: Literal["safe", "balanced", "quality"] = "safe"
+    duration_profile: Literal["safe", "standard", "extended", "custom"] = "safe"
+    duration_seconds: int = Field(default=2, ge=2, le=8)
+    seed: int = Field(ge=0, le=2**63 - 1)
+    motion_asset_id: str | None = None
+    motion_strength: float = Field(default=0.65, ge=0, le=1)
+
+
+class VideoSequenceOrderInput(StrictModel):
+    segment_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class VideoSequenceJoinInput(StrictModel):
+    segment_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class VideoContinuationFrameInput(StrictModel):
+    timestamp_seconds: float = Field(ge=0, le=120)
 
 
 class MotionImportInput(StrictModel):

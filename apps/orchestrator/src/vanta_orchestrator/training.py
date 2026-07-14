@@ -10,6 +10,7 @@ import subprocess
 import threading
 import uuid
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,44 @@ TRAINING_PROFILES: dict[str, dict[str, Any]] = {
 def _safe_error(error: object) -> str:
     message = " ".join(str(error).replace("\r", " ").replace("\n", " ").split())
     return message[:1000] or "The local training operation failed"
+
+
+def _failure_guidance(message: str | None) -> dict[str, str]:
+    normalized = (message or "").lower()
+    if "out of memory" in normalized or "cuda oom" in normalized:
+        return {
+            "category": "out_of_memory",
+            "title": "The GPU ran out of memory",
+            "explanation": "Training stopped before it could safely continue. Existing checkpoints remain available.",
+            "recommended_recovery": "Retry with Safe 12 GB, or resume a saved state with the same profile.",
+        }
+    if "base model" in normalized or ("model" in normalized and "unavailable" in normalized):
+        return {
+            "category": "model_unavailable",
+            "title": "The base model is unavailable",
+            "explanation": "The verified local model used by this dataset could not be opened.",
+            "recommended_recovery": "Verify the dataset model in Models & Engine, then retry.",
+        }
+    if "desktop closed" in normalized or "interrupted" in normalized:
+        return {
+            "category": "interrupted",
+            "title": "Training was interrupted",
+            "explanation": "Vanta recovered the run history after the local process stopped.",
+            "recommended_recovery": "Resume the last saved state when available, or retry from the beginning.",
+        }
+    if "dataset" in normalized or "caption" in normalized or "image" in normalized:
+        return {
+            "category": "dataset_invalid",
+            "title": "The dataset needs attention",
+            "explanation": "One or more owned training images or captions could not be prepared.",
+            "recommended_recovery": "Review dataset warnings and captions, then retry.",
+        }
+    return {
+        "category": "trainer_failed",
+        "title": "Local training could not finish",
+        "explanation": "The trainer stopped, but the dataset, run history, and completed checkpoints were preserved.",
+        "recommended_recovery": "Open technical details, verify the trainer, then resume or retry.",
+    }
 
 
 def _average_hash(image: Image.Image) -> str:
@@ -1171,13 +1210,54 @@ class TrainingService:
         row["parameters"] = json.loads(row["parameters"])
         row["estimates"] = json.loads(row["estimates"])
         row["cancellation_requested"] = bool(row["cancellation_requested"])
+        row["elapsed_seconds"] = 0
+        if row.get("started_at"):
+            end = (
+                datetime.fromisoformat(row["completed_at"])
+                if row.get("completed_at")
+                else datetime.now(UTC)
+            )
+            row["elapsed_seconds"] = max(
+                0, round((end - datetime.fromisoformat(row["started_at"])).total_seconds())
+            )
         row["checkpoints"] = self.db.query_all(
             "SELECT * FROM training_checkpoints WHERE run_id=? ORDER BY epoch,created_at",
             (row["id"],),
         )
         for checkpoint in row["checkpoints"]:
             checkpoint["selected"] = bool(checkpoint["selected"])
+        row["failure"] = (
+            _failure_guidance(row.get("error_message")) if row.get("error_message") else None
+        )
         return row
+
+    def failure_details(self, run_id: str) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        log_path = self.settings.training_run_root / run_id / "training.log"
+        content = (
+            log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+        )
+        replacements = {
+            str(self.settings.data_dir): "<VANTA_DATA>",
+            str(self.settings.project_root): "<VANTA_APP>",
+            str(Path.home()): "<USER_HOME>",
+        }
+        for source, replacement in replacements.items():
+            if source:
+                content = content.replace(source, replacement).replace(
+                    source.replace("\\", "/"), replacement
+                )
+        content = re.sub(
+            r"(?i)(authorization|x-vanta-token|token)(\s*[:=]\s*)([^\s]+)",
+            r"\1\2<redacted>",
+            content,
+        )
+        return {
+            "run_id": run_id,
+            "failure": run.get("failure"),
+            "technical_details": content or "No trainer output was recorded for this run.",
+            "truncated": False,
+        }
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         run = self.get_run(run_id)
@@ -1215,6 +1295,20 @@ class TrainingService:
         self._run_threads[run_id] = thread
         thread.start()
         return self.get_run(run_id)
+
+    def retry_run(self, run_id: str) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        if run["status"] not in {"failed", "cancelled"}:
+            raise ValueError("Only failed or cancelled runs can be retried")
+        parameters = run.get("parameters") or {}
+        return self.start_run(
+            TrainingRunInput(
+                dataset_id=run["dataset_id"],
+                profile=run["profile"],
+                epochs=run["total_epochs"],
+                validation_prompt=str(parameters.get("validation_prompt") or ""),
+            )
+        )
 
     def select_checkpoint(self, run_id: str, checkpoint_id: str) -> dict[str, Any]:
         checkpoint = self.db.query_one(

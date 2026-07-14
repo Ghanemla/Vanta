@@ -30,6 +30,9 @@ def test_migrations_create_all_required_tables(client):
         "training_images",
         "training_runs",
         "training_checkpoints",
+        "media_assets",
+        "video_sequences",
+        "video_sequence_segments",
         "schema_migrations",
     }
     assert required.issubset(tables)

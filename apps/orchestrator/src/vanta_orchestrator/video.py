@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import threading
 import uuid
 from pathlib import Path
@@ -25,6 +26,14 @@ VIDEO_PROFILES: dict[str, dict[str, int]] = {
     "balanced": {"width": 576, "height": 768, "steps": 8, "fps": 24},
     "quality": {"width": 640, "height": 832, "steps": 8, "fps": 24},
 }
+
+
+def is_owned_path(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
 
 
 class LtxVideoWorkflowCompiler:
@@ -147,6 +156,498 @@ def encode_mp4(frame_paths: list[Path], destination: Path, fps: int) -> None:
                 writer.send(frame.convert("RGB").tobytes())
     finally:
         writer.close()
+
+
+def extract_last_frame(source: Path, destination: Path) -> Path:
+    reader = imageio_ffmpeg.read_frames(str(source), pix_fmt="rgb24")
+    try:
+        metadata = next(reader)
+        size = tuple(metadata["size"])
+        last: bytes | None = None
+        for frame in reader:
+            last = frame
+    finally:
+        reader.close()
+    if last is None:
+        raise ValueError("The video does not contain a continuation frame")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    Image.frombytes("RGB", size, last).save(destination, "PNG", optimize=True)
+    return destination
+
+
+def extract_frame(source: Path, destination: Path, timestamp_seconds: float) -> Path:
+    reader = imageio_ffmpeg.read_frames(
+        str(source), pix_fmt="rgb24", input_params=["-ss", str(timestamp_seconds)]
+    )
+    try:
+        metadata = next(reader)
+        size = tuple(metadata["size"])
+        frame = next(reader, None)
+    finally:
+        reader.close()
+    if frame is None:
+        raise ValueError("The selected continuation time is outside this video")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    Image.frombytes("RGB", size, frame).save(destination, "PNG", optimize=True)
+    return destination
+
+
+class VideoSequenceService:
+    def __init__(self, db: Database, settings: Settings, engine: Any, jobs: Any):
+        self.db, self.settings, self.engine, self.jobs = db, settings, engine, jobs
+
+    def duration_capabilities(self, quality_profile: str = "safe") -> dict[str, Any]:
+        if quality_profile not in VIDEO_PROFILES:
+            raise ValueError("Choose a supported video quality profile")
+        verified_setting = self.db.query_one(
+            "SELECT value FROM app_settings WHERE key='video_extended_verified'"
+        )
+        extended_verified = bool(
+            verified_setting
+            and verified_setting["value"].lower() == "true"
+            and self.engine.hardware.get("vram_gb", 0) >= 12
+        )
+        historical_rates: list[float] = []
+        for row in self.db.query_all(
+            "SELECT metadata FROM generations WHERE media_type='video' ORDER BY created_at DESC LIMIT 20"
+        ):
+            metadata = json.loads(row.get("metadata") or "{}")
+            duration = float(metadata.get("duration_seconds") or 0)
+            render = float(metadata.get("duration_render_seconds") or 0)
+            if duration > 0 and render > 0:
+                historical_rates.append(render / duration)
+        seconds_per_output_second = (
+            round(sum(historical_rates) / len(historical_rates), 1) if historical_rates else 150.0
+        )
+        quality = VIDEO_PROFILES[quality_profile]
+
+        def estimate(duration: int) -> dict[str, Any]:
+            frames = duration * quality["fps"] + 1
+            factor = {"safe": 1.0, "balanced": 1.2, "quality": 1.45}[quality_profile]
+            return {
+                "duration_seconds": duration,
+                "frame_count": frames,
+                "expected_generation_seconds": round(seconds_per_output_second * duration * factor),
+                "estimated_vram_gb": {"safe": 9.5, "balanced": 10.7, "quality": 11.8}[
+                    quality_profile
+                ],
+                "estimated_ram_gb": {"safe": 14, "balanced": 16, "quality": 20}[quality_profile],
+                "estimated_disk_mb": round(
+                    frames * quality["width"] * quality["height"] * 0.000018, 1
+                ),
+            }
+
+        return {
+            "quality_profile": quality_profile,
+            "hardware": self.engine.hardware,
+            "max_custom_seconds": 8 if extended_verified else 4,
+            "extended_verified": extended_verified,
+            "historical_samples": len(historical_rates),
+            "profiles": [
+                {
+                    "id": "safe",
+                    "name": "Safe",
+                    "verified": True,
+                    "enabled": True,
+                    **estimate(2),
+                },
+                {
+                    "id": "standard",
+                    "name": "Standard",
+                    "verified": True,
+                    "enabled": True,
+                    **estimate(4),
+                },
+                {
+                    "id": "extended",
+                    "name": "Extended",
+                    "verified": extended_verified,
+                    "enabled": extended_verified,
+                    "range_seconds": [6, 8],
+                    **estimate(6),
+                },
+            ],
+        }
+
+    def validate_duration(self, duration_profile: str, duration_seconds: int) -> None:
+        capabilities = self.duration_capabilities()
+        maximum = int(capabilities["max_custom_seconds"])
+        expected = {"safe": 2, "standard": 4}
+        if duration_profile in expected and duration_seconds != expected[duration_profile]:
+            raise ValueError(
+                f"{duration_profile.title()} video uses {expected[duration_profile]} seconds"
+            )
+        if duration_profile == "extended" and (
+            not capabilities["extended_verified"] or duration_seconds not in {6, 7, 8}
+        ):
+            raise ValueError("Extended video has not been verified safe on this hardware")
+        if duration_seconds > maximum:
+            raise ValueError(f"This hardware is currently limited to {maximum} seconds per pass")
+
+    def create(self, name: str, source_generation_id: str) -> dict[str, Any]:
+        source = self.db.query_one("SELECT * FROM generations WHERE id=?", (source_generation_id,))
+        if source is None:
+            raise KeyError(source_generation_id)
+        source_path = Path(source.get("image_path") or "")
+        if not source_path.is_file() or not is_owned_path(source_path, self.settings.media_root):
+            raise ValueError("The selected Gallery source is unavailable")
+        item_id, now = f"video-sequence-{uuid.uuid4().hex}", utc_now()
+        self.db.execute(
+            """INSERT INTO video_sequences(
+                id,name,source_generation_id,character_id,metadata,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                item_id,
+                name,
+                source_generation_id,
+                source.get("character_id"),
+                json.dumps({"disclosure": True, "workflow": "hardware-safe-segments-v1"}),
+                now,
+                now,
+            ),
+        )
+        return self.get(item_id)
+
+    def _sync(self, sequence_id: str) -> None:
+        for segment in self.db.query_all(
+            "SELECT * FROM video_sequence_segments WHERE sequence_id=?", (sequence_id,)
+        ):
+            if not segment.get("job_id"):
+                continue
+            job = self.db.query_one(
+                "SELECT status,result_generation_id,error_message FROM generation_jobs WHERE id=?",
+                (segment["job_id"],),
+            )
+            if not job:
+                continue
+            status = job["status"]
+            self.db.execute(
+                "UPDATE video_sequence_segments SET status=?,generation_id=COALESCE(?,generation_id),metadata=?,updated_at=? WHERE id=?",
+                (
+                    status,
+                    job.get("result_generation_id"),
+                    json.dumps({"job_id": segment["job_id"], "error": job.get("error_message")}),
+                    utc_now(),
+                    segment["id"],
+                ),
+            )
+        states = [
+            row["status"]
+            for row in self.db.query_all(
+                "SELECT status FROM video_sequence_segments WHERE sequence_id=?", (sequence_id,)
+            )
+        ]
+        sequence = self.db.query_one(
+            "SELECT final_generation_id FROM video_sequences WHERE id=?", (sequence_id,)
+        )
+        status = (
+            "joined"
+            if sequence and sequence.get("final_generation_id")
+            else "rendering"
+            if any(state not in {"completed", "failed", "cancelled"} for state in states)
+            else "failed"
+            if any(state == "failed" for state in states)
+            else "ready"
+            if states
+            else "draft"
+        )
+        self.db.execute(
+            "UPDATE video_sequences SET status=?,updated_at=? WHERE id=?",
+            (status, utc_now(), sequence_id),
+        )
+
+    def list(self) -> list[dict[str, Any]]:
+        rows = self.db.query_all("SELECT id FROM video_sequences ORDER BY created_at DESC")
+        return [self.get(row["id"]) for row in rows]
+
+    def get(self, sequence_id: str) -> dict[str, Any]:
+        sequence = self.db.query_one("SELECT * FROM video_sequences WHERE id=?", (sequence_id,))
+        if sequence is None:
+            raise KeyError(sequence_id)
+        self._sync(sequence_id)
+        sequence = self.db.query_one("SELECT * FROM video_sequences WHERE id=?", (sequence_id,))
+        assert sequence is not None
+        sequence["metadata"] = json.loads(sequence.get("metadata") or "{}")
+        sequence["segments"] = self.db.query_all(
+            "SELECT * FROM video_sequence_segments WHERE sequence_id=? ORDER BY position",
+            (sequence_id,),
+        )
+        for segment in sequence["segments"]:
+            segment["metadata"] = json.loads(segment.get("metadata") or "{}")
+        return sequence
+
+    def add_segment(self, sequence_id: str, payload: Any) -> dict[str, Any]:
+        sequence = self.get(sequence_id)
+        self.validate_duration(payload.duration_profile, payload.duration_seconds)
+        segments = sequence["segments"]
+        if segments and segments[-1]["status"] != "completed":
+            raise ValueError("Finish the previous segment before adding the next one")
+        source_id = payload.source_generation_id or (
+            segments[-1]["generation_id"] if segments else sequence["source_generation_id"]
+        )
+        source = self.db.query_one("SELECT image_path FROM generations WHERE id=?", (source_id,))
+        source_path = Path(source.get("image_path") or "") if source else Path()
+        if (
+            source is None
+            or not source_path.is_file()
+            or not is_owned_path(source_path, self.settings.media_root)
+        ):
+            raise ValueError("The selected continuation frame is unavailable")
+        request = {
+            **payload.model_dump(),
+            "source_generation_id": source_id,
+            "operation": "video",
+            "model_alias": VIDEO_MODEL_ALIAS,
+        }
+        job = self.jobs.queue(request)
+        item_id, now = f"video-segment-{uuid.uuid4().hex}", utc_now()
+        self.db.execute(
+            """INSERT INTO video_sequence_segments(
+                id,sequence_id,position,source_generation_id,job_id,motion_prompt,
+                negative_prompt,quality_profile,duration_profile,duration_seconds,seed,
+                motion_asset_id,motion_strength,status,metadata,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                item_id,
+                sequence_id,
+                len(segments),
+                source_id,
+                job["id"],
+                payload.motion_prompt,
+                payload.negative_prompt,
+                payload.profile,
+                payload.duration_profile,
+                payload.duration_seconds,
+                payload.seed,
+                payload.motion_asset_id,
+                payload.motion_strength,
+                job["status"],
+                json.dumps({"job_id": job["id"]}),
+                now,
+                now,
+            ),
+        )
+        return self.get(sequence_id)
+
+    def continuation_frame(self, generation_id: str, timestamp_seconds: float) -> dict[str, Any]:
+        source = self.db.query_one(
+            "SELECT * FROM generations WHERE id=? AND media_type='video'", (generation_id,)
+        )
+        source_path = Path(source.get("image_path") or "") if source else Path()
+        if (
+            source is None
+            or not source_path.is_file()
+            or not is_owned_path(source_path, self.settings.media_root)
+        ):
+            raise KeyError(generation_id)
+        metadata = json.loads(source.get("metadata") or "{}")
+        duration = float(metadata.get("duration_seconds") or 0)
+        if timestamp_seconds > duration:
+            raise ValueError("Choose a continuation time inside this video")
+        item_id = f"generation-{uuid.uuid4().hex}"
+        destination = self.settings.media_root / f"{item_id}.png"
+        thumbnail = self.settings.media_root / f"{item_id}.thumb.jpg"
+        extract_frame(source_path, destination, timestamp_seconds)
+        with Image.open(destination) as frame:
+            width, height = frame.size
+            frame.thumbnail((480, 480))
+            frame.convert("RGB").save(thumbnail, "JPEG", quality=88, optimize=True)
+        frame_metadata = {
+            "workflow_version": "video-selected-continuation-v1",
+            "operation": "video_continuation_frame",
+            "derivative_of": generation_id,
+            "timestamp_seconds": timestamp_seconds,
+            "disclosure": True,
+        }
+        self.db.execute(
+            """INSERT INTO generations(
+                id,character_id,image_path,thumbnail_path,prompt,negative_prompt,seed,
+                model_alias,width,height,metadata,created_at,media_type
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'image')""",
+            (
+                item_id,
+                source.get("character_id"),
+                str(destination),
+                str(thumbnail),
+                f"Selected continuation frame at {timestamp_seconds:.2f} seconds",
+                "",
+                source["seed"],
+                source["model_alias"],
+                width,
+                height,
+                json.dumps(frame_metadata),
+                utc_now(),
+            ),
+        )
+        return self.db.query_one("SELECT * FROM generations WHERE id=?", (item_id,)) or {}
+
+    def reorder(self, sequence_id: str, segment_ids: list[str]) -> dict[str, Any]:
+        current = self.db.query_all(
+            "SELECT id FROM video_sequence_segments WHERE sequence_id=? ORDER BY position",
+            (sequence_id,),
+        )
+        if {row["id"] for row in current} != set(segment_ids) or len(current) != len(segment_ids):
+            raise ValueError("Reorder must include every sequence segment exactly once")
+        with self.db.connect() as connection:
+            for position, segment_id in enumerate(segment_ids):
+                connection.execute(
+                    "UPDATE video_sequence_segments SET position=?,updated_at=? WHERE id=? AND sequence_id=?",
+                    (position + 10_000, utc_now(), segment_id, sequence_id),
+                )
+            connection.execute(
+                "UPDATE video_sequence_segments SET position=position-10000 WHERE sequence_id=?",
+                (sequence_id,),
+            )
+        return self.get(sequence_id)
+
+    def remove_segment(self, sequence_id: str, segment_id: str) -> dict[str, Any]:
+        segment = self.db.query_one(
+            "SELECT id FROM video_sequence_segments WHERE id=? AND sequence_id=?",
+            (segment_id, sequence_id),
+        )
+        if segment is None:
+            raise KeyError(segment_id)
+        self.db.execute("DELETE FROM video_sequence_segments WHERE id=?", (segment_id,))
+        rows = self.db.query_all(
+            "SELECT id FROM video_sequence_segments WHERE sequence_id=? ORDER BY position",
+            (sequence_id,),
+        )
+        for position, row in enumerate(rows):
+            self.db.execute(
+                "UPDATE video_sequence_segments SET position=? WHERE id=?", (position, row["id"])
+            )
+        return self.get(sequence_id)
+
+    def join(self, sequence_id: str, segment_ids: list[str]) -> dict[str, Any]:
+        sequence = self.get(sequence_id)
+        if len(set(segment_ids)) != len(segment_ids):
+            raise ValueError("Choose each sequence segment only once")
+        by_id = {segment["id"]: segment for segment in sequence["segments"]}
+        if any(segment_id not in by_id for segment_id in segment_ids):
+            raise ValueError("Choose segments from this sequence")
+        selected = [by_id[segment_id] for segment_id in segment_ids]
+        if any(
+            segment["status"] != "completed" or not segment["generation_id"] for segment in selected
+        ):
+            raise ValueError("Only completed segments can be joined")
+        generations = [
+            self.db.query_one("SELECT * FROM generations WHERE id=?", (segment["generation_id"],))
+            for segment in selected
+        ]
+        if any(item is None for item in generations):
+            raise ValueError("One or more selected video files are unavailable")
+        typed_generations = [item for item in generations if item is not None]
+        if len({(item["width"], item["height"]) for item in typed_generations}) != 1:
+            raise ValueError("Join segments rendered with the same quality profile")
+        paths = [Path(item["image_path"]) for item in typed_generations]
+        if not all(
+            path.is_file() and is_owned_path(path, self.settings.media_root) for path in paths
+        ):
+            raise ValueError("One or more selected video files are missing")
+        generation_id = f"generation-{uuid.uuid4().hex}"
+        destination = self.settings.media_root / f"{generation_id}.mp4"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        concat_file = self.settings.media_root / f"{generation_id}.concat.txt"
+        concat_file.write_text(
+            "\n".join(f"file '{str(path).replace(chr(39), chr(39) * 2)}'" for path in paths),
+            encoding="utf-8",
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    str(imageio_ffmpeg.get_ffmpeg_exe()),
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_file),
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(destination),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+        finally:
+            concat_file.unlink(missing_ok=True)
+        if completed.returncode or not destination.is_file():
+            raise RuntimeError("The local MP4 join could not finish")
+        first_meta = json.loads(typed_generations[0].get("metadata") or "{}")
+        last_meta = json.loads(typed_generations[-1].get("metadata") or "{}")
+        poster = self.settings.media_root / f"{generation_id}.thumb.jpg"
+        poster_source = Path(typed_generations[0].get("thumbnail_path") or "")
+        if not poster_source.is_file() or not is_owned_path(
+            poster_source, self.settings.media_root
+        ):
+            destination.unlink(missing_ok=True)
+            raise ValueError("The first selected segment poster is unavailable")
+        shutil.copy2(poster_source, poster)
+        continuation = self.settings.media_root / f"{generation_id}.last.png"
+        last_continuation = Path(last_meta.get("continuation_frame_path") or "")
+        if last_continuation.is_file() and is_owned_path(
+            last_continuation, self.settings.media_root
+        ):
+            shutil.copy2(last_continuation, continuation)
+        else:
+            extract_last_frame(destination, continuation)
+        duration = sum(
+            float(json.loads(item["metadata"]).get("duration_seconds") or 0)
+            for item in typed_generations
+        )
+        metadata = {
+            "workflow_version": "video-sequence-join-v1",
+            "operation": "video_sequence_join",
+            "media_type": "video",
+            "sequence_id": sequence_id,
+            "segment_ids": segment_ids,
+            "segment_generation_ids": [item["id"] for item in typed_generations],
+            "duration_seconds": duration,
+            "frame_count": sum(
+                int(json.loads(item["metadata"]).get("frame_count") or 0)
+                for item in typed_generations
+            ),
+            "fps": first_meta.get("fps", 24),
+            "continuation_frame_path": str(continuation),
+            "disclosure": True,
+        }
+        width, height = typed_generations[0]["width"], typed_generations[0]["height"]
+        self.db.execute(
+            """INSERT INTO generations(
+                id,character_id,image_path,thumbnail_path,prompt,negative_prompt,seed,
+                model_alias,width,height,metadata,created_at,media_type
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'video')""",
+            (
+                generation_id,
+                sequence.get("character_id"),
+                str(destination),
+                str(poster),
+                " · ".join(segment["motion_prompt"] for segment in selected),
+                "",
+                selected[0]["seed"],
+                VIDEO_MODEL_ALIAS,
+                width,
+                height,
+                json.dumps(metadata),
+                utc_now(),
+            ),
+        )
+        self.db.execute(
+            "UPDATE video_sequences SET status='joined',final_generation_id=?,metadata=?,updated_at=? WHERE id=?",
+            (
+                generation_id,
+                json.dumps({**sequence["metadata"], "joined_segment_ids": segment_ids}),
+                utc_now(),
+                sequence_id,
+            ),
+        )
+        return self.get(sequence_id)
 
 
 class MotionService:
