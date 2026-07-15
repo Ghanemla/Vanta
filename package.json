@@ -6,7 +6,7 @@
     "dev": "pnpm --filter @vanta/desktop dev",
     "tauri": "pnpm --filter @vanta/desktop tauri",
     "format": "prettier --write .",
-    "format:check": "prettier --check README.md package.json pnpm-workspace.yaml tsconfig.base.json eslint.config.mjs apps packages engine data scripts docs",
+    "format:check": "prettier --check README.md package.json pnpm-workspace.yaml tsconfig.base.json eslint.config.mjs apps/desktop packages engine data docs",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
