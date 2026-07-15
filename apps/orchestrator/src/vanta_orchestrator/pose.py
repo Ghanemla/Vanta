@@ -124,12 +124,10 @@ class PoseService:
             self._update_progress(pose_id, "starting", 12)
             layout = self.engine.runtime.installed_layout()
             if layout is None:
-                raise ValueError("Install the Local Generation Engine before extracting a pose")
+                raise ValueError("Install the Local Image Engine before extracting a pose")
             self.engine.runtime.start()
             if not self.engine.runtime.wait_healthy(timeout=45):
-                raise ValueError(
-                    "Start or repair the Local Generation Engine before extracting a pose"
-                )
+                raise ValueError("Start or repair the Local Image Engine before extracting a pose")
             nodes = self.engine.runtime._request_json("/object_info")
             if "DWPreprocessor" not in nodes:
                 raise ValueError("Install and verify Vanta Pose Control before extracting a pose")

@@ -14,14 +14,22 @@ use uuid::Uuid;
 
 const SIDECAR_FILE: &str = "vanta-orchestrator-x86_64-pc-windows-msvc.exe";
 const HEALTH_ATTEMPTS: u32 = 12;
+const ENGINE_ARCHIVE_BYTES: u64 = 2_086_299_430;
+const ENGINE_EXTRACTED_BYTES: u64 = 7_500_000_000;
+const REALVISXL_BYTES: u64 = 6_938_065_488;
+const TEMPORARY_VERIFICATION_BYTES: u64 = 2_147_483_648;
+const RECOMMENDED_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct ServiceInfo {
+    desktop_version: String,
     state: String,
     phase: String,
     base_url: Option<String>,
     launch_token: Option<String>,
     sidecar_path: Option<String>,
+    application_install_path: String,
+    bootstrap_config_path: String,
     application_data_path: String,
     database_path: String,
     logs_path: String,
@@ -54,6 +62,15 @@ struct StorageInfo {
     last_error: Option<String>,
     previous_root: Option<String>,
     default_export_folder: Option<String>,
+    storage_configured: bool,
+    selected_drive: String,
+    application_install_path: String,
+    engine_archive_bytes: u64,
+    engine_extracted_bytes: u64,
+    realvisxl_bytes: u64,
+    temporary_verification_bytes: u64,
+    recommended_reserve_bytes: u64,
+    required_free_bytes: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -108,6 +125,7 @@ struct RuntimeInner {
     port: Option<u16>,
     token: Option<String>,
     sidecar_path: Option<PathBuf>,
+    application_dir: PathBuf,
     data_dir: PathBuf,
     default_data_dir: PathBuf,
     bootstrap_path: PathBuf,
@@ -160,6 +178,7 @@ impl RuntimeManager {
         default_data_dir: PathBuf,
         bootstrap_path: PathBuf,
         logs_dir: PathBuf,
+        application_dir: PathBuf,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
@@ -168,6 +187,7 @@ impl RuntimeManager {
                 port: None,
                 token: None,
                 sidecar_path: None,
+                application_dir,
                 data_dir,
                 default_data_dir,
                 bootstrap_path,
@@ -188,6 +208,7 @@ impl RuntimeManager {
     fn snapshot(&self) -> ServiceInfo {
         let inner = self.inner.lock().expect("runtime state lock");
         ServiceInfo {
+            desktop_version: env!("CARGO_PKG_VERSION").into(),
             state: inner.state.clone(),
             phase: inner.phase.clone(),
             base_url: inner.port.map(|port| format!("http://127.0.0.1:{port}")),
@@ -198,6 +219,8 @@ impl RuntimeManager {
                 .sidecar_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            application_install_path: inner.application_dir.display().to_string(),
+            bootstrap_config_path: inner.bootstrap_path.display().to_string(),
             application_data_path: inner.data_dir.display().to_string(),
             database_path: inner.data_dir.join("vanta.db").display().to_string(),
             logs_path: inner.logs_dir.display().to_string(),
@@ -261,6 +284,27 @@ impl RuntimeManager {
             default_export_folder: read_bootstrap(&inner.bootstrap_path)
                 .default_export_folder
                 .map(|path| path.display().to_string()),
+            storage_configured: read_bootstrap(&inner.bootstrap_path)
+                .studio_data_root
+                .as_ref()
+                .is_some_and(|path| path == &inner.data_dir),
+            selected_drive: inner
+                .data_dir
+                .components()
+                .next()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            application_install_path: inner.application_dir.display().to_string(),
+            engine_archive_bytes: ENGINE_ARCHIVE_BYTES,
+            engine_extracted_bytes: ENGINE_EXTRACTED_BYTES,
+            realvisxl_bytes: REALVISXL_BYTES,
+            temporary_verification_bytes: TEMPORARY_VERIFICATION_BYTES,
+            recommended_reserve_bytes: RECOMMENDED_RESERVE_BYTES,
+            required_free_bytes: ENGINE_ARCHIVE_BYTES
+                + ENGINE_EXTRACTED_BYTES
+                + REALVISXL_BYTES
+                + TEMPORARY_VERIFICATION_BYTES
+                + RECOMMENDED_RESERVE_BYTES,
         }
     }
 }
@@ -312,7 +356,41 @@ fn write_bootstrap(path: &Path, root: &Path) -> Result<(), String> {
         .map_err(|error| format!("Unable to encode storage bootstrap: {error}"))?;
     fs::write(&temporary, content)
         .map_err(|error| format!("Unable to write storage bootstrap: {error}"))?;
-    fs::rename(&temporary, path)
+    replace_file_atomically(&temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let mut source_wide: Vec<u16> = source.as_os_str().encode_wide().collect();
+    let mut destination_wide: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    source_wide.push(0);
+    destination_wide.push(0);
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(format!(
+            "Unable to activate storage bootstrap: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| error.to_string())?;
+    }
+    fs::rename(source, destination)
         .map_err(|error| format!("Unable to activate storage bootstrap: {error}"))
 }
 
@@ -399,9 +477,16 @@ fn free_bytes(path: &Path) -> Result<u64, String> {
     }
 }
 
-fn validate_storage_destination(source: &Path, destination: &Path) -> Result<(), String> {
+fn validate_storage_destination(
+    source: &Path,
+    destination: &Path,
+    application_dir: &Path,
+) -> Result<(), String> {
     if !destination.is_absolute() || destination.to_string_lossy().starts_with("\\\\") {
         return Err("Choose a local absolute folder, not a network location".into());
+    }
+    if destination == source {
+        return Err("The selected folder is already the current Vanta storage root".into());
     }
     if destination.starts_with(source) || source.starts_with(destination) {
         return Err(
@@ -414,6 +499,19 @@ fn validate_storage_destination(source: &Path, destination: &Path) -> Result<(),
     let destination = destination
         .canonicalize()
         .unwrap_or_else(|_| destination.to_path_buf());
+    let application_dir = application_dir
+        .canonicalize()
+        .unwrap_or_else(|_| application_dir.to_path_buf());
+    if destination.starts_with(&application_dir) || application_dir.starts_with(&destination) {
+        let drive = application_dir
+            .components()
+            .next()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "another drive".into());
+        return Err(format!(
+            "The selected folder is inside Vanta's application installation. Choose a separate location such as {drive}\\VantaStudioData."
+        ));
+    }
     if source == destination || destination.starts_with(&source) || source.starts_with(&destination)
     {
         return Err(
@@ -430,6 +528,23 @@ fn validate_storage_destination(source: &Path, destination: &Path) -> Result<(),
         return Err("The destination already contains data or is redirected. Choose an empty local folder or adopt its existing target.".into());
     }
     Ok(())
+}
+
+fn has_meaningful_studio_data(root: &Path) -> bool {
+    for owned in ["engine", "media", "training"] {
+        let path = root.join(owned);
+        if path.exists()
+            && tree_totals(&path)
+                .map(|(files, _)| files > 0)
+                .unwrap_or(true)
+        {
+            return true;
+        }
+    }
+    root.join("vanta.db")
+        .metadata()
+        .map(|metadata| metadata.len() > 2 * 1024 * 1024)
+        .unwrap_or(false)
 }
 
 fn copy_storage_tree(
@@ -924,7 +1039,7 @@ fn start_storage_move(
     manager: State<'_, RuntimeManager>,
 ) -> Result<StorageInfo, String> {
     let destination = PathBuf::from(destination);
-    let source = {
+    let (source, application_dir) = {
         let mut inner = manager
             .inner
             .lock()
@@ -935,23 +1050,88 @@ fn start_storage_move(
         ) {
             return Err("A storage move is already in progress".into());
         }
-        validate_storage_destination(&inner.data_dir, &destination)?;
+        validate_storage_destination(&inner.data_dir, &destination, &inner.application_dir)?;
         fs::create_dir_all(&destination)
-            .map_err(|error| format!("Unable to create storage destination: {error}"))?;
+            .map_err(|error| format!("The selected drive or folder is unavailable: {error}"))?;
         let probe = destination.join(".vanta-write-test");
         fs::write(&probe, b"vanta")
-            .map_err(|error| format!("The destination is not writable: {error}"))?;
-        fs::remove_file(&probe).map_err(|error| error.to_string())?;
+            .map_err(|error| format!("The selected folder is not writable: {error}"))?;
+        fs::remove_file(&probe)
+            .map_err(|error| format!("The selected folder failed its delete test: {error}"))?;
+        let required = ENGINE_ARCHIVE_BYTES
+            + ENGINE_EXTRACTED_BYTES
+            + REALVISXL_BYTES
+            + TEMPORARY_VERIFICATION_BYTES
+            + RECOMMENDED_RESERVE_BYTES;
+        let available = free_bytes(&destination)?;
+        if available < required {
+            return Err(format!(
+                "Insufficient free space: Vanta needs {required} bytes for the engine, RealVisXL, verification, and reserve; {available} bytes are available."
+            ));
+        }
         inner.storage = StorageOperation {
-            state: "scanning".into(),
-            phase: "Scanning studio data before safe copy".into(),
+            state: "validating".into(),
+            phase: "Validating storage and bootstrap configuration".into(),
             destination: Some(destination.clone()),
             started_at: Some(Instant::now()),
             previous_root: Some(inner.data_dir.clone()),
             ..StorageOperation::default()
         };
-        inner.data_dir.clone()
+        (inner.data_dir.clone(), inner.application_dir.clone())
     };
+    let _ = application_dir;
+    if !has_meaningful_studio_data(&source) {
+        shutdown_sidecar(&manager);
+        let bootstrap = manager
+            .inner
+            .lock()
+            .map_err(|_| "Storage state is unavailable")?
+            .bootstrap_path
+            .clone();
+        if let Err(error) = write_bootstrap(&bootstrap, &destination) {
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            inner.storage.state = "failed".into();
+            inner.storage.phase = "Storage configuration failed".into();
+            inner.storage.last_error = Some(sanitize_error(&error));
+            let _ = launch_sidecar(app, &manager, true);
+            return Err(error);
+        }
+        {
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            inner.data_dir = destination.clone();
+            inner.logs_dir = destination.join("logs");
+            inner.storage.state = "switching".into();
+            inner.storage.phase = "Creating the new studio database and local directories".into();
+        }
+        if let Err(error) = launch_sidecar(app.clone(), &manager, true) {
+            let _ = write_bootstrap(&bootstrap, &source);
+            {
+                let mut inner = manager.inner.lock().expect("runtime state lock");
+                inner.data_dir = source.clone();
+                inner.logs_dir = source.join("logs");
+                inner.storage.state = "failed".into();
+                inner.storage.phase = "Original studio data remains active".into();
+                inner.storage.last_error = Some(sanitize_error(&error));
+            }
+            let _ = launch_sidecar(app, &manager, true);
+            return Err(format!(
+                "The selected storage was configured, but the local service could not create and verify its database: {}",
+                sanitize_error(error)
+            ));
+        }
+        {
+            let mut inner = manager.inner.lock().expect("runtime state lock");
+            inner.storage.state = "completed".into();
+            inner.storage.phase = "Storage configured and verified".into();
+            inner.storage.destination = Some(destination);
+        }
+        return Ok(manager.storage_snapshot());
+    }
+    {
+        let mut inner = manager.inner.lock().expect("runtime state lock");
+        inner.storage.state = "scanning".into();
+        inner.storage.phase = "Scanning existing studio data before safe copy".into();
+    }
     let manager_clone = RuntimeManager {
         inner: manager.inner.clone(),
     };
@@ -1017,7 +1197,7 @@ fn set_default_export_folder(
         serde_json::to_vec_pretty(&bootstrap).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    fs::rename(temporary, bootstrap_path).map_err(|error| error.to_string())?;
+    replace_file_atomically(&temporary, &bootstrap_path)?;
     Ok(manager.storage_snapshot())
 }
 
@@ -1027,7 +1207,16 @@ fn execute_storage_move(
     source: PathBuf,
     destination: PathBuf,
 ) {
+    let staging = destination.with_file_name(format!(
+        "{}.vanta-staging-{}",
+        destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        Uuid::new_v4()
+    ));
     let result = (|| -> Result<(), String> {
+        shutdown_sidecar(&manager);
         let (total_files, total_bytes) = tree_totals(&source)?;
         let free = free_bytes(&destination)?;
         if free < total_bytes {
@@ -1040,17 +1229,26 @@ fn execute_storage_move(
             inner.storage.total_files = total_files;
             inner.storage.total_bytes = total_bytes;
         }
-        shutdown_sidecar(&manager);
-        copy_storage_tree(&manager, &source, &destination)?;
-        let (copied_files, copied_bytes) = tree_totals(&destination)?;
+        if staging.exists() {
+            return Err("A conflicting storage staging folder already exists".into());
+        }
+        copy_storage_tree(&manager, &source, &staging)?;
+        let (copied_files, copied_bytes) = tree_totals(&staging)?;
         if copied_files != total_files || copied_bytes != total_bytes {
             return Err(
                 "Copied storage verification failed; the original location was preserved".into(),
             );
         }
-        if !destination.join("vanta.db").is_file() {
+        if !staging.join("vanta.db").is_file() {
             return Err("Copied storage is missing its SQLite database; the original location was preserved".into());
         }
+        if destination.exists() {
+            fs::remove_dir(&destination).map_err(|error| {
+                format!("Unable to activate the verified storage copy: {error}")
+            })?;
+        }
+        fs::rename(&staging, &destination)
+            .map_err(|error| format!("Unable to activate the verified storage copy: {error}"))?;
         {
             let mut inner = manager.inner.lock().expect("runtime state lock");
             inner.storage.state = "switching".into();
@@ -1086,6 +1284,9 @@ fn execute_storage_move(
         Ok(())
     })();
     if let Err(error) = result {
+        if staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
         shutdown_sidecar(&manager);
         let (previous, app_for_restart) = {
             let mut inner = manager.inner.lock().expect("runtime state lock");
@@ -1349,18 +1550,45 @@ fn process_is_running(_pid: u32) -> bool {
 pub fn run() {
     let builder = tauri::Builder::default()
         .setup(|app| {
-            let default_data_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("Unable to resolve Vanta application data: {error}"))?;
-            let bootstrap_dir = app
+            let default_data_dir = match std::env::var_os("VANTA_ACCEPTANCE_DEFAULT_DATA_DIR") {
+                Some(value) => {
+                    let path = PathBuf::from(value);
+                    if !path.is_absolute() {
+                        return Err(
+                            "VANTA_ACCEPTANCE_DEFAULT_DATA_DIR must be an absolute path".into()
+                        );
+                    }
+                    path
+                }
+                None => app.path().app_data_dir().map_err(|error| {
+                    format!("Unable to resolve Vanta application data: {error}")
+                })?,
+            };
+            let default_bootstrap_dir = app
                 .path()
                 .app_local_data_dir()
                 .map_err(|error| format!("Unable to resolve Vanta storage bootstrap: {error}"))?
                 .join("storage-bootstrap");
+            let bootstrap_dir = match std::env::var_os("VANTA_ACCEPTANCE_BOOTSTRAP_DIR") {
+                Some(value) => {
+                    let path = PathBuf::from(value);
+                    if !path.is_absolute() {
+                        return Err(
+                            "VANTA_ACCEPTANCE_BOOTSTRAP_DIR must be an absolute path".into()
+                        );
+                    }
+                    path
+                }
+                None => default_bootstrap_dir,
+            };
             let bootstrap_path = bootstrap_dir.join("studio-data.json");
             let data_dir = bootstrap_root(&default_data_dir, &bootstrap_path);
             let logs_dir = data_dir.join("logs");
+            let application_dir = std::env::current_exe()
+                .map_err(|error| format!("Unable to resolve the Vanta installation path: {error}"))?
+                .parent()
+                .ok_or_else(|| "The Vanta executable has no installation directory".to_string())?
+                .to_path_buf();
             fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
             fs::create_dir_all(&bootstrap_dir).map_err(|error| error.to_string())?;
             app.manage(acquire_desktop_lock(&bootstrap_dir)?);
@@ -1369,6 +1597,7 @@ pub fn run() {
                 default_data_dir,
                 bootstrap_path,
                 logs_dir,
+                application_dir,
             ));
             let manager = app.state::<RuntimeManager>();
             if let Err(error) = launch_sidecar(app.handle().clone(), &manager, false) {
@@ -1450,11 +1679,43 @@ mod tests {
     #[test]
     fn bootstrap_configuration_preserves_a_selected_storage_root() {
         let root = std::env::temp_dir().join(format!("vanta-storage-test-{}", Uuid::new_v4()));
-        let selected = root.join("F-drive-style-data");
+        let selected = root.join("arbitrary-drive-style-data");
         let bootstrap = root.join("bootstrap").join("studio-data.json");
         write_bootstrap(&bootstrap, &selected).expect("bootstrap writes atomically");
         assert_eq!(bootstrap_root(&root.join("default"), &bootstrap), selected);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_validation_accepts_arbitrary_local_drives_and_an_app_installed_elsewhere() {
+        let app = PathBuf::from(r"F:\Applications\Vanta");
+        for destination in [
+            PathBuf::from(r"C:\VantaStudioData"),
+            PathBuf::from(r"D:\VantaStudioData"),
+            PathBuf::from(r"E:\External\VantaStudioData"),
+            PathBuf::from(r"Z:\FutureDrive\VantaStudioData"),
+        ] {
+            assert!(validate_storage_destination(
+                &PathBuf::from(r"C:\Users\Example\AppData\Roaming\studio.vanta.desktop"),
+                &destination,
+                &app,
+            )
+            .is_ok());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_inside_application_directory_has_a_drive_specific_error() {
+        let error = validate_storage_destination(
+            &PathBuf::from(r"C:\Users\Example\VantaData"),
+            &PathBuf::from(r"F:\Applications\Vanta\StudioData"),
+            &PathBuf::from(r"F:\Applications\Vanta"),
+        )
+        .expect_err("application data nesting must be rejected");
+        assert!(error.contains(r"F:\VantaStudioData"));
+        assert!(!error.contains(r"C:\VantaStudioData"));
     }
 
     #[test]
@@ -1465,7 +1726,10 @@ mod tests {
         fs::write(source.join("vanta.db"), b"SQLite format 3\0").expect("database fixture");
         fs::write(source.join("media").join("frame.png"), b"pixels").expect("media fixture");
         assert_eq!(tree_totals(&source).expect("totals"), (2, 22));
-        assert!(validate_storage_destination(&source, &source.join("nested")).is_err());
+        assert!(
+            validate_storage_destination(&source, &source.join("nested"), &root.join("app"))
+                .is_err()
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

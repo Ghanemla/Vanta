@@ -4,7 +4,7 @@
   "components": [
     {
       "id": "workflow-runtime",
-      "display_name": "Image Workflow Engine",
+      "display_name": "Local Image Engine",
       "version": "0.27.0",
       "pinned_revision": "v0.27.0",
       "source": {

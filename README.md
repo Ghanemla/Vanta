@@ -8,9 +8,9 @@ Generation progress is persisted across navigation and restart with honest engin
 
 ## Install Vanta
 
-Download `Vanta_0.1.2_x64-setup.exe` from the GitHub Releases page and run it. No Python, Node.js, Rust, Git, Visual Studio, standalone ComfyUI, Ollama, or Vanta account is required for normal use.
+Download `Vanta_0.1.3_x64-setup.exe` from the GitHub Releases page and run it. No Python, Node.js, Rust, Git, Visual Studio, standalone ComfyUI, Ollama, or Vanta account is required for normal use.
 
-On first launch, choose an F: studio-data location such as `F:\VantaData`. Vanta then installs its hidden, loopback-only local image engine and offers the reviewed RealVisXL V5.0 fp16 starter checkpoint. Large engine/model files are managed downloads with verification and can be repaired from Models & Engine. The unsigned installer will show Windows’ unknown-publisher warning until a signing certificate is provided.
+On first launch, choose any suitable writable local storage folder with enough free space. Vanta then installs its hidden, loopback-only Local Image Engine and offers the reviewed RealVisXL V5.0 fp16 starter checkpoint. Large engine/model files use durable byte-backed jobs with pause, resume, cancellation, verification, and repair. The unsigned installer will show Windows’ unknown-publisher warning until a signing certificate is provided.
 
 ## Build from source
 
@@ -21,7 +21,7 @@ On first launch, choose an F: studio-data location such as `F:\VantaData`. Vanta
 - Visual Studio Build Tools 2022 with Desktop development with C++, MSVC v143, C++ CMake tools, and Windows 11 SDK
 - WebView2 Runtime (normally included with current Windows)
 
-GitHub CLI is needed only for release publishing. See [Windows development setup](docs/DEVELOPMENT_SETUP_WINDOWS.md) for a clean-PC walkthrough, F-drive cache locations, PowerShell recovery, sidecar packaging, and NSIS release steps.
+GitHub CLI is needed only for release publishing. See [Windows development setup](docs/DEVELOPMENT_SETUP_WINDOWS.md) for a clean-PC walkthrough, local cache guidance, PowerShell recovery, sidecar packaging, and NSIS release steps.
 
 ## First setup
 

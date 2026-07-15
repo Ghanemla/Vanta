@@ -82,6 +82,7 @@ import type {
   CharacterRecord,
   Diagnostics,
   EngineComponent,
+  InstallationJob,
   GenerationJob,
   GenerationRecord,
   LoraRecord,
@@ -116,6 +117,7 @@ type AppData = {
   packs: ModelPack[];
   loras: LoraRecord[];
   jobs: GenerationJob[];
+  installationJobs: InstallationJob[];
   poses: PoseRecord[];
   motion: MotionAsset[];
   trainingDatasets: TrainingDataset[];
@@ -216,6 +218,15 @@ function formatDuration(seconds: number | null | undefined): string {
   const minutes = Math.floor(seconds / 60);
   const remainder = Math.round(seconds % 60);
   return `${minutes}m ${remainder.toString().padStart(2, '0')}s`;
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === 'string' && error.trim()) return error;
+  if (error && typeof error === 'object' && 'message' in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return fallback;
 }
 
 function formatBytes(bytes: number): string {
@@ -330,6 +341,131 @@ function JobProgressPanel({
             Dismiss
           </Button>
         )}
+      </footer>
+    </section>
+  );
+}
+
+const activeInstallationStates = [
+  'queued',
+  'validating_storage',
+  'checking_storage',
+  'waiting_for_dependency',
+  'connecting',
+  'downloading',
+  'paused',
+  'verifying_download',
+  'extracting',
+  'installing',
+  'activating',
+  'verifying_installation',
+  'starting_service',
+  'health_checking',
+  'cancelling',
+  'removing',
+];
+
+function InstallationJobPanel({
+  job,
+  onAction,
+  onDiagnostics,
+}: {
+  job: InstallationJob;
+  onAction: (action: string) => void;
+  onDiagnostics: () => void;
+}) {
+  const active = activeInstallationStates.includes(job.state);
+  const determinate = Boolean(job.total_bytes && job.total_bytes > 0);
+  const percentage = determinate
+    ? Math.min(100, Math.floor((job.downloaded_bytes * 100) / (job.total_bytes ?? 1)))
+    : null;
+  return (
+    <section
+      className="job-progress-panel job-progress-panel--compact"
+      aria-label="Installation job"
+    >
+      <header>
+        <div>
+          <span className="eyebrow">Download &amp; setup</span>
+          <h2>{job.stage}</h2>
+        </div>
+        <StatusPill
+          tone={
+            ['failed', 'repair_needed'].includes(job.state)
+              ? 'danger'
+              : job.state === 'ready'
+                ? 'ready'
+                : 'warning'
+          }
+        >
+          {percentage == null ? (stateLabels[job.state] ?? job.state) : `${percentage}%`}
+        </StatusPill>
+      </header>
+      <p>{job.summary}</p>
+      <div
+        className={`progress ${determinate ? '' : 'progress--indeterminate'}`}
+        role="progressbar"
+        aria-valuemin={determinate ? 0 : undefined}
+        aria-valuemax={determinate ? 100 : undefined}
+        aria-valuenow={percentage ?? undefined}
+      >
+        <span style={determinate ? { width: `${percentage}%` } : undefined} />
+      </div>
+      <dl className="job-progress-metrics">
+        <div>
+          <dt>Transferred</dt>
+          <dd>
+            {formatBytes(job.downloaded_bytes)}
+            {job.total_bytes ? ` / ${formatBytes(job.total_bytes)}` : ''}
+          </dd>
+        </div>
+        <div>
+          <dt>Speed</dt>
+          <dd>
+            {job.speed_bytes_per_second ? `${formatBytes(job.speed_bytes_per_second)}/s` : '—'}
+          </dd>
+        </div>
+        <div>
+          <dt>Elapsed</dt>
+          <dd>{formatDuration(job.elapsed_seconds)}</dd>
+        </div>
+        <div>
+          <dt>ETA</dt>
+          <dd>{job.eta_seconds != null ? formatDuration(job.eta_seconds) : '—'}</dd>
+        </div>
+      </dl>
+      <div className="job-progress-context">
+        <span>
+          <strong>{job.component_id}</strong> · {job.operation}
+        </span>
+        <span title={job.destination ?? undefined}>{job.destination ?? 'Destination pending'}</span>
+        {job.partial_path && <span title={job.partial_path}>Partial: {job.partial_path}</span>}
+        {job.source && <span title={job.source}>Source: {job.source}</span>}
+        <span>Updated: {new Date(job.updated_at).toLocaleString()}</span>
+      </div>
+      {job.error_message && <p className="inline-error">{job.error_message}</p>}
+      <footer>
+        {['connecting', 'downloading'].includes(job.state) && (
+          <Button onClick={() => onAction('pause')}>Pause</Button>
+        )}
+        {job.state === 'paused' && <Button onClick={() => onAction('resume')}>Resume</Button>}
+        {active && job.state !== 'cancelling' && (
+          <Button variant="ghost" onClick={() => onAction('cancel')}>
+            Cancel
+          </Button>
+        )}
+        {['failed', 'cancelled', 'repair_needed'].includes(job.state) && (
+          <Button onClick={() => onAction('retry')}>Retry</Button>
+        )}
+        {job.state === 'repair_needed' && (
+          <Button onClick={() => onAction('repair')}>Repair</Button>
+        )}
+        <Button variant="ghost" onClick={() => void openLocalPath('logs')}>
+          Open logs
+        </Button>
+        <Button variant="ghost" onClick={onDiagnostics}>
+          Diagnostics
+        </Button>
       </footer>
     </section>
   );
@@ -512,6 +648,7 @@ export function App() {
         settings,
         loras,
         jobs,
+        installationJobs,
         poses,
         motion,
         trainingDatasets,
@@ -526,11 +663,13 @@ export function App() {
         api.get<SettingsRecord>('/settings'),
         api.get<LoraRecord[]>('/loras'),
         api.get<GenerationJob[]>('/jobs'),
+        api.get<InstallationJob[]>('/installation-jobs'),
         api.get<PoseRecord[]>('/poses'),
         api.get<MotionAsset[]>('/motion-assets'),
         api.get<TrainingDataset[]>('/training/datasets'),
         api.get<TrainingRun[]>('/training/runs'),
       ]);
+      setError('');
       setData({
         characters,
         presets,
@@ -542,6 +681,7 @@ export function App() {
         settings,
         loras,
         jobs,
+        installationJobs,
         poses,
         motion,
         trainingDatasets,
@@ -587,11 +727,26 @@ export function App() {
     const timer = window.setInterval(() => {
       void Promise.all([
         api.get<GenerationJob[]>('/jobs'),
+        api.get<InstallationJob[]>('/installation-jobs'),
+        api.get<EngineComponent[]>('/engine/components'),
+        api.get<{ hardware: AppData['hardware']; packs: ModelPack[] }>('/engine/model-packs'),
         api.get<TrainingRun[]>('/training/runs'),
-      ]).then(([jobs, trainingRuns]) => {
-        setData((current) => (current ? { ...current, jobs, trainingRuns } : current));
+      ]).then(([jobs, installationJobs, components, modelResponse, trainingRuns]) => {
+        setData((current) =>
+          current
+            ? {
+                ...current,
+                jobs,
+                installationJobs,
+                components,
+                packs: modelResponse.packs,
+                hardware: modelResponse.hardware,
+                trainingRuns,
+              }
+            : current,
+        );
       });
-    }, 1100);
+    }, 900);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -710,19 +865,26 @@ export function App() {
         <main id="main-content" tabIndex={-1}>
           {data && (
             <button
-              className={`jobs-button ${data.jobs.some(isActiveJob) ? 'jobs-button--active' : ''}`}
+              className={`jobs-button ${
+                data.jobs.some(isActiveJob) ||
+                data.installationJobs.some((job) =>
+                  [...activeInstallationStates, 'failed', 'repair_needed'].includes(job.state),
+                )
+                  ? 'jobs-button--active'
+                  : ''
+              }`}
               onClick={() => setShowJobs(true)}
             >
               <Zap /> Jobs
-              {data.jobs.some(
-                (job) => !['completed', 'failed', 'cancelled'].includes(job.status),
-              ) && (
+              {(data.jobs.some(isActiveJob) ||
+                data.installationJobs.some((job) =>
+                  [...activeInstallationStates, 'failed', 'repair_needed'].includes(job.state),
+                )) && (
                 <span>
-                  {
-                    data.jobs.filter(
-                      (job) => !['completed', 'failed', 'cancelled'].includes(job.status),
-                    ).length
-                  }
+                  {data.jobs.filter(isActiveJob).length +
+                    data.installationJobs.filter((job) =>
+                      [...activeInstallationStates, 'failed', 'repair_needed'].includes(job.state),
+                    ).length}
                 </span>
               )}
             </button>
@@ -789,12 +951,17 @@ export function App() {
           )}
           {!loading && data && (
             <>
-              {!engineReady && (
+              {data.settings.values.setup_completed !== 'true' && (
                 <SetupWizard
                   data={data}
                   refresh={load}
                   notify={notify}
                   goEngine={() => navigate('engine')}
+                  goCreate={() => navigate('create')}
+                  onDiagnostics={() => {
+                    setDiagnosticsRequest((value) => value + 1);
+                    navigate('engine');
+                  }}
                 />
               )}
               {screen === 'create' && (
@@ -925,6 +1092,28 @@ export function App() {
         </main>
         <Drawer open={showJobs} title="Local jobs" onClose={() => setShowJobs(false)}>
           <div className="metadata-drawer">
+            <span className="eyebrow">Downloads &amp; setup</span>
+            {data?.installationJobs.length ? (
+              data.installationJobs.map((job) => (
+                <InstallationJobPanel
+                  key={job.id}
+                  job={job}
+                  onAction={(action) => {
+                    void api
+                      .post<InstallationJob>(`/installation-jobs/${job.id}/${action}`)
+                      .then(() => load());
+                  }}
+                  onDiagnostics={() => {
+                    setShowJobs(false);
+                    setDiagnosticsRequest((value) => value + 1);
+                    navigate('engine');
+                  }}
+                />
+              ))
+            ) : (
+              <p>No setup or download jobs yet.</p>
+            )}
+            <span className="eyebrow">Generations</span>
             {data?.jobs.length ? (
               data.jobs.map((job) => (
                 <JobProgressPanel
@@ -958,8 +1147,8 @@ export function App() {
               ))
             ) : (
               <EmptyState
-                title="No local jobs"
-                body="Generation activity will stay here while you work elsewhere."
+                title="No generation jobs"
+                body="Generation activity appears here separately from setup downloads."
               />
             )}
           </div>
@@ -980,11 +1169,15 @@ function SetupWizard({
   refresh,
   notify,
   goEngine,
+  goCreate,
+  onDiagnostics,
 }: {
   data: AppData;
   refresh: () => Promise<void>;
   notify: (message: string) => void;
   goEngine: () => void;
+  goCreate: () => void;
+  onDiagnostics: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -995,24 +1188,34 @@ function SetupWizard({
     data.packs.find((item) => item.alias === 'photoreal_balanced');
   const engineReady = runtime?.state === 'ready';
   const modelReady = Boolean(model?.installed && model.verified);
-  const storageSelected = Boolean(storage?.current_root.match(/^[Ff]:\\/));
+  const activeSetupJob = !engineReady ? runtime?.installation_job : model?.installation_job;
+  const storageSelected = Boolean(storage?.storage_configured);
   useEffect(() => {
     void getStorageInfo()
       .then(setStorage)
       .catch(() => setStorage(null));
   }, []);
+  useEffect(() => {
+    if (!storage || !['validating', 'scanning', 'copying', 'switching'].includes(storage.operation))
+      return;
+    const timer = window.setInterval(() => void getStorageInfo().then(setStorage), 700);
+    return () => window.clearInterval(timer);
+  }, [storage]);
   const chooseStudioStorage = async () => {
     const destination = await chooseStorageLocation();
     if (!destination) return;
     setBusy(true);
     setError('');
     try {
-      setStorage(await startStorageMove(destination));
-      notify('Vanta is moving its studio data before any large downloads.');
+      const selected = await startStorageMove(destination);
+      setStorage(selected);
+      if (selected.operation === 'completed') {
+        await getLocalServiceInfo();
+        await refresh();
+      }
+      notify('Vanta is validating and configuring the selected studio storage.');
     } catch (caught) {
-      setError(
-        caught instanceof Error ? caught.message : 'Vanta could not select that storage location.',
-      );
+      setError(errorMessage(caught, 'Vanta could not select that storage location.'));
     } finally {
       setBusy(false);
     }
@@ -1020,7 +1223,9 @@ function SetupWizard({
   const installEngine = async () => {
     if (!runtime) return;
     if (!storageSelected) {
-      setError('Choose an F: studio-data location before downloading the local image engine.');
+      setError(
+        'Choose where Vanta stores models and generated media before installing the engine.',
+      );
       return;
     }
     setBusy(true);
@@ -1033,7 +1238,6 @@ function SetupWizard({
             ? 'start'
             : 'install';
       await api.post(`/engine/components/${runtime.id}/${action}`);
-      await api.put('/settings/setup_step', { value: 'engine' });
       notify(action === 'start' ? 'Starting the local image engine' : 'Local engine setup started');
       await refresh();
     } catch (caught) {
@@ -1052,23 +1256,26 @@ function SetupWizard({
     setError('');
     try {
       await api.post(`/engine/model-packs/${model.id}/install`);
-      await api.put('/settings/setup_step', { value: 'model_verified' });
       notify('RealVisXL download started; Vanta verifies it before it becomes available.');
       await refresh();
     } catch (caught) {
-      setError(
-        caught instanceof Error ? caught.message : 'Vanta could not verify this local model.',
-      );
+      setError(errorMessage(caught, 'Vanta could not verify this local model.'));
     } finally {
       setBusy(false);
     }
   };
   useEffect(() => {
-    if (engineReady && modelReady && data.settings.values.setup_completed !== 'true') {
+    if (
+      engineReady &&
+      modelReady &&
+      data.gallery.length > 0 &&
+      data.settings.values.setup_completed !== 'true'
+    ) {
       void api.put('/settings/setup_completed', { value: 'true' });
     }
-  }, [data.settings.values.setup_completed, engineReady, modelReady]);
-  const step = modelReady ? 5 : engineReady ? 4 : storageSelected ? 3 : 2;
+  }, [data.gallery.length, data.settings.values.setup_completed, engineReady, modelReady]);
+  const step =
+    data.gallery.length > 0 ? 8 : modelReady ? 7 : engineReady ? 5 : storageSelected ? 4 : 3;
   return (
     <section className="setup-wizard" aria-labelledby="setup-title">
       <div className="setup-wizard__intro">
@@ -1090,14 +1297,26 @@ function SetupWizard({
             'Choose storage',
             storageSelected
               ? `${storage?.current_root} selected for large Vanta files.`
-              : 'Choose an F: location before large downloads.',
+              : 'Choose where Vanta stores models and generated media.',
           ],
-          ['Prepare local engine', runtime?.last_health_message ?? 'Checking engine status'],
+          ['Local Image Engine', runtime?.last_health_message ?? 'Checking engine status'],
           [
             'Starter model',
             modelReady
               ? 'Verified local SDXL model and diagnostic generation complete.'
               : 'RealVisXL V5.0 fp16 is downloaded only after confirmation.',
+          ],
+          [
+            'Verification',
+            modelReady
+              ? 'Engine health, model structure, hash, and diagnostic generation passed.'
+              : 'Vanta verifies real files and runtime health before enabling Create.',
+          ],
+          [
+            'First image',
+            data.gallery.length > 0
+              ? 'Your first local image is preserved in Gallery.'
+              : 'Create one image after verification to complete setup.',
           ],
         ].map(([title, detail], index) => (
           <li
@@ -1120,7 +1339,7 @@ function SetupWizard({
       <div className="setup-wizard__actions">
         {!storageSelected ? (
           <Button variant="primary" onClick={() => void chooseStudioStorage()} disabled={busy}>
-            <FolderLock /> {busy ? 'Selecting storage…' : 'Choose F: storage'}
+            <FolderLock /> {busy ? 'Selecting storage…' : 'Choose storage location'}
           </Button>
         ) : !engineReady ? (
           <Button
@@ -1130,12 +1349,12 @@ function SetupWizard({
           >
             <Download />
             {runtime?.state === 'installing'
-              ? `Installing ${runtime.progress}%`
+              ? 'Installing Local Image Engine'
               : runtime?.state === 'stopped'
                 ? 'Start local engine'
                 : runtime?.state === 'repair_needed'
-                  ? 'Repair local engine'
-                  : 'Install local engine'}
+                  ? 'Repair Local Image Engine'
+                  : 'Install Local Image Engine'}
           </Button>
         ) : !modelReady ? (
           <Button
@@ -1145,23 +1364,67 @@ function SetupWizard({
           >
             <Download />
             {model?.state === 'installing'
-              ? `Downloading RealVisXL ${model.progress}%`
+              ? 'Downloading RealVisXL V5.0'
               : 'Download RealVisXL V5.0'}
           </Button>
         ) : (
-          <Button variant="primary" onClick={goEngine}>
-            <Check /> Studio ready
+          <Button variant="primary" onClick={data.gallery.length > 0 ? goEngine : goCreate}>
+            {data.gallery.length > 0 ? <Check /> : <Sparkles />}
+            {data.gallery.length > 0 ? 'Studio ready' : 'Create first image'}
           </Button>
         )}
         <Button variant="ghost" onClick={goEngine}>
           View technical details
         </Button>
+        <Button variant="ghost" onClick={onDiagnostics}>
+          Diagnostics
+        </Button>
       </div>
+      {activeSetupJob && (
+        <InstallationJobPanel
+          job={activeSetupJob}
+          onAction={(action) => {
+            void api
+              .post<InstallationJob>(`/installation-jobs/${activeSetupJob.id}/${action}`)
+              .then(() => refresh())
+              .catch((caught) => setError(errorMessage(caught, 'The setup action failed.')));
+          }}
+          onDiagnostics={onDiagnostics}
+        />
+      )}
       <p className="setup-wizard__note">
         Local only: no Vanta account, cloud inference, standalone ComfyUI, or Ollama is required.
         {storage ? ` Storage: ${storage.current_root}.` : ''} The reviewed engine is about 2 GB;
         RealVisXL fp16 is 6.94 GB plus temporary verification space.
       </p>
+      {storage && (
+        <dl className="job-progress-metrics">
+          <div>
+            <dt>Available</dt>
+            <dd>{formatBytes(storage.destination_free_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Engine archive</dt>
+            <dd>{formatBytes(storage.engine_archive_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Extracted engine</dt>
+            <dd>{formatBytes(storage.engine_extracted_bytes)}</dd>
+          </div>
+          <div>
+            <dt>RealVisXL</dt>
+            <dd>{formatBytes(storage.realvisxl_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Verification space</dt>
+            <dd>{formatBytes(storage.temporary_verification_bytes)}</dd>
+          </div>
+          <div>
+            <dt>Recommended reserve</dt>
+            <dd>{formatBytes(storage.recommended_reserve_bytes)}</dd>
+          </div>
+        </dl>
+      )}
     </section>
   );
 }
@@ -1538,7 +1801,7 @@ function CreateScreen({
               <strong>Finish local setup to generate</strong>
               <small>
                 {runtime?.state !== 'ready'
-                  ? 'Install or repair the Local Generation Engine, then complete its health check.'
+                  ? 'Install or repair the Local Image Engine, then complete its health check.'
                   : 'Import and verify a compatible local checkpoint in Models & Engine.'}
               </small>
             </span>
@@ -6042,11 +6305,46 @@ function EngineScreen({
   diagnosticsRequest: number;
 }) {
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState('');
   const [busy, setBusy] = useState('');
+  const runtimeComponent = data.components.find((item) => item.id === 'workflow-runtime');
+  const selectedModel =
+    data.packs.find((item) => item.is_default) ??
+    data.packs.find((item) => item.alias === 'photoreal_balanced');
+  const loadDiagnostics = useCallback(async () => {
+    setDiagnosticsOpen(true);
+    setDiagnosticsLoading(true);
+    setDiagnosticsError('');
+    try {
+      const [backend, localService, storage] = await Promise.all([
+        api.get<Diagnostics>('/engine/diagnostics'),
+        getLocalServiceInfo(),
+        getStorageInfo(),
+      ]);
+      setDiagnostics({
+        ...backend,
+        system: {
+          ...backend.system,
+          desktop_version: localService.desktop_version,
+          application_install_path: localService.application_install_path,
+          sidecar_path: localService.sidecar_path,
+          current_storage_root: storage.current_root,
+          bootstrap_config_path: storage.bootstrap_config,
+          available_storage_bytes: storage.destination_free_bytes,
+        },
+      });
+    } catch (caught) {
+      setDiagnosticsError(errorMessage(caught, 'Diagnostics could not be loaded.'));
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  }, []);
   useEffect(() => {
     if (!diagnosticsRequest) return;
-    void api.get<Diagnostics>('/engine/diagnostics').then(setDiagnostics);
-  }, [diagnosticsRequest]);
+    void loadDiagnostics();
+  }, [diagnosticsRequest, loadDiagnostics]);
   const componentAction = async (item: EngineComponent, action: string) => {
     setBusy(item.id);
     try {
@@ -6065,6 +6363,16 @@ function EngineScreen({
       await refresh();
     } finally {
       setBusy('');
+    }
+  };
+  const runDiagnosticAction = async (operation: () => Promise<unknown>) => {
+    setDiagnosticsError('');
+    try {
+      await operation();
+      await refresh();
+      await loadDiagnostics();
+    } catch (caught) {
+      setDiagnosticsError(errorMessage(caught, 'The diagnostic recovery action failed.'));
     }
   };
   const importLocalModel = async (
@@ -6144,7 +6452,7 @@ function EngineScreen({
             <Button onClick={() => void importLocalLora()} disabled={busy === 'lora-import'}>
               <Plus /> Import LoRA
             </Button>
-            <Button onClick={async () => setDiagnostics(await api.get('/engine/diagnostics'))}>
+            <Button onClick={() => void loadDiagnostics()}>
               <Info /> Diagnostics
             </Button>
           </>
@@ -6244,7 +6552,7 @@ function EngineScreen({
                   </span>
                 ))}
               </div>
-              {item.state === 'installing' && (
+              {item.state === 'installing' && !item.installation_job && (
                 <div className="progress" aria-label={`${item.progress}% installed`}>
                   <span style={{ width: `${item.progress}%` }} />
                 </div>
@@ -6275,13 +6583,6 @@ function EngineScreen({
                           disabled={busy === item.id}
                         >
                           Restart
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          onClick={() => void componentAction(item, 'pause')}
-                          disabled={busy === item.id}
-                        >
-                          Pause
                         </Button>
                       </>
                     )}
@@ -6342,6 +6643,17 @@ function EngineScreen({
                   </Button>
                 )}
               </footer>
+              {item.installation_job && (
+                <InstallationJobPanel
+                  job={item.installation_job}
+                  onAction={(action) =>
+                    void runDiagnosticAction(() =>
+                      api.post(`/installation-jobs/${item.installation_job!.id}/${action}`),
+                    )
+                  }
+                  onDiagnostics={() => void loadDiagnostics()}
+                />
+              )}
             </Panel>
           ))}
         </div>
@@ -6395,23 +6707,34 @@ function EngineScreen({
                 </div>
               </div>
               <div className="model-actions">
-                {item.state === 'installing' && (
+                {item.state === 'installing' && !item.installation_job && (
                   <div className="progress">
                     <span style={{ width: `${item.progress}%` }} />
                   </div>
                 )}
                 {!item.installed &&
                   ['photoreal_balanced', 'preview_fast', 'photoreal_max'].includes(item.alias) && (
-                    <Button
-                      onClick={() =>
-                        void importLocalModel(
-                          item.alias as 'photoreal_balanced' | 'preview_fast' | 'photoreal_max',
-                        )
-                      }
-                      disabled={busy === 'model-import'}
-                    >
-                      <Upload /> Import local {item.alias === 'photoreal_max' ? 'FLUX' : 'model'}
-                    </Button>
+                    <>
+                      {item.alias === 'photoreal_balanced' && item.download?.url && (
+                        <Button
+                          variant="primary"
+                          onClick={() => void packAction(item, 'install')}
+                          disabled={busy === item.id}
+                        >
+                          <Download /> Download RealVisXL V5.0
+                        </Button>
+                      )}
+                      <Button
+                        onClick={() =>
+                          void importLocalModel(
+                            item.alias as 'photoreal_balanced' | 'preview_fast' | 'photoreal_max',
+                          )
+                        }
+                        disabled={busy === 'model-import'}
+                      >
+                        <Upload /> Import local {item.alias === 'photoreal_max' ? 'FLUX' : 'model'}
+                      </Button>
+                    </>
                   )}
                 {!item.installed &&
                   !['photoreal_balanced', 'preview_fast', 'photoreal_max'].includes(item.alias) &&
@@ -6469,6 +6792,17 @@ function EngineScreen({
                   </Button>
                 )}
               </div>
+              {item.installation_job && (
+                <InstallationJobPanel
+                  job={item.installation_job}
+                  onAction={(action) =>
+                    void runDiagnosticAction(() =>
+                      api.post(`/installation-jobs/${item.installation_job!.id}/${action}`),
+                    )
+                  }
+                  onDiagnostics={() => void loadDiagnostics()}
+                />
+              )}
             </Panel>
           ))}
         </div>
@@ -6559,10 +6893,17 @@ function EngineScreen({
         )}
       </section>
       <Drawer
-        open={diagnostics !== null}
+        open={diagnosticsOpen}
         title="Local diagnostics"
-        onClose={() => setDiagnostics(null)}
+        onClose={() => setDiagnosticsOpen(false)}
       >
+        {diagnosticsLoading && <p role="status">Loading local diagnostics…</p>}
+        {diagnosticsError && (
+          <div className="failure-state" role="alert">
+            <p>{diagnosticsError}</p>
+            <Button onClick={() => void loadDiagnostics()}>Retry diagnostics</Button>
+          </div>
+        )}
         {diagnostics && (
           <div className="diagnostics">
             <div className="diagnostic-summary">
@@ -6583,9 +6924,76 @@ function EngineScreen({
             <Button onClick={() => void exportDiagnostics()}>
               <FileDown /> Export support bundle
             </Button>
+            <Button
+              onClick={() =>
+                void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2))
+              }
+            >
+              <Copy /> Copy diagnostics
+            </Button>
             <Button onClick={() => void openLocalPath('logs')}>
               <FolderLock /> Open logs
             </Button>
+            <Button
+              onClick={() =>
+                void restartLocalService()
+                  .then(() => loadDiagnostics())
+                  .catch((caught) =>
+                    setDiagnosticsError(errorMessage(caught, 'The local service did not restart.')),
+                  )
+              }
+            >
+              <RotateCcw /> Restart local service
+            </Button>
+            {runtimeComponent && (
+              <>
+                <Button
+                  onClick={() =>
+                    void runDiagnosticAction(() =>
+                      api.post(`/engine/components/${runtimeComponent.id}/verify`),
+                    )
+                  }
+                >
+                  Verify Local Image Engine
+                </Button>
+                <Button
+                  onClick={() =>
+                    void runDiagnosticAction(() =>
+                      api.post(`/engine/components/${runtimeComponent.id}/repair`),
+                    )
+                  }
+                >
+                  Repair Local Image Engine
+                </Button>
+              </>
+            )}
+            {selectedModel?.installed && (
+              <Button
+                onClick={() =>
+                  void runDiagnosticAction(() =>
+                    api.post(`/engine/model-packs/${selectedModel.id}/verify`),
+                  )
+                }
+              >
+                Verify model
+              </Button>
+            )}
+            {diagnostics.installation_jobs?.some((job) =>
+              ['failed', 'repair_needed', 'cancelled'].includes(job.state),
+            ) && (
+              <Button
+                onClick={() => {
+                  const job = diagnostics.installation_jobs?.find((item) =>
+                    ['failed', 'repair_needed', 'cancelled'].includes(item.state),
+                  );
+                  if (job) {
+                    void runDiagnosticAction(() => api.post(`/installation-jobs/${job.id}/retry`));
+                  }
+                }}
+              >
+                Retry failed installation
+              </Button>
+            )}
             {diagnostics.system && (
               <dl className="runtime-diagnostics">
                 {Object.entries(diagnostics.system).map(([key, value]) => (
@@ -6595,6 +7003,42 @@ function EngineScreen({
                   </div>
                 ))}
               </dl>
+            )}
+            {diagnostics.installation_jobs && diagnostics.installation_jobs.length > 0 && (
+              <>
+                <h3>Installation jobs</h3>
+                {diagnostics.installation_jobs.map((job) => (
+                  <InstallationJobPanel
+                    key={job.id}
+                    job={job}
+                    onAction={(action) =>
+                      void runDiagnosticAction(() =>
+                        api.post(`/installation-jobs/${job.id}/${action}`),
+                      )
+                    }
+                    onDiagnostics={() => void loadDiagnostics()}
+                  />
+                ))}
+                {diagnostics.installation_jobs.some((job) =>
+                  ['failed', 'repair_needed', 'cancelled'].includes(job.state),
+                ) && (
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      const job = diagnostics.installation_jobs?.find((item) =>
+                        ['failed', 'repair_needed', 'cancelled'].includes(item.state),
+                      );
+                      if (job) {
+                        void runDiagnosticAction(() =>
+                          api.post(`/installation-jobs/${job.id}/reset`),
+                        );
+                      }
+                    }}
+                  >
+                    Reset stale failed state
+                  </Button>
+                )}
+              </>
             )}
           </div>
         )}

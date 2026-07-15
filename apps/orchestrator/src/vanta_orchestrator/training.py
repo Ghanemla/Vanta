@@ -19,6 +19,7 @@ from PIL import Image, ImageFilter, ImageStat
 from .comfy_runtime import ensure_safe_archive_members, sha256_file
 from .config import Settings
 from .database import Database, utc_now
+from .downloads import DownloadCancelled
 from .engine import EngineService
 from .repositories import LoraRepository
 from .schemas import (
@@ -175,7 +176,7 @@ class TrainingService:
     def _python(self) -> Path:
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise ValueError("Install the Local Generation Engine before local training")
+            raise ValueError("Install the Local Image Engine before local training")
         return layout[1]
 
     def _component_progress(self, item_id: str, progress: int, message: str) -> None:
@@ -256,19 +257,114 @@ class TrainingService:
         if action in {"install", "repair"}:
             thread = self._component_threads.get(item_id)
             if thread is None or not thread.is_alive():
-                self._component_progress(item_id, 1, f"Preparing {item_id.replace('-', ' ')}")
+                manifest = (
+                    self._trainer_manifest if item_id == "lora-training" else self._caption_manifest
+                )
+                if item_id == "lora-training":
+                    total_bytes = int(manifest.source["bytes"])
+                    source = str(manifest.source["url"])
+                    destination = (
+                        self.settings.engine_root
+                        / "downloads"
+                        / f"sd-scripts-{manifest.pinned_revision}.zip"
+                    )
+                else:
+                    total_bytes = sum(
+                        int(manifest.source[key]["bytes"]) for key in ("model", "tags")
+                    )
+                    source = str(manifest.source["model"]["url"])
+                    destination = self.settings.captioning_root / str(
+                        manifest.source["model"]["filename"]
+                    )
+                job_id = self.engine.installation_jobs.start(
+                    item_id,
+                    action,
+                    source=source,
+                    destination=destination,
+                    partial_path=destination.with_suffix(destination.suffix + ".partial"),
+                    total_bytes=total_bytes,
+                    resumable=True,
+                )
+                self._component_progress(item_id, 0, f"Preparing {item_id.replace('-', ' ')}")
                 target = (
                     self._install_trainer if item_id == "lora-training" else self._install_captioner
                 )
-                thread = threading.Thread(target=target, daemon=True)
+                thread = threading.Thread(target=target, args=(job_id,), daemon=True)
                 self._component_threads[item_id] = thread
                 thread.start()
+        elif action == "pause":
+            job = self.engine.installation_jobs.current(item_id)
+            if not job:
+                raise ValueError("There is no active capability download to pause")
+            self.engine.installation_jobs.request_pause(str(job["id"]))
+        elif action == "resume":
+            job = self.engine.installation_jobs.current(item_id)
+            if not job:
+                raise ValueError("There is no capability installation to resume")
+            self.engine.installation_jobs.request_resume(str(job["id"]))
+            thread = self._component_threads.get(item_id)
+            if thread is None or not thread.is_alive():
+                target = (
+                    self._install_trainer if item_id == "lora-training" else self._install_captioner
+                )
+                thread = threading.Thread(target=target, args=(str(job["id"]),), daemon=True)
+                self._component_threads[item_id] = thread
+                thread.start()
+        elif action == "cancel":
+            job = self.engine.installation_jobs.current(item_id)
+            if not job:
+                raise ValueError("There is no active capability installation to cancel")
+            self.engine.installation_jobs.request_cancel(str(job["id"]))
         elif action == "health_check":
-            if item_id == "lora-training":
-                self._verify_trainer()
-            else:
-                self._verify_captioner()
+            job_id = self.engine.installation_jobs.start(
+                item_id,
+                "verify",
+                destination=(
+                    self.settings.trainer_runtime_root
+                    if item_id == "lora-training"
+                    else self.settings.captioning_root
+                ),
+            )
+            try:
+                self.engine.installation_jobs.update(
+                    job_id, "health_checking", "Health checking", "Verifying installed files"
+                )
+                evidence = (
+                    self._verify_trainer()
+                    if item_id == "lora-training"
+                    else self._verify_captioner()
+                )
+                self.engine.installation_jobs.update(
+                    job_id,
+                    "ready",
+                    "Verified",
+                    "Installed files and local health check are verified",
+                    health_check_result=json.dumps(evidence, sort_keys=True),
+                )
+            except Exception as error:
+                self.engine.installation_jobs.update(
+                    job_id,
+                    "repair_needed",
+                    "Repair needed",
+                    _safe_error(error),
+                    error_category="health_check_failed",
+                    error_message=_safe_error(error),
+                    technical_details=_safe_error(error),
+                )
+                raise
         elif action == "remove":
+            job_id = self.engine.installation_jobs.start(
+                item_id,
+                "remove",
+                destination=(
+                    self.settings.trainer_runtime_root
+                    if item_id == "lora-training"
+                    else self.settings.captioning_root
+                ),
+            )
+            self.engine.installation_jobs.update(
+                job_id, "removing", "Removing", "Removing only managed capability files"
+            )
             root = (
                 self.settings.trainer_runtime_root
                 if item_id == "lora-training"
@@ -279,9 +375,21 @@ class TrainingService:
             self._set_component(
                 item_id, "not_installed", f"{item_id.replace('-', ' ').title()} removed"
             )
+            self.engine.installation_jobs.update(
+                job_id, "removed", "Removed", "Managed capability files were removed"
+            )
         else:
             raise ValueError("Use Install, Verify, Repair, or Remove for this capability")
         return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
+
+    def installation_job_action(self, job_id: str, action: str) -> dict[str, Any]:
+        job = self.engine.installation_jobs.get(job_id)
+        item_id = str(job["component_id"])
+        if item_id not in {"lora-training", "captioning"}:
+            raise KeyError(item_id)
+        mapped = "repair" if action in {"retry", "repair"} else action
+        self.component_action(item_id, mapped)
+        return self.engine.installation_jobs.get(job_id)
 
     def _runner_environment(self) -> dict[str, str]:
         return {
@@ -357,11 +465,16 @@ class TrainingService:
             if result.returncode or not (destination / "vocab.json").is_file():
                 raise RuntimeError(result.stderr[-1200:] or "Tokenizer download failed")
 
-    def _install_trainer(self) -> None:
+    def _install_trainer(self, job_id: str) -> None:
         item_id, manifest = "lora-training", self._trainer_manifest
         try:
             self._python()
-            self._component_progress(item_id, 5, "Downloading pinned sd-scripts 0.10.5")
+            self.engine.installation_jobs.update(
+                job_id,
+                "connecting",
+                "Connecting",
+                "Connecting to the pinned sd-scripts archive",
+            )
             archive = self.engine._download_verified(
                 str(manifest.source["url"]),
                 self.settings.engine_root
@@ -369,9 +482,21 @@ class TrainingService:
                 / f"sd-scripts-{manifest.pinned_revision}.zip",
                 int(manifest.source["bytes"]),
                 str(manifest.source["sha256"]),
-                lambda value: self._component_progress(
-                    item_id, min(38, 5 + value // 3), "Downloading pinned sd-scripts 0.10.5"
+                lambda snapshot: self.engine._component_download_progress(
+                    item_id,
+                    job_id,
+                    snapshot,
+                    total_bytes=int(manifest.source["bytes"]),
                 ),
+                cancel_requested=lambda: self.engine.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.engine.installation_jobs.pause_requested(job_id),
+            )
+            self.engine.installation_jobs.update(
+                job_id,
+                "extracting",
+                "Extracting",
+                "Validating and extracting the pinned trainer archive",
+                downloaded_bytes=int(manifest.source["bytes"]),
             )
             extract_root = self.settings.trainer_runtime_root / "extract"
             shutil.rmtree(extract_root, ignore_errors=True)
@@ -384,11 +509,30 @@ class TrainingService:
                 raise RuntimeError("The trainer archive layout is invalid")
             shutil.copytree(candidates[0], self._trainer_source)
             shutil.rmtree(extract_root, ignore_errors=True)
-            self._component_progress(item_id, 42, "Installing isolated pinned trainer packages")
+            self.engine.installation_jobs.update(
+                job_id,
+                "installing",
+                "Installing dependencies",
+                "Installing isolated pinned trainer packages",
+            )
             self._install_packages(self._trainer_packages, list(manifest.source["packages"]))
-            self._component_progress(item_id, 82, "Installing pinned offline SDXL tokenizers")
+            if self.engine.installation_jobs.cancel_requested(job_id):
+                raise DownloadCancelled("Installation cancelled; downloaded files were preserved")
+            self.engine.installation_jobs.update(
+                job_id,
+                "installing",
+                "Installing tokenizers",
+                "Installing pinned offline SDXL tokenizers",
+            )
             self._install_trainer_tokenizers()
-            self._component_progress(item_id, 94, "Verifying CUDA trainer imports")
+            if self.engine.installation_jobs.cancel_requested(job_id):
+                raise DownloadCancelled("Installation cancelled; downloaded files were preserved")
+            self.engine.installation_jobs.update(
+                job_id,
+                "health_checking",
+                "Health checking",
+                "Verifying CUDA trainer imports",
+            )
             evidence = self._verify_trainer(write_state=False)
             (self.settings.trainer_runtime_root / "installation.json").write_text(
                 json.dumps(
@@ -406,9 +550,36 @@ class TrainingService:
             self._set_component(
                 item_id, "ready", "Pinned sd-scripts trainer and CUDA imports are verified"
             )
+            self.engine.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Pinned trainer files and CUDA health are verified",
+                verified_file_hash=str(manifest.source["sha256"]),
+                health_check_result=json.dumps(evidence, sort_keys=True),
+            )
+        except DownloadCancelled as error:
+            self._set_component(item_id, "not_installed", "Installation cancelled")
+            self.engine.installation_jobs.update(
+                job_id,
+                "cancelled",
+                "Cancelled",
+                "Installation cancelled; verified partial bytes were preserved",
+                cancellation_requested=True,
+                error_message=str(error),
+            )
         except Exception as error:
             logger.exception("managed trainer installation failed")
             self._set_component(item_id, "repair_needed", _safe_error(error))
+            self.engine.installation_jobs.update(
+                job_id,
+                "repair_needed",
+                "Repair needed",
+                _safe_error(error),
+                error_category="installation_failed",
+                error_message=_safe_error(error),
+                technical_details=_safe_error(error),
+            )
 
     def _verify_trainer(self, *, write_state: bool = True) -> dict[str, Any]:
         command = [
@@ -446,49 +617,59 @@ class TrainingService:
             )
         return evidence
 
-    def _install_captioner(self) -> None:
+    def _install_captioner(self, job_id: str) -> None:
         item_id, manifest = "captioning", self._caption_manifest
         try:
             self._python()
             root, source = self.settings.captioning_root, manifest.source
-            for index, key in enumerate(("model", "tags")):
+            total_bytes = sum(int(source[key]["bytes"]) for key in ("model", "tags"))
+            completed_bytes = 0
+            for key in ("model", "tags"):
                 asset = source[key]
-                self._component_progress(
-                    item_id, 5 + index * 70, f"Downloading verified caption {key}"
+                self.engine.installation_jobs.update(
+                    job_id,
+                    "connecting",
+                    "Connecting",
+                    f"Connecting to the verified caption {key}",
+                    downloaded_bytes=completed_bytes,
+                    total_bytes=total_bytes,
                 )
                 destination = root / str(asset["filename"])
-                try:
-                    self.engine._download_verified(
-                        str(asset["url"]),
-                        destination,
-                        int(asset["bytes"]),
-                        str(asset["sha256"]),
-                        lambda value, index=index, key=key: self._component_progress(
+                self.engine._download_verified(
+                    str(asset["url"]),
+                    destination,
+                    int(asset["bytes"]),
+                    str(asset["sha256"]),
+                    lambda snapshot, completed_bytes=completed_bytes: (
+                        self.engine._component_download_progress(
                             item_id,
-                            min(
-                                78,
-                                5 + index * 70 + round(value * (0.68 if index == 0 else 0.08)),
-                            ),
-                            f"Downloading verified caption {key}",
-                        ),
-                    )
-                except RuntimeError:
-                    self._download_huggingface_asset(
-                        str(asset["url"]),
-                        str(source["repository"]),
-                        str(asset["filename"]),
-                        manifest.pinned_revision,
-                        destination,
-                        int(asset["bytes"]),
-                        str(asset["sha256"]),
-                    )
-                    self._component_progress(
-                        item_id,
-                        72 if index == 0 else 80,
-                        f"Verified caption {key}",
-                    )
-            self._component_progress(item_id, 82, "Installing isolated ONNX Runtime")
+                            job_id,
+                            snapshot,
+                            completed_bytes=completed_bytes,
+                            total_bytes=total_bytes,
+                        )
+                    ),
+                    cancel_requested=lambda: self.engine.installation_jobs.cancel_requested(job_id),
+                    pause_requested=lambda: self.engine.installation_jobs.pause_requested(job_id),
+                )
+                completed_bytes += int(asset["bytes"])
+            self.engine.installation_jobs.update(
+                job_id,
+                "installing",
+                "Installing dependencies",
+                "Installing isolated ONNX Runtime",
+                downloaded_bytes=total_bytes,
+                total_bytes=total_bytes,
+            )
             self._install_packages(self._caption_packages, list(source["packages"]))
+            if self.engine.installation_jobs.cancel_requested(job_id):
+                raise DownloadCancelled("Installation cancelled; downloaded files were preserved")
+            self.engine.installation_jobs.update(
+                job_id,
+                "health_checking",
+                "Health checking",
+                "Verifying the local caption model and tag index",
+            )
             evidence = self._verify_captioner(write_state=False)
             (root / "installation.json").write_text(
                 json.dumps(
@@ -504,9 +685,35 @@ class TrainingService:
                 encoding="utf-8",
             )
             self._set_component(item_id, "ready", "Pinned local ONNX captioner is verified")
+            self.engine.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Caption model, tag index, packages, and health are verified",
+                health_check_result=json.dumps(evidence, sort_keys=True),
+            )
+        except DownloadCancelled as error:
+            self._set_component(item_id, "not_installed", "Installation cancelled")
+            self.engine.installation_jobs.update(
+                job_id,
+                "cancelled",
+                "Cancelled",
+                "Installation cancelled; verified partial bytes were preserved",
+                cancellation_requested=True,
+                error_message=str(error),
+            )
         except Exception as error:
             logger.exception("managed captioner installation failed")
             self._set_component(item_id, "repair_needed", _safe_error(error))
+            self.engine.installation_jobs.update(
+                job_id,
+                "repair_needed",
+                "Repair needed",
+                _safe_error(error),
+                error_category="installation_failed",
+                error_message=_safe_error(error),
+                technical_details=_safe_error(error),
+            )
 
     def _download_huggingface_asset(
         self,

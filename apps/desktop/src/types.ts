@@ -129,6 +129,7 @@ export interface InstallationJob {
   stage: string;
   source?: string | null;
   destination?: string | null;
+  partial_path?: string | null;
   downloaded_bytes: number;
   total_bytes?: number | null;
   extracted_bytes?: number | null;
@@ -138,6 +139,19 @@ export interface InstallationJob {
   eta_seconds?: number | null;
   resumable: boolean;
   cancellation_requested: boolean;
+  paused_requested: boolean;
+  retry_count: number;
+  created_at: string;
+  started_at?: string | null;
+  updated_at: string;
+  completed_at?: string | null;
+  error_category?: string | null;
+  error_message?: string | null;
+  technical_details?: string;
+  process_id?: number | null;
+  worker_heartbeat?: string | null;
+  verified_file_hash?: string | null;
+  health_check_result?: string | null;
   summary: string;
 }
 export interface ModelPack {
@@ -153,7 +167,7 @@ export interface ModelPack {
   capabilities: string[];
   disk_gb: number;
   hardware: { minimum_vram_gb: number; recommended_vram_gb: number; minimum_ram_gb: number };
-  download: { source_name: string; authentication: string };
+  download: { source_name: string; authentication: string; url?: string | null };
   license: { name: string; acceptance_required: boolean };
   sha256: string;
   target_path: string;
@@ -165,6 +179,7 @@ export interface ModelPack {
   imported_at?: string | null;
   filename?: string;
   source_information?: string;
+  installation_job?: InstallationJob | null;
 }
 export interface GenerationRecord {
   id: string;
@@ -420,4 +435,5 @@ export interface Diagnostics {
   components?: Array<Record<string, unknown>>;
   model_packs?: Array<Record<string, unknown>>;
   runtime?: Record<string, unknown>;
+  installation_jobs?: InstallationJob[];
 }

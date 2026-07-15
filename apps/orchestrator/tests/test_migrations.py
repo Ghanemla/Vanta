@@ -34,6 +34,7 @@ def test_migrations_create_all_required_tables(client):
         "video_sequences",
         "video_sequence_segments",
         "schema_migrations",
+        "installation_jobs",
     }
     assert required.issubset(tables)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(generation_jobs)")}
@@ -68,4 +69,18 @@ def test_migrations_create_all_required_tables(client):
         "video_settings",
         "generation_settings",
     }.issubset(recipe_columns)
+    installation_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(installation_jobs)")
+    }
+    assert {
+        "partial_path",
+        "paused_requested",
+        "retry_count",
+        "completed_at",
+        "error_message",
+        "process_id",
+        "worker_heartbeat",
+        "verified_file_hash",
+        "health_check_result",
+    }.issubset(installation_columns)
     connection.close()

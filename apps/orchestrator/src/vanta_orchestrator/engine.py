@@ -19,12 +19,11 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import __version__
 from .comfy_runtime import (
     ManagedComfyRuntime,
     ensure_safe_archive_members,
@@ -33,7 +32,13 @@ from .comfy_runtime import (
 )
 from .config import Settings
 from .database import Database, utc_now
-from .installation_jobs import InstallationJobs
+from .downloads import (
+    DownloadCancelled,
+    DownloadProgress,
+    StreamDownloader,
+    revalidate_huggingface_file,
+)
+from .installation_jobs import ACTIVE_STATES, InstallationJobs
 from .video import (
     VIDEO_FFMPEG_BYTES,
     VIDEO_FFMPEG_FILENAME,
@@ -595,7 +600,15 @@ def checkpoint_family(header: dict[str, Any]) -> str:
         and any(key.startswith("vae.") for key in keys)
     ):
         return "FLUX"
-    return "SDXL"
+    required_sdxl_prefixes = (
+        "model.diffusion_model.",
+        "conditioner.embedders.0.",
+        "conditioner.embedders.1.",
+        "first_stage_model.",
+    )
+    if all(any(key.startswith(prefix) for key in keys) for prefix in required_sdxl_prefixes):
+        return "SDXL"
+    return "UNKNOWN"
 
 
 class EngineService:
@@ -613,7 +626,17 @@ class EngineService:
         "restart",
         "update",
     }
-    allowed_pack_actions = {"install", "verify", "repair", "remove", "set_default"}
+    allowed_pack_actions = {
+        "install",
+        "verify",
+        "repair",
+        "remove",
+        "set_default",
+        "pause",
+        "resume",
+        "cancel",
+        "retry",
+    }
 
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -634,9 +657,14 @@ class EngineService:
         self.installation_jobs.recover()
         self.hardware = detect_hardware(settings.data_dir)
         self._install_thread: threading.Thread | None = None
+        self._pose_install_thread: threading.Thread | None = None
         self._identity_install_thread: threading.Thread | None = None
         self._pack_threads: dict[str, threading.Thread] = {}
+        self._downloader = StreamDownloader()
         self._seed()
+        if self.runtime.installed_layout() is not None:
+            self.runtime.start()
+            self.runtime.wait_healthy(timeout=45)
         self._sync_pose_component()
         self._sync_identity_component()
         self._sync_image_finishing_component()
@@ -670,7 +698,7 @@ class EngineService:
                 if component.id == "pose-control"
                 else "Install the reviewed local identity-conditioning extension"
                 if component.id == "identity-lock"
-                else "Install the managed Image Workflow Engine to enable local editing"
+                else "Install the managed Local Image Engine to enable local editing"
                 if component.id == "image-finishing"
                 else "Install and verify the optional LTX-Video model pack"
                 if component.id == "video-generation"
@@ -719,41 +747,55 @@ class EngineService:
 
     def _set_component_progress(
         self,
-        progress: int,
+        state: str,
         message: str,
-        stage: str = "installing",
         downloaded_bytes: int = 0,
         total_bytes: int = 0,
         job_id: str | None = None,
+        **metrics: Any,
     ) -> None:
+        component_state = (
+            state
+            if state in {"paused", "cancelling", "cancelled", "repair_needed"}
+            else "installing"
+        )
+        percentage = min(100, int(downloaded_bytes * 100 / total_bytes)) if total_bytes else 0
         self.db.execute(
-            "UPDATE engine_components SET state='installing', progress=?, last_health_message=?, updated_at=? WHERE id='workflow-runtime'",
-            (progress, message, utc_now()),
+            "UPDATE engine_components SET state=?, progress=?, last_health_message=?, updated_at=? WHERE id='workflow-runtime'",
+            (component_state, percentage, message, utc_now()),
         )
         if job_id:
+            metrics.setdefault("resumable", True)
             self.installation_jobs.update(
                 job_id,
-                stage,
+                state,
                 message,
                 message,
                 downloaded_bytes=downloaded_bytes,
                 total_bytes=total_bytes or None,
-                percentage=progress,
-                resumable=True,
+                **metrics,
             )
 
     def _install_runtime(self, job_id: str) -> None:
         try:
             self.runtime.install(
-                lambda progress, message, stage, downloaded, total: self._set_component_progress(
-                    progress, message, stage, downloaded, total, job_id
+                lambda state, message, downloaded, total, **metrics: self._set_component_progress(
+                    state, message, downloaded, total, job_id, **metrics
                 )
             )
             self.installation_jobs.update(
-                job_id, "ready", "Ready", "Local engine is verified and ready", percentage=100
+                job_id,
+                "ready",
+                "Ready",
+                "Local Image Engine files, process, loopback health, and required nodes are verified",
+                downloaded_bytes=int(self.runtime.source["bytes"]),
+                total_bytes=int(self.runtime.source["bytes"]),
+                verified_file_hash=str(self.runtime.source["sha256"]),
+                process_id=self.runtime.process_id,
+                health_check_result="loopback health and required node probe passed",
             )
         except Exception as error:
-            cancelled = "cancelled" in str(error).lower()
+            cancelled = isinstance(error, DownloadCancelled) or "cancelled" in str(error).lower()
             if cancelled:
                 self.runtime.mark_repair_needed(
                     "Installation cancelled; the partial download is preserved"
@@ -764,6 +806,7 @@ class EngineService:
                     "Cancelled",
                     "Installation cancelled; retry resumes when the source supports it.",
                     cancellation_requested=True,
+                    error_message="Installation cancelled. Partial download bytes are preserved.",
                 )
             else:
                 logger.exception("managed ComfyUI installation failed")
@@ -774,6 +817,7 @@ class EngineService:
                     "Failed",
                     "Vanta could not install the local engine. Review diagnostics and retry.",
                     error_category="installation_failed",
+                    error_message=str(error),
                     technical_details=str(error),
                 )
             self.db.execute(
@@ -805,6 +849,28 @@ class EngineService:
             for row in self.db.query_all("SELECT * FROM engine_components ORDER BY display_name")
         ]
 
+    def installation_job_action(self, job_id: str, action: str) -> dict[str, Any]:
+        job = self.installation_jobs.get(job_id)
+        if action == "reset":
+            return self.installation_jobs.reset_failed(job_id)
+        component_id = str(job["component_id"])
+        if component_id == "workflow-runtime":
+            mapped = "repair" if action in {"retry", "repair"} else action
+            self.component_action(component_id, mapped)
+        else:
+            component = self.db.query_one(
+                "SELECT id FROM engine_components WHERE id=?", (component_id,)
+            )
+            if component is not None:
+                mapped = "repair" if action in {"retry", "repair"} else action
+                self.component_action(component_id, mapped)
+                return self.installation_jobs.get(job_id)
+            pack = self.db.query_one("SELECT id FROM model_packs WHERE alias=?", (component_id,))
+            if pack is None:
+                raise ValueError("This installation job has no managed action target")
+            self.pack_action(str(pack["id"]), action)
+        return self.installation_jobs.get(job_id)
+
     def component_action(self, item_id: str, action: str) -> dict[str, Any]:
         if action not in self.allowed_component_actions:
             raise ValueError("Unsupported component action")
@@ -833,14 +899,62 @@ class EngineService:
             action = "health_check"
         if item_id == "pose-control":
             if action in {"install", "repair"}:
-                if self._install_thread is None or not self._install_thread.is_alive():
-                    self._component_progress(1, "Preparing the managed DWPose installation")
-                    self._install_thread = threading.Thread(
-                        target=self._install_pose_component, daemon=True
+                if self._pose_install_thread is None or not self._pose_install_thread.is_alive():
+                    manifest = self._pose_manifest()
+                    total_bytes = (
+                        int(manifest.source["bytes"])
+                        + int(manifest.source["python_wheel"]["bytes"])
+                        + sum(int(asset["bytes"]) for asset in manifest.source["model_assets"])
                     )
-                    self._install_thread.start()
+                    archive = (
+                        self.settings.engine_root
+                        / "downloads"
+                        / f"pose-control-{manifest.pinned_revision}.zip"
+                    )
+                    job_id = self.installation_jobs.start(
+                        item_id,
+                        action,
+                        source=str(manifest.source["url"]),
+                        destination=self._pose_extension_root(),
+                        partial_path=archive.with_suffix(archive.suffix + ".partial"),
+                        total_bytes=total_bytes,
+                        resumable=True,
+                    )
+                    self._pose_install_thread = threading.Thread(
+                        target=self._install_pose_component, args=(job_id,), daemon=True
+                    )
+                    self._pose_install_thread.start()
+            elif action in {"pause", "cancel"}:
+                job = self.installation_jobs.current(item_id)
+                if not job:
+                    raise ValueError("No Pose Control installation is active")
+                if action == "pause":
+                    self.installation_jobs.request_pause(str(job["id"]))
+                else:
+                    self.installation_jobs.request_cancel(str(job["id"]))
+            elif action == "resume":
+                job = self.installation_jobs.current(item_id)
+                if not job:
+                    raise ValueError("No Pose Control installation can be resumed")
+                self.installation_jobs.request_resume(str(job["id"]))
+                if self._pose_install_thread is None or not self._pose_install_thread.is_alive():
+                    self._pose_install_thread = threading.Thread(
+                        target=self._install_pose_component,
+                        args=(str(job["id"]),),
+                        daemon=True,
+                    )
+                    self._pose_install_thread.start()
             elif action == "remove":
+                job_id = self.installation_jobs.start(
+                    item_id, "remove", destination=self._pose_extension_root()
+                )
+                self.installation_jobs.update(
+                    job_id, "removing", "Removing Pose Control", "Removing managed files only"
+                )
                 self._remove_pose_component()
+                self.installation_jobs.update(
+                    job_id, "removed", "Removed", "Pose Control was removed safely"
+                )
             elif action == "health_check":
                 self._verify_pose_component()
             else:
@@ -852,15 +966,59 @@ class EngineService:
                     self._identity_install_thread is None
                     or not self._identity_install_thread.is_alive()
                 ):
-                    self._identity_component_progress(
-                        1, "Preparing the managed Identity Lock installation"
+                    manifest = self._identity_manifest()
+                    archive = (
+                        self.settings.engine_root
+                        / "downloads"
+                        / f"identity-lock-{manifest.pinned_revision}.zip"
+                    )
+                    job_id = self.installation_jobs.start(
+                        item_id,
+                        action,
+                        source=str(manifest.source["url"]),
+                        destination=self._identity_extension_root(),
+                        partial_path=archive.with_suffix(archive.suffix + ".partial"),
+                        total_bytes=int(manifest.source["bytes"]),
+                        resumable=True,
                     )
                     self._identity_install_thread = threading.Thread(
-                        target=self._install_identity_component, daemon=True
+                        target=self._install_identity_component, args=(job_id,), daemon=True
+                    )
+                    self._identity_install_thread.start()
+            elif action in {"pause", "cancel"}:
+                job = self.installation_jobs.current(item_id)
+                if not job:
+                    raise ValueError("No Identity Lock installation is active")
+                if action == "pause":
+                    self.installation_jobs.request_pause(str(job["id"]))
+                else:
+                    self.installation_jobs.request_cancel(str(job["id"]))
+            elif action == "resume":
+                job = self.installation_jobs.current(item_id)
+                if not job:
+                    raise ValueError("No Identity Lock installation can be resumed")
+                self.installation_jobs.request_resume(str(job["id"]))
+                if (
+                    self._identity_install_thread is None
+                    or not self._identity_install_thread.is_alive()
+                ):
+                    self._identity_install_thread = threading.Thread(
+                        target=self._install_identity_component,
+                        args=(str(job["id"]),),
+                        daemon=True,
                     )
                     self._identity_install_thread.start()
             elif action == "remove":
+                job_id = self.installation_jobs.start(
+                    item_id, "remove", destination=self._identity_extension_root()
+                )
+                self.installation_jobs.update(
+                    job_id, "removing", "Removing Identity Lock", "Removing managed files only"
+                )
                 self._remove_identity_component()
+                self.installation_jobs.update(
+                    job_id, "removed", "Removed", "Identity Lock was removed safely"
+                )
             elif action == "health_check":
                 self._verify_identity_component()
             else:
@@ -884,7 +1042,7 @@ class EngineService:
             if action in {"install", "repair"} and not (pack["installed"] and pack["verified"]):
                 self.pack_action(pack["id"], action)
                 self.db.execute(
-                    "UPDATE engine_components SET state='installing', progress=1, last_health_message=?, updated_at=? WHERE id=?",
+                    "UPDATE engine_components SET state='installing', progress=0, last_health_message=?, updated_at=? WHERE id=?",
                     (
                         "Downloading and verifying the optional local LTX-Video model pack",
                         utc_now(),
@@ -916,54 +1074,95 @@ class EngineService:
                     action,
                     source=source,
                     destination=self.runtime.archive_path,
+                    partial_path=self.runtime.archive_partial_path,
                     total_bytes=expected_bytes,
                     resumable=True,
                 )
+                if self.installation_jobs.get(job_id)["state"] == "paused":
+                    self.installation_jobs.request_resume(job_id)
+                    self.runtime.resume_install()
                 self._set_component_progress(
-                    0, "Checking storage before download", "checking_storage", job_id=job_id
+                    "validating_storage", "Checking storage before download", job_id=job_id
                 )
                 self._install_thread = threading.Thread(
                     target=self._install_runtime, args=(job_id,), daemon=True
                 )
                 self._install_thread.start()
         elif action == "cancel":
+            job = self.installation_jobs.current("workflow-runtime")
+            if not job or job["state"] not in ACTIVE_STATES:
+                raise ValueError("There is no active Local Image Engine installation to cancel")
+            self.installation_jobs.request_cancel(str(job["id"]))
             self.runtime.cancel_install()
-            job = self.installation_jobs.current("workflow-runtime")
-            if job:
-                self.installation_jobs.update(
-                    str(job["id"]),
-                    "cancelling",
-                    "Cancelling",
-                    "Stopping the active download",
-                    cancellation_requested=True,
-                )
         elif action == "pause":
+            job = self.installation_jobs.current("workflow-runtime")
+            if not job:
+                raise ValueError("There is no active Local Image Engine download to pause")
+            self.installation_jobs.request_pause(str(job["id"]))
             self.runtime.pause_install()
-            job = self.installation_jobs.current("workflow-runtime")
-            if job:
-                self.installation_jobs.update(
-                    str(job["id"]),
-                    "paused",
-                    "Paused",
-                    "Download paused; resume continues when supported",
-                )
         elif action == "resume":
-            self.runtime.resume_install()
             job = self.installation_jobs.current("workflow-runtime")
-            if job:
-                self.installation_jobs.update(
-                    str(job["id"]), "downloading", "Downloading engine archive", "Resuming download"
+            if not job:
+                raise ValueError("There is no Local Image Engine installation to resume")
+            self.installation_jobs.request_resume(str(job["id"]))
+            self.runtime.resume_install()
+            if self._install_thread is None or not self._install_thread.is_alive():
+                self._install_thread = threading.Thread(
+                    target=self._install_runtime, args=(str(job["id"]),), daemon=True
                 )
+                self._install_thread.start()
         elif action == "start":
             self.runtime.start()
-            self.runtime.wait_healthy()
+            if not self.runtime.wait_healthy():
+                raise ValueError("The Local Image Engine did not pass its health and node checks")
         elif action == "stop":
             self.runtime.stop()
         elif action == "remove":
+            job_id = self.installation_jobs.start(
+                "workflow-runtime", "remove", destination=self.runtime.root
+            )
+            self.installation_jobs.update(
+                job_id,
+                "removing",
+                "Removing managed runtime",
+                "Stopping the managed process and removing only Local Image Engine files",
+            )
             self.runtime.remove()
+            self.installation_jobs.update(
+                job_id,
+                "removed",
+                "Removed",
+                "Local Image Engine files were removed; databases, models, and media remain",
+            )
         else:
+            job_id = self.installation_jobs.start(
+                "workflow-runtime", "verify", destination=self.runtime.root
+            )
+            self.installation_jobs.update(
+                job_id,
+                "verifying_installation",
+                "Verifying Local Image Engine",
+                "Checking the managed inventory, process, loopback health, and required nodes",
+            )
             self.runtime.start()
-            self.runtime.wait_healthy(timeout=15)
+            if not self.runtime.wait_healthy(timeout=45):
+                self.installation_jobs.update(
+                    job_id,
+                    "repair_needed",
+                    "Repair needed",
+                    self.runtime.snapshot().message,
+                    error_category="health_check_failed",
+                    error_message=self.runtime.snapshot().message,
+                )
+                raise ValueError("The Local Image Engine failed its health or required-node check")
+            self.installation_jobs.update(
+                job_id,
+                "ready",
+                "Verified",
+                "Managed inventory, process, loopback health, and required nodes are verified",
+                process_id=self.runtime.process_id,
+                health_check_result="loopback health and required node probe passed",
+            )
         self._sync_runtime()
         return self.db.query_one("SELECT * FROM engine_components WHERE id=?", (item_id,)) or {}
 
@@ -1040,7 +1239,7 @@ class EngineService:
     def _verify_video_components(self) -> None:
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying local video")
+            raise ValueError("Start the Local Image Engine before verifying local video")
         nodes = self.runtime._request_json("/object_info")
         missing = self._video_required_nodes().difference(nodes)
         if missing:
@@ -1050,8 +1249,8 @@ class EngineService:
 
     def _sync_image_finishing_component(self) -> None:
         snapshot = self.runtime.snapshot()
-        state = snapshot.state
-        message = "Install and start the managed Image Workflow Engine to enable local editing"
+        state = "waiting_for_dependency"
+        message = "Waiting for Local Image Engine"
         if snapshot.state == "ready":
             required = {
                 "LoadImage",
@@ -1080,7 +1279,7 @@ class EngineService:
     def _verify_image_finishing_component(self) -> None:
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying Image Editing")
+            raise ValueError("Start the Local Image Engine before verifying Image Editing")
         nodes = self.runtime._request_json("/object_info")
         required = {
             "LoadImage",
@@ -1117,19 +1316,43 @@ class EngineService:
                 ("Install the reviewed local identity-conditioning extension", utc_now()),
             )
 
-    def _identity_component_progress(self, progress: int, message: str) -> None:
+    def _component_download_progress(
+        self,
+        component_id: str,
+        job_id: str,
+        snapshot: DownloadProgress,
+        *,
+        completed_bytes: int = 0,
+        total_bytes: int | None = None,
+    ) -> None:
+        downloaded = completed_bytes + snapshot.downloaded_bytes
+        expected = total_bytes or snapshot.expected_bytes
+        percentage = min(100, int(downloaded * 100 / expected)) if expected else 0
         self.db.execute(
-            "UPDATE engine_components SET state='installing', progress=?, last_health_message=?, updated_at=? WHERE id='identity-lock'",
-            (progress, message, utc_now()),
+            "UPDATE engine_components SET state='installing',progress=?,last_health_message=?,updated_at=? WHERE id=?",
+            (percentage, snapshot.stage, utc_now(), component_id),
+        )
+        self.installation_jobs.update(
+            job_id,
+            snapshot.state,
+            snapshot.stage,
+            f"{snapshot.stage}: {component_id}",
+            downloaded_bytes=downloaded,
+            total_bytes=expected,
+            speed_bytes_per_second=snapshot.speed_bytes_per_second,
+            elapsed_seconds=snapshot.elapsed_seconds,
+            eta_seconds=(expected - downloaded) / snapshot.speed_bytes_per_second
+            if expected and snapshot.speed_bytes_per_second and downloaded < expected
+            else None,
+            resumable=snapshot.resumable,
         )
 
-    def _install_identity_component(self) -> None:
+    def _install_identity_component(self, job_id: str) -> None:
         manifest = self._identity_manifest()
         try:
             root = self._identity_extension_root()
             if root is None:
-                raise ValueError("Install the Local Generation Engine before Identity Lock")
-            self._identity_component_progress(5, "Downloading the reviewed identity extension")
+                raise ValueError("Install the Local Image Engine before Identity Lock")
             archive = self._download_verified(
                 str(manifest.source["url"]),
                 self.settings.engine_root
@@ -1137,10 +1360,19 @@ class EngineService:
                 / f"identity-lock-{manifest.pinned_revision}.zip",
                 int(manifest.source["bytes"]),
                 str(manifest.source["sha256"]),
-                lambda value: self._identity_component_progress(
-                    min(70, 5 + round(value * 0.65)),
-                    "Downloading the reviewed identity extension",
+                lambda snapshot: self._component_download_progress(
+                    "identity-lock", job_id, snapshot
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "extracting",
+                "Extracting Identity Lock",
+                "Activating the reviewed identity extension from verified bytes",
+                downloaded_bytes=int(manifest.source["bytes"]),
+                total_bytes=int(manifest.source["bytes"]),
             )
             self.runtime.stop()
             staging = self.settings.engine_root / f"identity-staging-{uuid.uuid4().hex}"
@@ -1161,13 +1393,39 @@ class EngineService:
                 ),
                 encoding="utf-8",
             )
-            self._identity_component_progress(90, "Restarting and verifying Identity Lock")
+            self.installation_jobs.update(
+                job_id,
+                "health_checking",
+                "Verifying Identity Lock",
+                "Restarting the Local Image Engine and probing required identity nodes",
+            )
             self._verify_identity_component()
+            self.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Identity Lock files and required runtime nodes are verified",
+                downloaded_bytes=int(manifest.source["bytes"]),
+                total_bytes=int(manifest.source["bytes"]),
+                verified_file_hash=str(manifest.source["sha256"]),
+                health_check_result="required identity nodes loaded",
+            )
         except Exception as error:
             logger.exception("managed identity component installation failed")
+            cancelled = isinstance(error, DownloadCancelled)
             self.db.execute(
                 "UPDATE engine_components SET state='repair_needed', progress=0, last_health_message=?, updated_at=? WHERE id='identity-lock'",
                 (str(error), utc_now()),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "cancelled" if cancelled else "failed",
+                "Cancelled" if cancelled else "Failed",
+                "Identity Lock installation did not activate",
+                cancellation_requested=cancelled,
+                error_category="cancelled" if cancelled else "installation_failed",
+                error_message=str(error),
+                technical_details=str(error),
             )
 
     def _verify_identity_component(self) -> None:
@@ -1216,12 +1474,6 @@ class EngineService:
                 ("Install the reviewed local pose preprocessor", utc_now()),
             )
 
-    def _component_progress(self, progress: int, message: str) -> None:
-        self.db.execute(
-            "UPDATE engine_components SET state='installing', progress=?, last_health_message=?, updated_at=? WHERE id='pose-control'",
-            (progress, message, utc_now()),
-        )
-
     @staticmethod
     def _patch_dwpose_extension(root: Path) -> None:
         """Remove unused legacy OpenPose imports from the maintained DWPose wrapper."""
@@ -1269,58 +1521,40 @@ class EngineService:
         )
         utility.write_text(source, encoding="utf-8")
 
-    @staticmethod
     def _download_verified(
+        self,
         url: str,
         destination: Path,
         expected_size: int,
         expected_hash: str,
-        progress: Callable[[int], None] | None = None,
+        progress: Callable[[DownloadProgress], None] | None = None,
+        cancel_requested: Callable[[], bool] = lambda: False,
+        pause_requested: Callable[[], bool] = lambda: False,
     ) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        existing = destination.stat().st_size if destination.exists() else 0
-        if existing == expected_size and sha256_file(destination) == expected_hash:
-            return destination
-        if existing >= expected_size:
-            destination.unlink(missing_ok=True)
-        last_error: URLError | None = None
-        for attempt in range(4):
-            existing = destination.stat().st_size if destination.exists() else 0
-            headers = {"User-Agent": "Vanta/0.1"}
-            if existing:
-                headers["Range"] = f"bytes={existing}-"
-            request = Request(url, headers=headers)
-            try:
-                with urlopen(request, timeout=45) as response:
-                    resumed = existing > 0 and response.status == 206
-                    written = existing if resumed else 0
-                    with destination.open("ab" if resumed else "wb") as target:
-                        while chunk := response.read(1024 * 1024):
-                            target.write(chunk)
-                            written += len(chunk)
-                            if progress:
-                                progress(min(95, round(100 * written / expected_size)))
-                last_error = None
-                break
-            except URLError as error:
-                last_error = error
-                if attempt < 3:
-                    time.sleep(2**attempt)
-        if last_error is not None:
-            raise RuntimeError("Vanta could not download the reviewed component") from last_error
-        if destination.stat().st_size != expected_size or sha256_file(destination) != expected_hash:
-            destination.unlink(missing_ok=True)
-            raise RuntimeError("The managed component download failed verification")
-        return destination
+        return self._downloader.download(
+            url,
+            destination,
+            partial_path=destination.with_suffix(destination.suffix + ".partial"),
+            expected_bytes=expected_size,
+            expected_sha256=expected_hash,
+            on_progress=progress or (lambda _snapshot: None),
+            cancel_requested=cancel_requested,
+            pause_requested=pause_requested,
+        )
 
-    def _install_pose_component(self) -> None:
+    def _install_pose_component(self, job_id: str) -> None:
         manifest = self._pose_manifest()
         try:
             root = self._pose_extension_root()
             layout = self.runtime.installed_layout()
             if root is None or layout is None:
-                raise ValueError("Install the Local Generation Engine before Pose Control")
-            self._component_progress(5, "Downloading the reviewed pose preprocessor")
+                raise ValueError("Install the Local Image Engine before Pose Control")
+            total_bytes = (
+                int(manifest.source["bytes"])
+                + int(manifest.source["python_wheel"]["bytes"])
+                + sum(int(asset["bytes"]) for asset in manifest.source["model_assets"])
+            )
+            completed_bytes = 0
             archive = self._download_verified(
                 str(manifest.source["url"]),
                 self.settings.engine_root
@@ -1328,34 +1562,63 @@ class EngineService:
                 / f"pose-control-{manifest.pinned_revision}.zip",
                 int(manifest.source["bytes"]),
                 str(manifest.source["sha256"]),
-                lambda value: self._component_progress(
-                    min(45, 5 + round(value * 0.4)), "Downloading the reviewed pose preprocessor"
+                lambda snapshot: self._component_download_progress(
+                    "pose-control",
+                    job_id,
+                    snapshot,
+                    completed_bytes=completed_bytes,
+                    total_bytes=total_bytes,
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
             )
+            completed_bytes += int(manifest.source["bytes"])
             wheel_metadata = manifest.source["python_wheel"]
-            self._component_progress(46, "Downloading the pinned local vision runtime")
             wheel = self._download_verified(
                 str(wheel_metadata["url"]),
                 self.settings.engine_root / "downloads" / Path(str(wheel_metadata["url"])).name,
                 int(wheel_metadata["bytes"]),
                 str(wheel_metadata["sha256"]),
-                lambda value: self._component_progress(
-                    min(54, 46 + round(value * 0.08)), "Downloading the pinned local vision runtime"
+                lambda snapshot: self._component_download_progress(
+                    "pose-control",
+                    job_id,
+                    snapshot,
+                    completed_bytes=completed_bytes,
+                    total_bytes=total_bytes,
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
             )
+            completed_bytes += int(wheel_metadata["bytes"])
             asset_downloads: list[tuple[dict[str, Any], Path]] = []
-            for index, asset in enumerate(manifest.source["model_assets"]):
-                self._component_progress(55 + index * 7, f"Downloading {asset['name']}")
+            for asset in manifest.source["model_assets"]:
                 downloaded = self._download_verified(
                     str(asset["url"]),
                     self.settings.engine_root / "downloads" / str(asset["filename"]),
                     int(asset["bytes"]),
                     str(asset["sha256"]),
-                    lambda value, index=index, name=str(asset["name"]): self._component_progress(
-                        min(68, 55 + index * 7 + round(value * 0.06)), f"Downloading {name}"
+                    lambda snapshot, completed_bytes=completed_bytes: (
+                        self._component_download_progress(
+                            "pose-control",
+                            job_id,
+                            snapshot,
+                            completed_bytes=completed_bytes,
+                            total_bytes=total_bytes,
+                        )
                     ),
+                    cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                    pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
                 )
                 asset_downloads.append((asset, downloaded))
+                completed_bytes += int(asset["bytes"])
+            self.installation_jobs.update(
+                job_id,
+                "installing",
+                "Installing Pose Control",
+                "Activating verified extension, wheel, and model assets",
+                downloaded_bytes=total_bytes,
+                total_bytes=total_bytes,
+            )
             self.runtime.stop()
             staging = self.settings.engine_root / f"pose-staging-{uuid.uuid4().hex}"
             staging.mkdir(parents=True, exist_ok=True)
@@ -1374,7 +1637,6 @@ class EngineService:
                     shutil.copy2(downloaded, asset_root / str(asset["filename"]))
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
-            self._component_progress(72, "Installing the pinned local vision runtime")
             completed = subprocess.run(
                 [
                     str(layout[1]),
@@ -1422,13 +1684,39 @@ class EngineService:
                 ),
                 encoding="utf-8",
             )
-            self._component_progress(90, "Restarting and verifying Pose Control")
+            self.installation_jobs.update(
+                job_id,
+                "health_checking",
+                "Verifying Pose Control",
+                "Restarting the Local Image Engine and probing the required pose node",
+            )
             self._verify_pose_component()
+            self.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Pose Control files, pinned assets, and runtime node are verified",
+                downloaded_bytes=total_bytes,
+                total_bytes=total_bytes,
+                verified_file_hash=str(manifest.source["sha256"]),
+                health_check_result="DWPreprocessor node loaded",
+            )
         except Exception as error:
             logger.exception("managed pose component installation failed")
+            cancelled = isinstance(error, DownloadCancelled)
             self.db.execute(
                 "UPDATE engine_components SET state='repair_needed', progress=0, last_health_message=?, updated_at=? WHERE id='pose-control'",
                 (str(error), utc_now()),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "cancelled" if cancelled else "failed",
+                "Cancelled" if cancelled else "Failed",
+                "Pose Control installation did not activate",
+                cancellation_requested=cancelled,
+                error_category="cancelled" if cancelled else "installation_failed",
+                error_message=str(error),
+                technical_details=str(error),
             )
 
     def _verify_pose_component(self) -> None:
@@ -1632,7 +1920,7 @@ class EngineService:
             raise ValueError("Identity Lock model files failed manifest verification; use Repair")
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying Identity Lock")
+            raise ValueError("Start the Local Image Engine before verifying Identity Lock")
         nodes = self.runtime._request_json("/object_info")
         if not {"IPAdapterUnifiedLoader", "IPAdapterAdvanced"}.issubset(nodes):
             raise ValueError("Vanta's compatible identity adapter runtime is not installed")
@@ -1665,7 +1953,7 @@ class EngineService:
             )
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying this upscale pack")
+            raise ValueError("Start the Local Image Engine before verifying this upscale pack")
         model_names = (
             self.runtime._request_json("/object_info")
             .get("UpscaleModelLoader", {})
@@ -1675,7 +1963,7 @@ class EngineService:
         )
         if filename not in model_names:
             raise ValueError(
-                "The Local Generation Engine cannot see this upscale model; repair the pack"
+                "The Local Image Engine cannot see this upscale model; repair the pack"
             )
         metadata = json.loads(self._pack_row(alias)["metadata"])
         metadata.update({"filename": filename, "sha256": sha256_file(path)})
@@ -1698,7 +1986,7 @@ class EngineService:
             )
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying this model")
+            raise ValueError("Start the Local Image Engine before verifying this model")
         header = validate_safetensors(path)
         family = checkpoint_family(header)
         expected_family = "FLUX" if alias == "photoreal_max" else "SDXL"
@@ -1706,14 +1994,54 @@ class EngineService:
             raise ValueError(
                 f"This checkpoint is {family}; the {alias} profile requires {expected_family}"
             )
+        metadata = json.loads(row["metadata"])
+        reviewed = metadata.get("download", {})
+        if row.get("original_path") == reviewed.get("url"):
+            expected_bytes = int(reviewed["bytes"])
+            if path.stat().st_size != expected_bytes:
+                raise ValueError(
+                    f"The reviewed model is incomplete: expected {expected_bytes} bytes, found {path.stat().st_size}"
+                )
         actual_hash = sha256_file(path)
+        if row.get("original_path") == reviewed.get("url") and actual_hash != metadata["sha256"]:
+            raise ValueError("The reviewed model failed its pinned SHA-256 verification")
         self.db.execute(
             "UPDATE model_packs SET state='verifying', progress=80, updated_at=? WHERE alias=?",
             (utc_now(), alias),
         )
         try:
             compiler = FluxWorkflowCompiler() if family == "FLUX" else WorkflowCompiler()
-            self.runtime.submit(compiler.diagnostic(path.name), lambda _value, _max: None)
+            _prompt_id, history = self.runtime.submit(
+                compiler.diagnostic(path.name), lambda _value, _max: None
+            )
+            images = [
+                image
+                for output in history.get("outputs", {}).values()
+                for image in output.get("images", [])
+                if image.get("filename")
+            ]
+            if not images:
+                raise RuntimeError("The diagnostic workflow produced no image output")
+            image = images[-1]
+            generated = (
+                self.runtime.root
+                / "output"
+                / str(image.get("subfolder", ""))
+                / str(image["filename"])
+            )
+            if not generated.is_file() or generated.stat().st_size == 0:
+                raise RuntimeError("The diagnostic image output is missing or empty")
+            with Image.open(generated) as diagnostic_image:
+                diagnostic_image.verify()
+            diagnostics_dir = self.settings.data_dir / "diagnostics"
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            diagnostic_path = diagnostics_dir / f"{alias}-diagnostic.png"
+            shutil.copy2(generated, diagnostic_path)
+            thumbnail_path = diagnostics_dir / f"{alias}-diagnostic-thumb.jpg"
+            with Image.open(diagnostic_path) as diagnostic_image:
+                diagnostic_image.thumbnail((384, 384))
+                diagnostic_image.convert("RGB").save(thumbnail_path, "JPEG", quality=88)
+            diagnostic_hash = sha256_file(diagnostic_path)
         except Exception as error:
             self.db.execute(
                 "UPDATE model_packs SET state='repair_needed', verified=0, progress=0, updated_at=? WHERE alias=?",
@@ -1722,7 +2050,6 @@ class EngineService:
             raise ValueError(
                 f"The local image engine could not load this {family} checkpoint"
             ) from error
-        metadata = json.loads(row["metadata"])
         metadata.update(
             {
                 "filename": path.name,
@@ -1733,6 +2060,12 @@ class EngineService:
                     if family == "FLUX"
                     else "standard checkpoint"
                 ),
+                "verification": "exact file, SafeTensor structure, SDXL family, engine load, and diagnostic image verified",
+                "diagnostic_output_path": str(diagnostic_path),
+                "diagnostic_output_sha256": diagnostic_hash,
+                "diagnostic_thumbnail_path": str(thumbnail_path),
+                "verified_file_size": path.stat().st_size,
+                "verified_file_mtime_ns": path.stat().st_mtime_ns,
             }
         )
         self.db.execute(
@@ -1750,7 +2083,26 @@ class EngineService:
         for row in self.db.query_all("SELECT * FROM model_packs ORDER BY display_name"):
             metadata = json.loads(row.pop("metadata"))
             installed_path = Path(row.get("installed_path") or "")
-            if row["installed"] and not installed_path.is_file():
+            reviewed = metadata.get("download", {})
+            reviewed_install = bool(
+                row.get("original_path") == reviewed.get("url") and reviewed.get("bytes")
+            )
+            verified_inventory = True
+            if row["verified"] and reviewed_install and installed_path.is_file():
+                diagnostic = Path(str(metadata.get("diagnostic_output_path", "")))
+                thumbnail = Path(str(metadata.get("diagnostic_thumbnail_path", "")))
+                verified_inventory = bool(
+                    installed_path.stat().st_size == int(reviewed["bytes"])
+                    and metadata.get("verified_file_size") == installed_path.stat().st_size
+                    and metadata.get("verified_file_mtime_ns") == installed_path.stat().st_mtime_ns
+                    and metadata.get("sha256")
+                    and diagnostic.is_file()
+                    and diagnostic.stat().st_size > 0
+                    and sha256_file(diagnostic) == metadata.get("diagnostic_output_sha256")
+                    and thumbnail.is_file()
+                    and thumbnail.stat().st_size > 0
+                )
+            if row["installed"] and (not installed_path.is_file() or not verified_inventory):
                 self.db.execute(
                     "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
                     (utc_now(), row["id"]),
@@ -1765,11 +2117,44 @@ class EngineService:
                     "installed": bool(row["installed"]),
                     "verified": bool(row["verified"]),
                     "is_default": bool(row["is_default"]),
+                    "installation_job": self.installation_jobs.current(str(row["alias"])),
                 }
             )
         return rows
 
-    def _install_pose_pack(self, item_id: str) -> None:
+    def _pack_download_progress(
+        self,
+        item_id: str,
+        alias: str,
+        job_id: str,
+        snapshot: DownloadProgress,
+        *,
+        completed_bytes: int = 0,
+        total_bytes: int | None = None,
+    ) -> None:
+        downloaded = completed_bytes + snapshot.downloaded_bytes
+        expected = total_bytes or snapshot.expected_bytes
+        percentage = min(100, int(downloaded * 100 / expected)) if expected else 0
+        self.db.execute(
+            "UPDATE model_packs SET state='installing',progress=?,updated_at=? WHERE id=?",
+            (percentage, utc_now(), item_id),
+        )
+        self.installation_jobs.update(
+            job_id,
+            snapshot.state,
+            snapshot.stage,
+            f"{snapshot.stage}: {alias}",
+            downloaded_bytes=downloaded,
+            total_bytes=expected,
+            speed_bytes_per_second=snapshot.speed_bytes_per_second,
+            elapsed_seconds=snapshot.elapsed_seconds,
+            eta_seconds=(expected - downloaded) / snapshot.speed_bytes_per_second
+            if expected and snapshot.speed_bytes_per_second and downloaded < expected
+            else None,
+            resumable=snapshot.resumable,
+        )
+
+    def _install_pose_pack(self, item_id: str, job_id: str) -> None:
         try:
             row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
             if row is None:
@@ -1778,15 +2163,12 @@ class EngineService:
             download = metadata["download"]
             destination = self.settings.controlnet_root / Path(metadata["target_path"]).name
             self.db.execute(
-                "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
+                "UPDATE model_packs SET state='installing', progress=0, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
             )
 
-            def progress(value: int) -> None:
-                self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
-                    (value, utc_now(), item_id),
-                )
+            def progress(snapshot: DownloadProgress) -> None:
+                self._pack_download_progress(item_id, str(row["alias"]), job_id, snapshot)
 
             self._download_verified(
                 str(download["url"]),
@@ -1794,6 +2176,14 @@ class EngineService:
                 int(download["bytes"]),
                 str(metadata["sha256"]),
                 progress,
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "verifying_installation",
+                "Verifying Pose model",
+                "Checking exact file, hash, SafeTensor structure, and runtime visibility",
             )
             self.db.execute(
                 """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
@@ -1809,14 +2199,35 @@ class EngineService:
                 ),
             )
             self.verify_pose_pack()
-        except Exception:
+            self.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Pose model file and runtime visibility are verified",
+                downloaded_bytes=int(download["bytes"]),
+                total_bytes=int(download["bytes"]),
+                verified_file_hash=str(metadata["sha256"]),
+                health_check_result="ControlNet nodes and model visibility passed",
+            )
+        except Exception as error:
             logger.exception("managed pose model installation failed")
+            cancelled = isinstance(error, DownloadCancelled)
             self.db.execute(
                 "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
             )
+            self.installation_jobs.update(
+                job_id,
+                "cancelled" if cancelled else "failed",
+                "Cancelled" if cancelled else "Failed",
+                "Pose model installation did not verify",
+                cancellation_requested=cancelled,
+                error_category="cancelled" if cancelled else "model_installation_failed",
+                error_message=str(error),
+                technical_details=str(error),
+            )
 
-    def _install_curated_checkpoint(self, item_id: str) -> None:
+    def _install_curated_checkpoint(self, item_id: str, job_id: str) -> None:
         """Install one reviewed checkpoint, never a whole provider repository."""
         row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
         if row is None:
@@ -1836,32 +2247,37 @@ class EngineService:
                 )
             if filename.lower().endswith(".gguf"):
                 raise ValueError("GGUF model loading is not supported in this release.")
+            self.installation_jobs.update(
+                job_id,
+                "validating_storage",
+                "Revalidating reviewed model",
+                "Checking the live immutable-file metadata against Vanta's pinned manifest",
+            )
+            live_metadata = revalidate_huggingface_file(
+                url,
+                repository=str(download["repository"]),
+                revision=revision,
+                filename=filename,
+                expected_bytes=expected_bytes,
+                expected_sha256=expected_hash,
+            )
+            metadata["live_source_validation"] = live_metadata
+            self.db.execute(
+                "UPDATE model_packs SET metadata=?,updated_at=? WHERE id=?",
+                (json.dumps(metadata), utc_now(), item_id),
+            )
             destination = self.settings.model_root / filename
-            if (
-                os.name == "nt"
-                and self.settings.data_dir.drive.upper() == "C:"
-                and expected_bytes > 500 * 1024**2
-            ):
-                raise ValueError(
-                    "Choose an F: studio-data location before downloading this large model"
-                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            partial = destination.with_suffix(destination.suffix + ".partial")
             available = shutil.disk_usage(destination.parent).free
             required = expected_bytes * 2 + 10 * 1024**3
             if available < required:
                 raise ValueError(
                     f"Not enough disk space. Need {required} bytes including staging and reserve; {available} bytes are available."
                 )
-            job_id = self.installation_jobs.start(
-                row["alias"],
-                "install",
-                source=url,
-                destination=destination,
-                total_bytes=expected_bytes,
-                resumable=True,
-            )
             self.installation_jobs.update(
                 job_id,
-                "checking_storage",
+                "validating_storage",
                 "Checking storage",
                 "Storage location is suitable for this model",
             )
@@ -1870,23 +2286,35 @@ class EngineService:
                 (utc_now(), item_id),
             )
 
-            def progress(value: int) -> None:
+            def progress(snapshot: DownloadProgress) -> None:
+                percentage = snapshot.percentage or 0
                 self.db.execute(
                     "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
-                    (value, utc_now(), item_id),
+                    (percentage, utc_now(), item_id),
                 )
-                downloaded = min(expected_bytes, round(expected_bytes * value / 100))
                 self.installation_jobs.update(
                     job_id,
-                    "downloading",
-                    "Downloading model checkpoint",
-                    f"Downloading {filename}",
-                    downloaded_bytes=downloaded,
+                    snapshot.state,
+                    snapshot.stage,
+                    f"{snapshot.stage}: {filename}",
+                    downloaded_bytes=snapshot.downloaded_bytes,
                     total_bytes=expected_bytes,
-                    percentage=value,
+                    speed_bytes_per_second=snapshot.speed_bytes_per_second,
+                    elapsed_seconds=snapshot.elapsed_seconds,
+                    eta_seconds=snapshot.eta_seconds,
+                    resumable=snapshot.resumable,
                 )
 
-            self._download_verified(url, destination, expected_bytes, expected_hash, progress)
+            self._downloader.download(
+                url,
+                destination,
+                partial_path=partial,
+                expected_bytes=expected_bytes,
+                expected_sha256=expected_hash,
+                on_progress=progress,
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
+            )
             self.installation_jobs.update(
                 job_id,
                 "verifying_download",
@@ -1894,9 +2322,10 @@ class EngineService:
                 "Verifying exact byte count and SHA-256",
                 downloaded_bytes=expected_bytes,
                 total_bytes=expected_bytes,
-                percentage=96,
             )
             validate_safetensors(destination)
+            if checkpoint_family(validate_safetensors(destination)) != "SDXL":
+                raise ValueError("The reviewed RealVisXL file is not a complete SDXL checkpoint")
             self.db.execute(
                 """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
                 installed_path=?,original_path=?,file_size=?,license_notes=?,imported_at=?,updated_at=? WHERE id=?""",
@@ -1915,7 +2344,6 @@ class EngineService:
                 "verifying_installation",
                 "Verifying model",
                 "Loading the SDXL checkpoint through the local engine",
-                percentage=98,
             )
             self.verify_model(row["alias"])
             self.installation_jobs.update(
@@ -1924,21 +2352,28 @@ class EngineService:
                 "Ready",
                 "Model is verified for local SDXL generation",
                 percentage=100,
+                verified_file_hash=expected_hash,
+                health_check_result="SafeTensor, SDXL family, engine load, and diagnostic generation passed",
             )
         except Exception as error:
             logger.exception("curated checkpoint installation failed")
+            cancelled = isinstance(error, DownloadCancelled)
             self.db.execute(
-                "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
-                (utc_now(), item_id),
+                "UPDATE model_packs SET state=?, installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
+                ("cancelled" if cancelled else "repair_needed", utc_now(), item_id),
             )
             job = self.installation_jobs.current(str(row["alias"]))
             if job:
                 self.installation_jobs.update(
                     str(job["id"]),
-                    "failed",
-                    "Failed",
-                    "Vanta could not verify the reviewed model download.",
-                    error_category="model_installation_failed",
+                    "cancelled" if cancelled else "failed",
+                    "Cancelled" if cancelled else "Failed",
+                    "Model download cancelled; partial bytes are preserved."
+                    if cancelled
+                    else "Vanta could not verify the reviewed model download.",
+                    cancellation_requested=cancelled,
+                    error_category="cancelled" if cancelled else "model_installation_failed",
+                    error_message=str(error),
                     technical_details=str(error),
                 )
 
@@ -1953,7 +2388,7 @@ class EngineService:
             raise ValueError("The Pose Control model failed hash verification; use Repair")
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying Pose Control")
+            raise ValueError("Start the Local Image Engine before verifying Pose Control")
         nodes = self.runtime._request_json("/object_info")
         missing = {"DiffControlNetLoader", "ControlNetApplyAdvanced"} - set(nodes)
         if missing:
@@ -1965,7 +2400,7 @@ class EngineService:
         )
         return self._pack_row(POSE_PACK_ALIAS)
 
-    def _install_identity_pack(self, item_id: str) -> None:
+    def _install_identity_pack(self, item_id: str, job_id: str) -> None:
         try:
             row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
             if row is None:
@@ -1975,25 +2410,43 @@ class EngineService:
             clip = download["clip_vision"]
             adapter_path = self.settings.ipadapter_root / IDENTITY_ADAPTER_FILENAME
             clip_path = self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME
+            total_bytes = int(download["bytes"]) + int(clip["bytes"])
             self._download_verified(
                 str(download["url"]),
                 adapter_path,
                 int(download["bytes"]),
                 str(metadata["sha256"]),
-                lambda value: self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
-                    (min(25, round(value * 0.25)), utc_now(), item_id),
+                lambda snapshot: self._pack_download_progress(
+                    item_id,
+                    str(row["alias"]),
+                    job_id,
+                    snapshot,
+                    total_bytes=total_bytes,
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
             )
             self._download_verified(
                 str(clip["url"]),
                 clip_path,
                 int(clip["bytes"]),
                 str(clip["sha256"]),
-                lambda value: self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
-                    (min(95, 25 + round(value * 0.7)), utc_now(), item_id),
+                lambda snapshot: self._pack_download_progress(
+                    item_id,
+                    str(row["alias"]),
+                    job_id,
+                    snapshot,
+                    completed_bytes=int(download["bytes"]),
+                    total_bytes=total_bytes,
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "verifying_installation",
+                "Verifying Identity model",
+                "Checking both exact model files, hashes, and runtime nodes",
             )
             self.db.execute(
                 """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
@@ -2009,14 +2462,35 @@ class EngineService:
                 ),
             )
             self.verify_identity_adapter()
-        except Exception:
+            self.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Identity adapter, CLIP Vision encoder, and runtime nodes are verified",
+                downloaded_bytes=total_bytes,
+                total_bytes=total_bytes,
+                verified_file_hash=str(metadata["sha256"]),
+                health_check_result="identity runtime nodes loaded",
+            )
+        except Exception as error:
             logger.exception("managed identity model installation failed")
+            cancelled = isinstance(error, DownloadCancelled)
             self.db.execute(
                 "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
             )
+            self.installation_jobs.update(
+                job_id,
+                "cancelled" if cancelled else "failed",
+                "Cancelled" if cancelled else "Failed",
+                "Identity model installation did not verify",
+                cancellation_requested=cancelled,
+                error_category="cancelled" if cancelled else "model_installation_failed",
+                error_message=str(error),
+                technical_details=str(error),
+            )
 
-    def _install_video_pack(self, item_id: str) -> None:
+    def _install_video_pack(self, item_id: str, job_id: str) -> None:
         try:
             row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
             if row is None:
@@ -2026,25 +2500,43 @@ class EngineService:
             encoder = download["text_encoder"]
             model_path = self.settings.model_root / VIDEO_MODEL_FILENAME
             encoder_path = self.settings.text_encoder_root / VIDEO_TEXT_ENCODER_FILENAME
+            total_bytes = int(download["bytes"]) + int(encoder["bytes"])
             self._download_verified(
                 str(download["url"]),
                 model_path,
                 int(download["bytes"]),
                 str(metadata["sha256"]),
-                lambda value: self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
-                    (min(48, round(value * 0.48)), utc_now(), item_id),
+                lambda snapshot: self._pack_download_progress(
+                    item_id,
+                    str(row["alias"]),
+                    job_id,
+                    snapshot,
+                    total_bytes=total_bytes,
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
             )
             self._download_verified(
                 str(encoder["url"]),
                 encoder_path,
                 int(encoder["bytes"]),
                 str(encoder["sha256"]),
-                lambda value: self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
-                    (min(96, 48 + round(value * 0.48)), utc_now(), item_id),
+                lambda snapshot: self._pack_download_progress(
+                    item_id,
+                    str(row["alias"]),
+                    job_id,
+                    snapshot,
+                    completed_bytes=int(download["bytes"]),
+                    total_bytes=total_bytes,
                 ),
+                cancel_requested=lambda: self.installation_jobs.cancel_requested(job_id),
+                pause_requested=lambda: self.installation_jobs.pause_requested(job_id),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "verifying_installation",
+                "Verifying video model",
+                "Checking exact files, hashes, and native Local Image Engine nodes",
             )
             self.db.execute(
                 """UPDATE model_packs SET state='verifying', installed=1, verified=0, progress=97,
@@ -2060,11 +2552,32 @@ class EngineService:
                 ),
             )
             self.verify_video_pack()
-        except Exception:
+            self.installation_jobs.update(
+                job_id,
+                "ready",
+                "Ready",
+                "Video model, text encoder, and native runtime nodes are verified",
+                downloaded_bytes=total_bytes,
+                total_bytes=total_bytes,
+                verified_file_hash=str(metadata["sha256"]),
+                health_check_result="native LTXV nodes and files verified",
+            )
+        except Exception as error:
             logger.exception("managed video model installation failed")
+            cancelled = isinstance(error, DownloadCancelled)
             self.db.execute(
                 "UPDATE model_packs SET state='repair_needed', installed=0, verified=0, progress=0, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "cancelled" if cancelled else "failed",
+                "Cancelled" if cancelled else "Failed",
+                "Video model installation did not verify",
+                cancellation_requested=cancelled,
+                error_category="cancelled" if cancelled else "model_installation_failed",
+                error_message=str(error),
+                technical_details=str(error),
             )
 
     def verify_video_pack(self) -> dict[str, Any]:
@@ -2087,7 +2600,7 @@ class EngineService:
                 raise ValueError(f"{path.name} failed hash verification; use Repair")
         self.runtime.start()
         if not self.runtime.wait_healthy(timeout=45):
-            raise ValueError("Start the Local Generation Engine before verifying local video")
+            raise ValueError("Start the Local Image Engine before verifying local video")
         nodes = self.runtime._request_json("/object_info")
         missing = self._video_required_nodes().difference(nodes)
         if missing:
@@ -2108,7 +2621,7 @@ class EngineService:
             VIDEO_MODEL_FILENAME not in checkpoint_names
             or VIDEO_TEXT_ENCODER_FILENAME not in encoder_names
         ):
-            raise ValueError("The Local Generation Engine cannot see the verified LTXV assets")
+            raise ValueError("The Local Image Engine cannot see the verified LTXV assets")
         metadata.update(
             {
                 "filename": VIDEO_MODEL_FILENAME,
@@ -2129,15 +2642,56 @@ class EngineService:
         row = self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,))
         if row is None:
             raise KeyError(item_id)
+        metadata = json.loads(row["metadata"])
+        reviewed_download = metadata.get("download", {})
+        reviewed_url = reviewed_download.get("url")
+        is_curated_checkpoint = bool(
+            reviewed_url and row["alias"] in {"photoreal_balanced", "preview_fast", "photoreal_max"}
+        )
+        if reviewed_url and action in {"pause", "cancel", "resume"}:
+            job = self.installation_jobs.current(str(row["alias"]))
+            if not job:
+                raise ValueError("No model installation job is available for this action")
+            if action == "pause":
+                self.installation_jobs.request_pause(str(job["id"]))
+            elif action == "cancel":
+                self.installation_jobs.request_cancel(str(job["id"]))
+            else:
+                self.installation_jobs.request_resume(str(job["id"]))
+                thread = self._pack_threads.get(item_id)
+                if thread is None or not thread.is_alive():
+                    target = (
+                        self._install_pose_pack
+                        if row["alias"] == POSE_PACK_ALIAS
+                        else self._install_identity_pack
+                        if row["alias"] == IDENTITY_PACK_ALIAS
+                        else self._install_video_pack
+                        if row["alias"] == VIDEO_MODEL_ALIAS
+                        else self._install_curated_checkpoint
+                    )
+                    thread = threading.Thread(
+                        target=target,
+                        args=(item_id, str(job["id"])),
+                        daemon=True,
+                    )
+                    self._pack_threads[item_id] = thread
+                    thread.start()
+            return self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,)) or {}
         if row["alias"] == POSE_PACK_ALIAS and action in {"install", "repair"}:
             thread = self._pack_threads.get(item_id)
             if thread is None or not thread.is_alive():
-                self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
-                    (utc_now(), item_id),
+                destination = self.settings.controlnet_root / Path(metadata["target_path"]).name
+                job_id = self.installation_jobs.start(
+                    str(row["alias"]),
+                    action,
+                    source=str(reviewed_url),
+                    destination=destination,
+                    partial_path=destination.with_suffix(destination.suffix + ".partial"),
+                    total_bytes=int(reviewed_download["bytes"]),
+                    resumable=True,
                 )
                 thread = threading.Thread(
-                    target=self._install_pose_pack, args=(item_id,), daemon=True
+                    target=self._install_pose_pack, args=(item_id, job_id), daemon=True
                 )
                 self._pack_threads[item_id] = thread
                 thread.start()
@@ -2145,12 +2699,19 @@ class EngineService:
         if row["alias"] == IDENTITY_PACK_ALIAS and action in {"install", "repair"}:
             thread = self._pack_threads.get(item_id)
             if thread is None or not thread.is_alive():
-                self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
-                    (utc_now(), item_id),
+                clip = reviewed_download["clip_vision"]
+                destination = self.settings.ipadapter_root / IDENTITY_ADAPTER_FILENAME
+                job_id = self.installation_jobs.start(
+                    str(row["alias"]),
+                    action,
+                    source=str(reviewed_url),
+                    destination=destination,
+                    partial_path=destination.with_suffix(destination.suffix + ".partial"),
+                    total_bytes=int(reviewed_download["bytes"]) + int(clip["bytes"]),
+                    resumable=True,
                 )
                 thread = threading.Thread(
-                    target=self._install_identity_pack, args=(item_id,), daemon=True
+                    target=self._install_identity_pack, args=(item_id, job_id), daemon=True
                 )
                 self._pack_threads[item_id] = thread
                 thread.start()
@@ -2158,22 +2719,56 @@ class EngineService:
         if row["alias"] == VIDEO_MODEL_ALIAS and action in {"install", "repair"}:
             thread = self._pack_threads.get(item_id)
             if thread is None or not thread.is_alive():
-                self.db.execute(
-                    "UPDATE model_packs SET state='installing', progress=1, updated_at=? WHERE id=?",
-                    (utc_now(), item_id),
+                encoder = reviewed_download["text_encoder"]
+                destination = self.settings.model_root / VIDEO_MODEL_FILENAME
+                job_id = self.installation_jobs.start(
+                    str(row["alias"]),
+                    action,
+                    source=str(reviewed_url),
+                    destination=destination,
+                    partial_path=destination.with_suffix(destination.suffix + ".partial"),
+                    total_bytes=int(reviewed_download["bytes"]) + int(encoder["bytes"]),
+                    resumable=True,
                 )
                 thread = threading.Thread(
-                    target=self._install_video_pack, args=(item_id,), daemon=True
+                    target=self._install_video_pack, args=(item_id, job_id), daemon=True
                 )
                 self._pack_threads[item_id] = thread
                 thread.start()
             return self.db.query_one("SELECT * FROM model_packs WHERE id=?", (item_id,)) or {}
-        metadata = json.loads(row["metadata"])
-        if action in {"install", "repair"} and metadata.get("download", {}).get("url"):
+        if is_curated_checkpoint and action in {"install", "repair", "retry"}:
             thread = self._pack_threads.get(item_id)
             if thread is None or not thread.is_alive():
+                filename = str(reviewed_download["filename"])
+                destination = self.settings.model_root / filename
+                partial = destination.with_suffix(destination.suffix + ".partial")
+                current = self.installation_jobs.current(str(row["alias"]))
+                if current and current["state"] in {
+                    "paused",
+                    "cancelled",
+                    "failed",
+                    "repair_needed",
+                }:
+                    self.installation_jobs.request_resume(str(current["id"]))
+                    job_id = str(current["id"])
+                else:
+                    job_id = self.installation_jobs.start(
+                        str(row["alias"]),
+                        action,
+                        source=str(reviewed_url),
+                        destination=destination,
+                        partial_path=partial,
+                        total_bytes=int(reviewed_download["bytes"]),
+                        resumable=True,
+                    )
+                actual = partial.stat().st_size if partial.is_file() else 0
+                progress = min(100, int(actual * 100 / int(reviewed_download["bytes"])))
+                self.db.execute(
+                    "UPDATE model_packs SET state='installing', progress=?, updated_at=? WHERE id=?",
+                    (progress, utc_now(), item_id),
+                )
                 thread = threading.Thread(
-                    target=self._install_curated_checkpoint, args=(item_id,), daemon=True
+                    target=self._install_curated_checkpoint, args=(item_id, job_id), daemon=True
                 )
                 self._pack_threads[item_id] = thread
                 thread.start()
@@ -2193,6 +2788,15 @@ class EngineService:
         if action == "remove":
             if row["is_default"]:
                 raise ValueError("Choose another verified model before removing the default")
+            job_id = self.installation_jobs.start(
+                str(row["alias"]), "remove", destination=Path(row.get("installed_path") or "")
+            )
+            self.installation_jobs.update(
+                job_id,
+                "removing",
+                "Removing managed model",
+                "Removing only Vanta-managed model files",
+            )
             Path(row.get("installed_path") or "").unlink(missing_ok=True)
             if row["alias"] == IDENTITY_PACK_ALIAS:
                 (self.settings.clip_vision_root / IDENTITY_CLIP_FILENAME).unlink(missing_ok=True)
@@ -2203,6 +2807,12 @@ class EngineService:
             self.db.execute(
                 "UPDATE model_packs SET state='not_installed', installed=0, verified=0, progress=0, installed_path=NULL, updated_at=? WHERE id=?",
                 (utc_now(), item_id),
+            )
+            self.installation_jobs.update(
+                job_id,
+                "removed",
+                "Removed",
+                "Managed model files were removed; projects and media remain",
             )
         elif action == "set_default":
             if not row["installed"] or not row["verified"]:
@@ -2242,6 +2852,9 @@ class EngineService:
                 logs.append(f"[{path.name}] {sanitized[:1000]}")
         components = self.list_components()
         packs = self.list_packs()
+        installation_jobs = self.installation_jobs.list()
+        runtime_files = [path for path in self.settings.runtime_root.rglob("*") if path.is_file()]
+        runtime_bytes = sum(path.stat().st_size for path in runtime_files)
         return {
             "summary": snapshot.message,
             "messages": [
@@ -2254,11 +2867,15 @@ class EngineService:
             "system": {
                 "platform": platform.platform(),
                 "python": platform.python_version(),
+                "orchestrator_version": __version__,
                 "orchestrator_pid": os.getpid(),
                 "comfyui_pid": self.runtime.process_id,
                 "orchestrator_host": self.settings.host,
                 "orchestrator_port": self.settings.port,
                 "comfyui_port": snapshot.port,
+                "data_root": str(self.settings.data_dir),
+                "database_path": str(self.settings.database_path),
+                "logs_path": str(log_root),
             },
             "components": [
                 {
@@ -2292,14 +2909,27 @@ class EngineService:
                 "active_model_file": model["installed_path"] if model else None,
                 "model_sha256": model_metadata.get("sha256"),
                 "model_verified": bool(model and model["verified"]),
+                "model_downloaded_bytes": (
+                    Path(model["installed_path"]).stat().st_size
+                    if model
+                    and model.get("installed_path")
+                    and Path(model["installed_path"]).is_file()
+                    else 0
+                ),
+                "model_expected_bytes": model_metadata.get("download", {}).get("bytes"),
                 "gpu": self.hardware["gpu_name"],
                 "vram_gb": self.hardware["vram_gb"],
                 "ram_gb": self.hardware["ram_gb"],
                 "free_disk_gb": self.hardware["free_disk_gb"],
                 "active_jobs": active,
+                "installation_jobs": installation_jobs,
+                "runtime_file_count": len(runtime_files),
+                "runtime_bytes": runtime_bytes,
+                "runtime_process_id": self.runtime.process_id,
                 "workflow_version": WorkflowCompiler.version,
                 "output_path": str(self.settings.media_root),
             },
+            "installation_jobs": installation_jobs,
         }
 
 
@@ -2379,7 +3009,7 @@ class GenerationService:
                 self.engine.runtime.start()
             self._update(job_id, "checking_engine", 0)
             if not self.engine.runtime.wait_healthy(timeout=45):
-                raise RuntimeError("The Local Generation Engine is not ready")
+                raise RuntimeError("The Local Image Engine is not ready")
             if request.get("operation") == "video":
                 self._run_video(job_id, request, started)
                 return
@@ -2524,6 +3154,10 @@ class GenerationService:
                 "pose_control": pose_metadata,
                 "inpaint": inpaint_metadata,
                 "disclosure": True,
+                "output_path": str(destination),
+                "output_sha256": sha256_file(destination),
+                "output_bytes": destination.stat().st_size,
+                "thumbnail_sha256": sha256_file(thumbnail),
                 "duration_seconds": round(time.monotonic() - started, 2),
                 "request": request,
             }
@@ -2628,7 +3262,7 @@ class GenerationService:
         request = {**request, "motion_prompt": motion_prompt}
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise RuntimeError("The Local Generation Engine is not installed")
+            raise RuntimeError("The Local Image Engine is not installed")
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         source_name = f"{job_id}-video-source.png"
@@ -2758,7 +3392,7 @@ class GenerationService:
             )
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise RuntimeError("The Local Generation Engine is not installed")
+            raise RuntimeError("The Local Image Engine is not installed")
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         source_name = f"{source_id}-upscale-source.png"
@@ -2939,7 +3573,7 @@ class GenerationService:
                 raise ValueError("Preserve pose requires a source created with Pose Control")
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise ValueError("Start the Local Generation Engine before creating a variation")
+            raise ValueError("Start the Local Image Engine before creating a variation")
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{generation_id}.png"
@@ -2999,7 +3633,7 @@ class GenerationService:
         request["recipe_id"] = request.get("recipe_id") or source.get("recipe_id")
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise ValueError("Start the Local Generation Engine before inpainting")
+            raise ValueError("Start the Local Image Engine before inpainting")
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         source_name = f"{generation_id}-inpaint-source.png"
@@ -3043,7 +3677,7 @@ class GenerationService:
             raise ValueError("The selected identity reference is no longer available")
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise ValueError("Start the Local Generation Engine before using an identity reference")
+            raise ValueError("Start the Local Image Engine before using an identity reference")
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         filename = f"identity-{reference_id}.png"
@@ -3068,7 +3702,7 @@ class GenerationService:
             )
         layout = self.engine.runtime.installed_layout()
         if layout is None:
-            raise ValueError("Start the Local Generation Engine before using a saved pose")
+            raise ValueError("Start the Local Image Engine before using a saved pose")
         input_dir = layout[0].parent / "input" / "Vanta"
         input_dir.mkdir(parents=True, exist_ok=True)
         filename = f"pose-{pose_id}.png"

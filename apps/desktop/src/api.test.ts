@@ -2,11 +2,14 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { api, configureLocalService, type LocalServiceInfo, VANTA_TOKEN_HEADER } from './api';
 
 const service: LocalServiceInfo = {
+  desktop_version: '0.1.3',
   state: 'ready',
   phase: 'Ready',
   base_url: 'http://127.0.0.1:58123',
   launch_token: 'test-launch-token',
   sidecar_path: null,
+  application_install_path: 'F:\\Vanta\\App',
+  bootstrap_config_path: 'data/bootstrap/studio-data.json',
   application_data_path: 'data',
   database_path: 'data/vanta.db',
   logs_path: 'data/logs',
@@ -33,6 +36,15 @@ it('uses the dynamic local service URL and per-launch token header', async () =>
       headers: expect.objectContaining({ [VANTA_TOKEN_HEADER]: 'test-launch-token' }),
     }),
   );
+});
+
+it('retries ordinary API requests after a stale local-service connection', async () => {
+  vi.mocked(fetch)
+    .mockRejectedValueOnce(new TypeError('old sidecar port closed'))
+    .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 'ready' }]), { status: 200 }));
+
+  await expect(api.get('/installation-jobs')).resolves.toEqual([{ id: 'ready' }]);
+  expect(fetch).toHaveBeenCalledTimes(2);
 });
 
 it('authenticates typed media requests and rejects non-media responses', async () => {

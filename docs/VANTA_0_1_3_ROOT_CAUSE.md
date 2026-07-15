@@ -1,0 +1,32 @@
+# Vanta 0.1.3 installed-release root-cause record
+
+## Evidence boundary
+
+The requested 0.1.2 studio-data path, `F:\VantaData\VantaStudioData`, was not present when the 0.1.3 investigation began. A read-only drive and AppData search found no recoverable Vanta database, bootstrap record, log set, or partial download at that location. `F:\VantaData\Vanta` was the installed application directory, not the studio-data root. Windows uninstall registration identified it as Vanta 0.1.2 and listed `F:\VantaData\Vanta` as the install location.
+
+The non-private evidence that could be captured is stored outside Git under `F:\VantaAcceptance\0.1.3\source-evidence`: source-path status, installed-application inventory, uninstall registration, and live endpoint headers. No generated media was copied. Because the reported database and logs no longer existed, conclusions below that concern persisted rows are supported by the 0.1.2 schema and code paths, not by a fabricated database reconstruction.
+
+## Exact failure chain
+
+1. **Storage readiness was a drive-letter test.** `SetupWizard` used a literal `^[Ff]:\\` check and consumer copy instructed the user to choose F:. This rejected valid C:, D:, external, and future drive letters without testing writability or capacity.
+2. **Clean selection entered relocation machinery.** The desktop always called `start_storage_move`. A first run could therefore scan/copy a mostly empty default root instead of directly configuring the selected root. The bootstrap writer used `fs::rename` over an existing file; on Windows that cannot replace the target, so a later selection/update could fail even when the folder itself was valid.
+3. **The desktop did not refresh authoritative installation data.** The main application polling loop refreshed generation jobs, but not installation jobs, components, or model packs. The setup and engine cards therefore retained their initial `0%` or `1%` renderer state while backend work changed independently.
+4. **The Jobs drawer queried generations only.** It loaded `/api/jobs` and rendered generation records. The existing `/api/installation-jobs` records were never loaded into the drawer, producing “No local jobs” during engine and model installation.
+5. **Model percentage was reconstructed, not measured.** The curated-model callback converted a rounded/capped percentage back into `expected_bytes * percentage / 100`. It did not persist the actual partial-file length. A displayed 1% consequently proved neither 1% of the response nor meaningful disk growth.
+6. **Large model downloads wrote directly to the final path.** There was no explicit `.partial` activation boundary, durable pause flag, or model cancel/resume worker contract. Restart reconciliation could not distinguish a verified final model from an interrupted transfer solely from the path.
+7. **Installation records were created too late for immediate UI truth.** The curated model worker created its job after background execution began. A fast double click or a renderer refresh could therefore precede the only durable job record.
+8. **Setup advancement was assigned at start.** Setup-step settings advanced when engine/model work was requested, not only after file, process, node, model, and diagnostic verification. The wizard and Models & Engine could contradict the real worker.
+9. **Cancel accepted stale renderer state.** The frontend could send Cancel after the backend operation had already left its cancellable stage. The backend did not first require the current durable job to be active. It then synchronized the component from the runtime snapshot, which could overwrite the cancellation presentation with the runtime’s stored state. This is the direct false-Ready path.
+10. **The dependent editing capability mirrored the engine text state.** Image Editing & Finishing inherited the runtime state instead of remaining `waiting_for_dependency` until a live required-node probe passed. A false engine Ready therefore cascaded into a second false Ready.
+11. **Engine health was incomplete.** Readiness used the loopback `/system_stats` response without also requiring a valid installation inventory and the required ComfyUI node set. Stored files, a running process, and actual workflow capability were not one indivisible readiness check.
+12. **RealVisXL verification stopped short of output proof.** The diagnostic workflow was submitted, but its history was not required to contain an image whose file could be opened, hashed, and thumbnailed. “Verified” therefore did not prove that the checkpoint produced a valid image.
+13. **Diagnostics failures were invisible.** Diagnostics requests used promise continuations/direct awaits without a dedicated open/loading/error state. A rejected request could leave the click with no visible result, especially before setup.
+14. **Restart made retry possible without reconciling truth.** Persisted component/model text state was not comprehensively reconciled against partial length, exact model inventory, runtime inventory, process health, and node availability. Restart could expose another action while leaving the prior percentage and failure evidence ambiguous.
+
+## Corrective architecture in 0.1.3
+
+Storage validation now accepts any writable absolute local Windows path with sufficient space, rejects unsafe application-directory overlap using the detected executable directory, and atomically replaces the bootstrap. Clean setup configures the root directly; populated relocation copies into a sibling staging directory, verifies it, activates it by rename, health-checks the service, and retains the source.
+
+`installation_jobs` is the durable record rendered by setup, component/model cards, Jobs, and Diagnostics. Downloads stream into `.partial` files; byte counts come from writes and on-disk reconciliation; Range resume, ignored Range, pause, cancel, retry, redirect validation, bounded retries, exact length, free-space checks, and SHA-256 precede atomic activation. Cancellation remains cancelled and never assigns readiness.
+
+Local Image Engine readiness now requires the pinned archive hash, safe extraction, required files, packaged Python dependency probe, installation inventory, hidden loopback process, `/system_stats`, and required `/object_info` nodes. RealVisXL additionally requires live immutable metadata to match the pinned revision/bytes/hash, exact file verification, complete SDXL structure, a real diagnostic workflow, a valid nonempty output, output hash, and thumbnail.

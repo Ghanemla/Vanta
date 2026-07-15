@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from vanta_orchestrator.comfy_runtime import ensure_safe_archive_members, validate_safetensors
+from vanta_orchestrator.comfy_runtime import (
+    REQUIRED_RUNTIME_NODES,
+    ManagedComfyRuntime,
+    ensure_safe_archive_members,
+    validate_safetensors,
+)
+from vanta_orchestrator.config import Settings
 from vanta_orchestrator.engine import (
     POSE_CONTROL_FILENAME,
     FluxWorkflowCompiler,
@@ -60,6 +66,50 @@ def test_safetensors_validation_and_archive_path_safety(tmp_path: Path):
         ensure_safe_archive_members(["ComfyUI/../escape.txt"])
 
 
+def test_runtime_ready_requires_inventory_and_the_live_required_node_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = Settings(data_dir=tmp_path / "data")
+    source = {"sha256": "a" * 64, "bytes": 10, "url": "https://example.invalid/runtime.7z"}
+    runtime = ManagedComfyRuntime(settings, source, "v-test")
+    main = runtime.root / "ComfyUI" / "main.py"
+    python = runtime.root / "python_embeded" / "python.exe"
+    main.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True)
+    main.write_text("# managed runtime", encoding="utf-8")
+    python.write_bytes(b"MZ")
+    (runtime.root / ".vanta-runtime.json").write_text(
+        json.dumps(
+            {
+                "revision": "v-test",
+                "archive_sha256": "a" * 64,
+                "packaged_python_probe": "torch-test",
+                "extracted_bytes": 100,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert runtime.installed_layout() == (main, python)
+
+    monkeypatch.setattr(
+        runtime,
+        "_request_json",
+        lambda path, payload=None: (
+            {} if path == "/system_stats" else {node: {} for node in REQUIRED_RUNTIME_NODES}
+        ),
+    )
+    assert runtime.wait_healthy(timeout=1)
+    assert runtime.snapshot().state == "ready"
+
+    monkeypatch.setattr(
+        runtime,
+        "_request_json",
+        lambda path, payload=None: {} if path == "/system_stats" else {},
+    )
+    assert not runtime.wait_healthy(timeout=1)
+    assert runtime.snapshot().state == "repair_needed"
+
+
 def test_sdxl_lora_workflow_is_inserted_without_exposing_nodes_to_the_ui():
     request = {
         "direction": "original adult editorial portrait",
@@ -112,7 +162,18 @@ def test_checkpoint_family_requires_self_contained_flux_assets():
         "vae.decoder.conv_in.weight": {},
     }
     assert checkpoint_family(header) == "FLUX"
-    assert checkpoint_family({"model.diffusion_model.input_blocks.0.0.weight": {}}) == "SDXL"
+    assert (
+        checkpoint_family(
+            {
+                "model.diffusion_model.input_blocks.0.0.weight": {},
+                "conditioner.embedders.0.transformer.text_model.embeddings.weight": {},
+                "conditioner.embedders.1.model.text_projection": {},
+                "first_stage_model.decoder.conv_out.weight": {},
+            }
+        )
+        == "SDXL"
+    )
+    assert checkpoint_family({"model.diffusion_model.input_blocks.0.0.weight": {}}) == "UNKNOWN"
 
 
 def test_variation_workflow_encodes_a_local_source_image():

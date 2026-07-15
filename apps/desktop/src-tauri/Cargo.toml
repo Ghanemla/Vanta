@@ -1,6 +1,6 @@
 [package]
 name = "vanta-desktop"
-version = "0.1.2"
+version = "0.1.3"
 description = "Project Vanta local character studio"
 authors = ["Project Vanta"]
 edition = "2021"

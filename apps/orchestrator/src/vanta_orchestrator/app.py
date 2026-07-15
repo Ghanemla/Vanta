@@ -137,7 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     generation_jobs.recover()
     motion.recover()
 
-    app = FastAPI(title="Vanta Local Orchestrator", version="0.1.2", docs_url="/api/docs")
+    app = FastAPI(title="Vanta Local Orchestrator", version="0.1.3", docs_url="/api/docs")
     # Starlette applies the most recently added middleware first. CORS must be
     # outermost so it can answer browser preflight before token authentication.
     app.add_middleware(LaunchTokenMiddleware, launch_token=settings.launch_token)
@@ -895,6 +895,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/installation-jobs")
     def installation_jobs() -> list[dict]:
         return engine.installation_jobs.list()
+
+    @app.post("/api/installation-jobs/{job_id}/{action}")
+    def installation_job_action(job_id: str, action: str) -> dict:
+        try:
+            job = engine.installation_jobs.get(job_id)
+            if job["component_id"] in {"lora-training", "captioning"}:
+                return training.installation_job_action(job_id, action)
+            return engine.installation_job_action(job_id, action)
+        except KeyError as error:
+            raise missing(error) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/api/engine/components/{item_id}/{action}")
     def component_action(item_id: str, action: str) -> dict:

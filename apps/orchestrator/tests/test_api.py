@@ -32,6 +32,49 @@ def test_engine_diagnostics_and_support_bundle_are_sanitized_and_traceable(clien
         assert json.loads(bundled)["system"]["orchestrator_host"] == "127.0.0.1"
 
 
+def test_managed_training_capability_creates_authoritative_job_before_worker(tmp_path, monkeypatch):
+    import time
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+
+    from vanta_orchestrator.app import create_app
+    from vanta_orchestrator.config import Settings
+    from vanta_orchestrator.training import TrainingService
+
+    observed = []
+
+    def inspect_job(self, job_id):
+        observed.append(self.engine.installation_jobs.get(job_id))
+
+    monkeypatch.setattr(TrainingService, "_install_captioner", inspect_job)
+    settings = Settings(data_dir=tmp_path, project_root=Path(__file__).resolve().parents[3])
+    with TestClient(create_app(settings)) as test_client:
+        response = test_client.post("/api/engine/components/captioning/install")
+        assert response.status_code == 200
+        for _ in range(50):
+            if observed:
+                break
+            time.sleep(0.01)
+        assert observed and observed[0]["component_id"] == "captioning"
+        assert observed[0]["state"] == "queued"
+        assert observed[0]["percentage"] == 0
+        component = next(
+            item
+            for item in test_client.get("/api/engine/components").json()
+            if item["id"] == "captioning"
+        )
+        assert component["progress"] == 0
+        cancelled = test_client.post(f"/api/installation-jobs/{observed[0]['id']}/cancel")
+        assert cancelled.status_code == 200
+        current = next(
+            item
+            for item in test_client.get("/api/installation-jobs").json()
+            if item["id"] == observed[0]["id"]
+        )
+        assert current["state"] == "cancelling"
+
+
 def test_character_crud_archives_without_deleting(client):
     payload = {"name": "Mara", "identity_description": "Original adult character, age 29"}
     created = client.post("/api/characters", json=payload)
@@ -318,7 +361,7 @@ def test_pose_library_persists_source_progress_edit_and_delete(client, tmp_path)
             break
         time.sleep(0.01)
     assert item["status"] == "failed"
-    assert "Local Generation Engine" in item["error_message"]
+    assert "Local Image Engine" in item["error_message"]
     updated = client.put(
         f"/api/poses/{pose_id}",
         json={

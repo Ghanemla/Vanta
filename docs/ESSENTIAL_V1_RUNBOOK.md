@@ -1,10 +1,10 @@
 # Project Vanta Essential V1 Runbook
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
-## Vanta 0.1.2 managed fresh install
+## Vanta 0.1.3 managed fresh install
 
-Vanta 0.1.2 keeps the desktop installer self-contained while treating the workflow engine and checkpoints as reviewed, user-approved managed downloads. The first-run wizard requires an F: studio-data root before a large engine/model transfer. Installation work is persisted in `installation_jobs`: a component has one authoritative job, byte-level progress is durable, and interrupted jobs recover to a visible repair-needed state rather than a stale disabled Installing button.
+Vanta 0.1.3 keeps the desktop installer self-contained while treating the Local Image Engine and checkpoints as reviewed, user-approved managed downloads. The first-run wizard accepts any suitable writable absolute local Windows folder with sufficient space. Installation work is persisted in `installation_jobs`: a component has one authoritative job, byte-level progress is durable, cancellation cannot produce Ready, and interrupted jobs reconcile against real partial files.
 
 The starter alias `photoreal_balanced` is RealVisXL V5.0 fp16 from `SG161222/RealVisXL_V5.0`, revision `3125c9694b477d14433287b90c84f447237f6867`, file `RealVisXL_V5.0_fp16.safetensors`, 6,938,065,488 bytes, SHA-256 `6a35a7855770ae9820a3c931d4964c3817b6d9e3c6f9c4dabb5b3a94e5643b80`, OpenRAIL++. It is never auto-downloaded and is made default only after SafeTensor, SDXL, engine-load and diagnostic-workflow verification.
 

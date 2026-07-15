@@ -816,10 +816,10 @@ class MotionService:
             )
             self.engine.runtime.start()
             if not self.engine.runtime.wait_healthy(timeout=45):
-                raise RuntimeError("Start the Local Generation Engine before extracting motion")
+                raise RuntimeError("Start the Local Image Engine before extracting motion")
             layout = self.engine.runtime.installed_layout()
             if layout is None:
-                raise RuntimeError("The Local Generation Engine is not installed")
+                raise RuntimeError("The Local Image Engine is not installed")
             input_root = layout[0].parent / "input" / "Vanta"
             input_root.mkdir(parents=True, exist_ok=True)
             pose_frames: list[Path] = []

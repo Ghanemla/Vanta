@@ -1,6 +1,6 @@
 # Vanta manual acceptance checklist
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 These checks need native Windows interaction and must be run against the final NSIS installer. They are deliberately not represented as automated or simulated evidence.
 
@@ -15,12 +15,12 @@ These checks need native Windows interaction and must be run against the final N
 - [ ] Close normally and confirm Vanta-owned sidecar/engine processes stop. Repeat after a forced desktop-process close and confirm the Job Object cleanup stops children.
 - [ ] Reinstall or upgrade without deleting `%APPDATA%\studio.vanta.desktop`; confirm database, model records, gallery media, presets and characters remain.
 
-## Vanta 0.1.2 fresh-install acceptance
+## Vanta 0.1.3 fresh-install acceptance
 
-- [ ] Install `Vanta_0.1.2_x64-setup.exe` on a clean Windows profile and launch it without a console window.
-- [ ] In first-run setup, verify real GPU, VRAM, RAM and free-storage values, then choose `F:\VantaData` before accepting a large download.
+- [ ] Install `Vanta_0.1.3_x64-setup.exe` into `F:\VantaAcceptance\0.1.3\AppInstall` and launch it without a console window.
+- [ ] In first-run setup, verify real GPU, VRAM, RAM and free-storage values, then choose `F:\VantaAcceptance\0.1.3\StudioData`. Also prove C: is permitted when it has enough space.
 - [ ] Start Local Image Engine and confirm the same durable job appears in Models & Engine with stage, bytes, percentage, speed, ETA, destination, Pause, Resume and Cancel.
-- [ ] Cancel a download, restart Vanta, and confirm the visible recovery state preserves the partial download and explains the Retry/Resume action.
+- [ ] Pause and confirm meaningful file growth stops; resume with a Range request; cancel a separate attempt and confirm it remains Cancelled and never becomes Ready.
 - [ ] Download only `RealVisXL_V5.0_fp16.safetensors`, verify the hash and diagnostic workflow, then generate one image and confirm Gallery file actions work after restart.
 
 ## V1.0.1 installed media and progress repair

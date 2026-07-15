@@ -20,11 +20,14 @@ export type MediaRequest = {
 };
 
 export type LocalServiceInfo = {
+  desktop_version: string;
   state: string;
   phase: string;
   base_url: string | null;
   launch_token: string | null;
   sidecar_path: string | null;
+  application_install_path: string;
+  bootstrap_config_path: string;
   application_data_path: string;
   database_path: string;
   logs_path: string;
@@ -56,6 +59,15 @@ export type StorageInfo = {
   last_error: string | null;
   previous_root: string | null;
   default_export_folder: string | null;
+  storage_configured: boolean;
+  selected_drive: string;
+  application_install_path: string;
+  engine_archive_bytes: number;
+  engine_extracted_bytes: number;
+  realvisxl_bytes: number;
+  temporary_verification_bytes: number;
+  recommended_reserve_bytes: number;
+  required_free_bytes: number;
 };
 
 export function configureLocalService(service: LocalServiceInfo): void {
@@ -68,11 +80,14 @@ export function configureLocalService(service: LocalServiceInfo): void {
 export async function getLocalServiceInfo(): Promise<LocalServiceInfo> {
   if (!isTauri()) {
     return {
+      desktop_version: '0.1.3',
       state: 'ready',
       phase: 'Ready',
       base_url: apiBase,
       launch_token: null,
       sidecar_path: null,
+      application_install_path: 'Development runtime',
+      bootstrap_config_path: 'Development runtime/storage-bootstrap/studio-data.json',
       application_data_path: 'Development runtime',
       database_path: 'Development runtime/vanta.db',
       logs_path: 'Development runtime/logs',
@@ -91,13 +106,17 @@ export async function getLocalServiceInfo(): Promise<LocalServiceInfo> {
 export async function restartLocalService(): Promise<LocalServiceInfo> {
   if (!isTauri()) return getLocalServiceInfo();
   const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<LocalServiceInfo>('restart_local_service');
+  const service = await invoke<LocalServiceInfo>('restart_local_service');
+  configureLocalService(service);
+  return service;
 }
 
 export async function repairApplicationRuntime(): Promise<LocalServiceInfo> {
   if (!isTauri()) return getLocalServiceInfo();
   const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<LocalServiceInfo>('repair_application_runtime');
+  const service = await invoke<LocalServiceInfo>('repair_application_runtime');
+  configureLocalService(service);
+  return service;
 }
 
 export async function chooseLocalModelFile(): Promise<string | null> {
@@ -138,8 +157,8 @@ export const getStorageInfo = () =>
   isTauri()
     ? invokeDesktop<StorageInfo>('storage_info')
     : Promise.resolve({
-        current_root: 'F:\\VantaData',
-        default_root: 'F:\\VantaData',
+        current_root: 'Development runtime',
+        default_root: 'Development runtime',
         bootstrap_config: 'Development runtime',
         current_bytes: 0,
         current_files: 0,
@@ -159,6 +178,15 @@ export const getStorageInfo = () =>
         last_error: null,
         previous_root: null,
         default_export_folder: null,
+        storage_configured: false,
+        selected_drive: '',
+        application_install_path: 'Development runtime',
+        engine_archive_bytes: 2_086_299_430,
+        engine_extracted_bytes: 7_500_000_000,
+        realvisxl_bytes: 6_938_065_488,
+        temporary_verification_bytes: 2_147_483_648,
+        recommended_reserve_bytes: 10_737_418_240,
+        required_free_bytes: 29_409_266_806,
       });
 export const chooseStorageLocation = () => invokeDesktop<string | null>('choose_storage_location');
 export const startStorageMove = (destination: string) =>
@@ -204,7 +232,28 @@ export class ApiError extends Error {
 async function refreshServiceConnection(): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import('@tauri-apps/api/core');
-  configureLocalService(await invoke<LocalServiceInfo>('service_info'));
+  const deadline = Date.now() + 20_000;
+  let latest: LocalServiceInfo | undefined;
+  while (Date.now() < deadline) {
+    latest = await invoke<LocalServiceInfo>('service_info');
+    if (latest.state === 'ready' && latest.base_url && latest.launch_token) {
+      configureLocalService(latest);
+      return;
+    }
+    if (latest.state === 'failed') {
+      throw new ApiError(
+        latest.last_sanitized_error ?? 'The local service could not restart.',
+        0,
+        'local_service_unavailable',
+      );
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new ApiError(
+    latest?.last_sanitized_error ?? 'The local service did not become ready in time.',
+    0,
+    'local_service_unavailable',
+  );
 }
 
 async function fetchMedia(requested: MediaRequest): Promise<Blob> {
@@ -262,14 +311,37 @@ async function fetchMedia(requested: MediaRequest): Promise<Blob> {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}/api${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {}),
-      ...init?.headers,
-    },
-  });
+  let response: Response | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(`${apiBase}/api${path}`, {
+        ...init,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(launchToken ? { [VANTA_TOKEN_HEADER]: launchToken } : {}),
+          ...init?.headers,
+        },
+      });
+    } catch (error) {
+      if (attempt === 0) {
+        await refreshServiceConnection();
+        continue;
+      }
+      throw new ApiError(
+        error instanceof Error ? error.message : 'The local service is unavailable.',
+        0,
+        'local_service_unavailable',
+      );
+    }
+    if (response.status === 401 && attempt === 0) {
+      await refreshServiceConnection();
+      continue;
+    }
+    break;
+  }
+  if (!response) {
+    throw new ApiError('The local service is unavailable.', 0, 'local_service_unavailable');
+  }
   if (!response.ok) {
     const body = (await response.json().catch(() => ({ detail: response.statusText }))) as {
       detail?: string;
