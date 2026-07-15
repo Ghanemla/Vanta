@@ -134,7 +134,32 @@ async function invokeDesktop<T>(command: string, args?: Record<string, unknown>)
   return invoke<T>(command, args);
 }
 
-export const getStorageInfo = () => invokeDesktop<StorageInfo>('storage_info');
+export const getStorageInfo = () =>
+  isTauri()
+    ? invokeDesktop<StorageInfo>('storage_info')
+    : Promise.resolve({
+        current_root: 'F:\\VantaData',
+        default_root: 'F:\\VantaData',
+        bootstrap_config: 'Development runtime',
+        current_bytes: 0,
+        current_files: 0,
+        destination_free_bytes: 1_000_000_000_000,
+        redirected_target: null,
+        operation: 'idle',
+        phase: 'Development storage ready',
+        destination: null,
+        current_file: null,
+        copied_bytes: 0,
+        total_bytes: 0,
+        copied_files: 0,
+        total_files: 0,
+        elapsed_seconds: 0,
+        eta_seconds: null,
+        can_cancel: false,
+        last_error: null,
+        previous_root: null,
+        default_export_folder: null,
+      });
 export const chooseStorageLocation = () => invokeDesktop<string | null>('choose_storage_location');
 export const startStorageMove = (destination: string) =>
   invokeDesktop<StorageInfo>('start_storage_move', { destination });

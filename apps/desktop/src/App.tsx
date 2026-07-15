@@ -988,14 +988,41 @@ function SetupWizard({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [storage, setStorage] = useState<StorageInfo | null>(null);
   const runtime = data.components.find((item) => item.id === 'workflow-runtime');
   const model =
     data.packs.find((item) => item.is_default) ??
     data.packs.find((item) => item.alias === 'photoreal_balanced');
   const engineReady = runtime?.state === 'ready';
   const modelReady = Boolean(model?.installed && model.verified);
+  const storageSelected = Boolean(storage?.current_root.match(/^[Ff]:\\/));
+  useEffect(() => {
+    void getStorageInfo()
+      .then(setStorage)
+      .catch(() => setStorage(null));
+  }, []);
+  const chooseStudioStorage = async () => {
+    const destination = await chooseStorageLocation();
+    if (!destination) return;
+    setBusy(true);
+    setError('');
+    try {
+      setStorage(await startStorageMove(destination));
+      notify('Vanta is moving its studio data before any large downloads.');
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : 'Vanta could not select that storage location.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
   const installEngine = async () => {
     if (!runtime) return;
+    if (!storageSelected) {
+      setError('Choose an F: studio-data location before downloading the local image engine.');
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -1019,19 +1046,14 @@ function SetupWizard({
       setBusy(false);
     }
   };
-  const importModel = async () => {
-    const sourcePath = await chooseLocalModelFile();
-    if (!sourcePath) return;
+  const installModel = async () => {
+    if (!model) return;
     setBusy(true);
     setError('');
     try {
-      await api.post('/engine/models/import', {
-        source_path: sourcePath,
-        alias: 'photoreal_balanced',
-        license_notes: 'User-selected local checkpoint; review its license before redistribution.',
-      });
+      await api.post(`/engine/model-packs/${model.id}/install`);
       await api.put('/settings/setup_step', { value: 'model_verified' });
-      notify('Local model imported and verified');
+      notify('RealVisXL download started; Vanta verifies it before it becomes available.');
       await refresh();
     } catch (caught) {
       setError(
@@ -1046,7 +1068,7 @@ function SetupWizard({
       void api.put('/settings/setup_completed', { value: 'true' });
     }
   }, [data.settings.values.setup_completed, engineReady, modelReady]);
-  const step = modelReady ? 4 : engineReady ? 3 : 2;
+  const step = modelReady ? 5 : engineReady ? 4 : storageSelected ? 3 : 2;
   return (
     <section className="setup-wizard" aria-labelledby="setup-title">
       <div className="setup-wizard__intro">
@@ -1064,12 +1086,18 @@ function SetupWizard({
             'Check this device',
             `${data.hardware.gpu_name} · ${data.hardware.vram_gb} GB VRAM · ${data.hardware.free_disk_gb} GB free`,
           ],
+          [
+            'Choose storage',
+            storageSelected
+              ? `${storage?.current_root} selected for large Vanta files.`
+              : 'Choose an F: location before large downloads.',
+          ],
           ['Prepare local engine', runtime?.last_health_message ?? 'Checking engine status'],
           [
-            'Import a model',
+            'Starter model',
             modelReady
               ? 'Verified local SDXL model and diagnostic generation complete.'
-              : 'Choose a compatible SDXL .safetensors checkpoint.',
+              : 'RealVisXL V5.0 fp16 is downloaded only after confirmation.',
           ],
         ].map(([title, detail], index) => (
           <li
@@ -1090,7 +1118,11 @@ function SetupWizard({
         </p>
       )}
       <div className="setup-wizard__actions">
-        {!engineReady ? (
+        {!storageSelected ? (
+          <Button variant="primary" onClick={() => void chooseStudioStorage()} disabled={busy}>
+            <FolderLock /> {busy ? 'Selecting storage…' : 'Choose F: storage'}
+          </Button>
+        ) : !engineReady ? (
           <Button
             variant="primary"
             onClick={() => void installEngine()}
@@ -1106,8 +1138,15 @@ function SetupWizard({
                   : 'Install local engine'}
           </Button>
         ) : !modelReady ? (
-          <Button variant="primary" onClick={() => void importModel()} disabled={busy}>
-            <Upload /> {busy ? 'Verifying local model…' : 'Import local SDXL model'}
+          <Button
+            variant="primary"
+            onClick={() => void installModel()}
+            disabled={busy || model?.state === 'installing'}
+          >
+            <Download />
+            {model?.state === 'installing'
+              ? `Downloading RealVisXL ${model.progress}%`
+              : 'Download RealVisXL V5.0'}
           </Button>
         ) : (
           <Button variant="primary" onClick={goEngine}>
@@ -1119,8 +1158,9 @@ function SetupWizard({
         </Button>
       </div>
       <p className="setup-wizard__note">
-        Storage: {data.settings.paths.data}. The engine requires about 2 GB; model size depends on
-        the file you import.
+        Local only: no Vanta account, cloud inference, standalone ComfyUI, or Ollama is required.
+        {storage ? ` Storage: ${storage.current_root}.` : ''} The reviewed engine is about 2 GB;
+        RealVisXL fp16 is 6.94 GB plus temporary verification space.
       </p>
     </section>
   );

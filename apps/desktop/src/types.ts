@@ -119,6 +119,26 @@ export interface EngineComponent {
   source: string | null;
   sha256: string | null;
   license: { name: string; source_url?: string | null; acceptance_required?: boolean | null };
+  installation_job?: InstallationJob | null;
+}
+export interface InstallationJob {
+  id: string;
+  component_id: string;
+  operation: string;
+  state: string;
+  stage: string;
+  source?: string | null;
+  destination?: string | null;
+  downloaded_bytes: number;
+  total_bytes?: number | null;
+  extracted_bytes?: number | null;
+  percentage: number;
+  speed_bytes_per_second?: number | null;
+  elapsed_seconds: number;
+  eta_seconds?: number | null;
+  resumable: boolean;
+  cancellation_requested: boolean;
+  summary: string;
 }
 export interface ModelPack {
   id: string;

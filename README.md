@@ -6,29 +6,33 @@ V1.0.1 includes real local SDXL and FLUX image generation, identity and pose con
 
 Generation progress is persisted across navigation and restart with honest engine, model, sampling, decoding, saving, and finalization states. Video defaults to a verified two-second Safe profile, exposes a four-second Standard profile, keeps unverified 6–8 second single-pass rendering disabled, and provides a persisted multi-segment sequence workflow for longer work.
 
-## Prerequisites on Windows
+## Install Vanta
+
+Download `Vanta_0.1.2_x64-setup.exe` from the GitHub Releases page and run it. No Python, Node.js, Rust, Git, Visual Studio, standalone ComfyUI, Ollama, or Vanta account is required for normal use.
+
+On first launch, choose an F: studio-data location such as `F:\VantaData`. Vanta then installs its hidden, loopback-only local image engine and offers the reviewed RealVisXL V5.0 fp16 starter checkpoint. Large engine/model files are managed downloads with verification and can be repaired from Models & Engine. The unsigned installer will show Windows’ unknown-publisher warning until a signing certificate is provided.
+
+## Build from source
 
 - Node.js 22 or newer
 - pnpm 11 (`corepack enable`, then `corepack prepare pnpm@11.7.0 --activate` if needed)
 - Python 3.11, including `venv`
 - Rust stable with the MSVC target
-- Microsoft C++ Build Tools and Windows 10/11 SDK
+- Visual Studio Build Tools 2022 with Desktop development with C++, MSVC v143, C++ CMake tools, and Windows 11 SDK
 - WebView2 Runtime (normally included with current Windows)
 
-No model, CUDA toolkit, ComfyUI installation, account, API key, web font, or internet connection is needed to run Milestone 1 after development dependencies are installed.
+GitHub CLI is needed only for release publishing. See [Windows development setup](docs/DEVELOPMENT_SETUP_WINDOWS.md) for a clean-PC walkthrough, F-drive cache locations, PowerShell recovery, sidecar packaging, and NSIS release steps.
 
 ## First setup
 
 From PowerShell in this directory:
 
 ```powershell
-pnpm install
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".\apps\orchestrator[dev]"
-Copy-Item .env.example .env
+.\scripts\check-windows-prerequisites.ps1
+.\scripts\setup-windows-development.ps1
 ```
 
-The environment file contains no secrets. Keep `VANTA_HOST=127.0.0.1`; the service intentionally rejects non-loopback binding.
+`apps/orchestrator/pyproject.toml` is the authoritative Python dependency definition, including the pinned PyInstaller build dependency. Keep `VANTA_HOST=127.0.0.1`; the service intentionally rejects non-loopback binding.
 
 ## Run the desktop application
 

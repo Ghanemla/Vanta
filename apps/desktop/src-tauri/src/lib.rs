@@ -284,11 +284,15 @@ fn sanitize_error(message: impl ToString) -> String {
 }
 
 fn read_bootstrap(path: &Path) -> StorageBootstrap {
-    fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<StorageBootstrap>(&text).ok()).unwrap_or_default()
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<StorageBootstrap>(&text).ok())
+        .unwrap_or_default()
 }
 
 fn bootstrap_root(default_root: &Path, bootstrap_path: &Path) -> PathBuf {
-    let configured = read_bootstrap(bootstrap_path).studio_data_root
+    let configured = read_bootstrap(bootstrap_path)
+        .studio_data_root
         .filter(|path| path.is_absolute());
     configured.unwrap_or_else(|| {
         redirected_target(default_root).unwrap_or_else(|| default_root.to_path_buf())
@@ -305,7 +309,7 @@ fn write_bootstrap(path: &Path, root: &Path) -> Result<(), String> {
     let mut bootstrap = read_bootstrap(path);
     bootstrap.studio_data_root = Some(root.to_path_buf());
     let content = serde_json::to_vec_pretty(&bootstrap)
-    .map_err(|error| format!("Unable to encode storage bootstrap: {error}"))?;
+        .map_err(|error| format!("Unable to encode storage bootstrap: {error}"))?;
     fs::write(&temporary, content)
         .map_err(|error| format!("Unable to write storage bootstrap: {error}"))?;
     fs::rename(&temporary, path)
@@ -987,18 +991,32 @@ fn adopt_redirected_storage(manager: State<'_, RuntimeManager>) -> Result<Storag
 }
 
 #[tauri::command]
-fn set_default_export_folder(folder: String, manager: State<'_, RuntimeManager>) -> Result<StorageInfo, String> {
+fn set_default_export_folder(
+    folder: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<StorageInfo, String> {
     let folder = PathBuf::from(folder);
     if !folder.is_absolute() || folder.to_string_lossy().starts_with("\\\\") || !folder.is_dir() {
         return Err("Choose an existing local export folder".into());
     }
-    let bootstrap_path = manager.inner.lock().map_err(|_| "Storage state is unavailable")?.bootstrap_path.clone();
+    let bootstrap_path = manager
+        .inner
+        .lock()
+        .map_err(|_| "Storage state is unavailable")?
+        .bootstrap_path
+        .clone();
     let mut bootstrap = read_bootstrap(&bootstrap_path);
     bootstrap.default_export_folder = Some(folder);
-    let parent = bootstrap_path.parent().ok_or_else(|| "Storage bootstrap has no parent directory".to_string())?;
+    let parent = bootstrap_path
+        .parent()
+        .ok_or_else(|| "Storage bootstrap has no parent directory".to_string())?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let temporary = bootstrap_path.with_extension("json.pending");
-    fs::write(&temporary, serde_json::to_vec_pretty(&bootstrap).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&bootstrap).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     fs::rename(temporary, bootstrap_path).map_err(|error| error.to_string())?;
     Ok(manager.storage_snapshot())
 }
@@ -1223,10 +1241,18 @@ fn save_managed_media_copy(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("vanta-media");
-    let configured_folder = { let inner = manager.inner.lock().map_err(|_| "Runtime state is unavailable")?; read_bootstrap(&inner.bootstrap_path).default_export_folder };
-    let pictures = configured_folder.or_else(|| std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .map(|root| root.join("Pictures")));
+    let configured_folder = {
+        let inner = manager
+            .inner
+            .lock()
+            .map_err(|_| "Runtime state is unavailable")?;
+        read_bootstrap(&inner.bootstrap_path).default_export_folder
+    };
+    let pictures = configured_folder.or_else(|| {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .map(|root| root.join("Pictures"))
+    });
     let mut dialog = rfd::FileDialog::new()
         .set_file_name(initial)
         .add_filter("Vanta media", &[extension]);

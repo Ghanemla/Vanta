@@ -1,0 +1,9 @@
+node_modules
+.pnpm-store
+build
+target
+dist
+.venv
+.pytest_cache
+coverage
+apps/orchestrator/.pytest_cache

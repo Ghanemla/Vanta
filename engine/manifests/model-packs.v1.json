@@ -2,25 +2,35 @@
   "schema_version": 1,
   "packs": [
     {
-      "id": "vanta-sdxl-balanced-v1",
+      "id": "vanta-realvisxl-v5-fp16-v1",
       "alias": "photoreal_balanced",
       "display_name": "Realistic — Balanced",
       "model_family": "SDXL",
       "capabilities": ["Photoreal Portrait", "Identity Lock", "Pose Control", "Inpainting"],
       "hardware": { "minimum_vram_gb": 10, "recommended_vram_gb": 12, "minimum_ram_gb": 24 },
-      "disk_gb": 14.2,
+      "disk_gb": 6.94,
       "download": {
-        "source_name": "User-selected verified SDXL source",
-        "url": null,
-        "authentication": "source_dependent"
+        "source_name": "Hugging Face reviewed model provider",
+        "provider": "huggingface",
+        "creator": "SG161222",
+        "repository": "SG161222/RealVisXL_V5.0",
+        "source_page": "https://huggingface.co/SG161222/RealVisXL_V5.0",
+        "url": "https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/3125c9694b477d14433287b90c84f447237f6867/RealVisXL_V5.0_fp16.safetensors?download=true",
+        "source_revision": "3125c9694b477d14433287b90c84f447237f6867",
+        "file_path": "RealVisXL_V5.0_fp16.safetensors",
+        "filename": "RealVisXL_V5.0_fp16.safetensors",
+        "bytes": 6938065488,
+        "authentication": "none",
+        "content_acknowledgment_required": false,
+        "provenance": "Reviewed public SDXL checkpoint; immutable revision and exact file only."
       },
       "license": {
-        "name": "Source dependent; review required",
-        "acceptance_required": true,
-        "source_url": null
+        "name": "OpenRAIL++",
+        "acceptance_required": false,
+        "source_url": "https://huggingface.co/SG161222/RealVisXL_V5.0"
       },
-      "sha256": "fixture:must-be-resolved-before-install",
-      "target_path": "models/checkpoints/photoreal_balanced.safetensors",
+      "sha256": "6a35a7855770ae9820a3c931d4964c3817b6d9e3c6f9c4dabb5b3a94e5643b80",
+      "target_path": "models/checkpoints/RealVisXL_V5.0_fp16.safetensors",
       "compatible_workflows": ["image-sdxl-photoreal-v1", "image-sdxl-preview-v1"],
       "active_default": true
     },

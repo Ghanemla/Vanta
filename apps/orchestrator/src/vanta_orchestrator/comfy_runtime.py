@@ -106,6 +106,7 @@ class ManagedComfyRuntime:
         self._message = "Local Generation Engine has not been installed"
         self._restart_count = 0
         self._cancel_install = threading.Event()
+        self._pause_install = threading.Event()
 
     @property
     def archive_path(self) -> Path:
@@ -171,13 +172,15 @@ class ManagedComfyRuntime:
                 self._state = "crashed"
                 self._message = f"Local Generation Engine stopped unexpectedly (exit {exit_code})"
 
-    def _download(self) -> Path:
+    def _download(self, progress: Callable[[str, int, int], None] | None = None) -> Path:
         url = str(self.source["url"])
         expected_hash = str(self.source["sha256"])
         expected_size = int(self.source["bytes"])
         self.archive_path.parent.mkdir(parents=True, exist_ok=True)
         existing = self.archive_path.stat().st_size if self.archive_path.exists() else 0
         if existing == expected_size and sha256_file(self.archive_path) == expected_hash:
+            if progress:
+                progress("Verifying downloaded archive", expected_size, expected_size)
             return self.archive_path
         request = Request(url, headers={"User-Agent": "Vanta/0.1", "Range": f"bytes={existing}-"})
         try:
@@ -190,10 +193,15 @@ class ManagedComfyRuntime:
                     while True:
                         if self._cancel_install.is_set():
                             raise RuntimeError("Local engine installation was cancelled")
+                        while self._pause_install.is_set():
+                            if self._cancel_install.wait(0.2):
+                                raise RuntimeError("Local engine installation was cancelled")
                         chunk = response.read(1024 * 1024)
                         if not chunk:
                             break
                         target.write(chunk)
+                        if progress:
+                            progress("Downloading engine archive", target.tell(), expected_size)
         except URLError as error:
             raise RuntimeError(
                 "Vanta could not download the reviewed local engine runtime"
@@ -205,17 +213,42 @@ class ManagedComfyRuntime:
             raise RuntimeError("The managed engine download failed verification")
         return self.archive_path
 
-    def install(self, progress: Callable[[int, str], None]) -> None:
+    def install(self, progress: Callable[..., None]) -> None:
+        def report(
+            percentage: int,
+            message: str,
+            stage: str,
+            downloaded: int = 0,
+            total: int = 0,
+        ) -> None:
+            try:
+                progress(percentage, message, stage, downloaded, total)
+            except TypeError:
+                progress(percentage, message)
+
         self._cancel_install.clear()
+        self._pause_install.clear()
         self._set_state("installing", "Downloading the reviewed local image engine")
-        progress(5, self._message)
-        archive = self._download()
+        report(0, self._message, "connecting")
+        archive = self._download(
+            lambda stage, downloaded, total: report(
+                min(45, round(downloaded * 45 / total)) if total else 0,
+                stage,
+                "downloading",
+                downloaded,
+                total,
+            )
+        )
         self._set_state("installing", "Verifying and extracting the local image engine")
-        progress(45, self._message)
+        report(
+            46, self._message, "verifying_download", archive.stat().st_size, archive.stat().st_size
+        )
         staging = self.root.with_name(f"comfyui-staging-{uuid.uuid4().hex}")
+        backup = self.root.with_name(f"comfyui-previous-{uuid.uuid4().hex}")
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir(parents=True, exist_ok=True)
         try:
+            report(50, "Extracting the reviewed local image engine", "extracting")
             safe_extract_7z(archive, staging, self._verify_extractor())
             main = next(staging.rglob("main.py"), None)
             python = next(staging.rglob("python_embeded/python.exe"), None)
@@ -223,22 +256,39 @@ class ManagedComfyRuntime:
                 raise RuntimeError("The reviewed engine archive is missing its runtime files")
             wrapper = main.parent.parent
             if self.root.exists():
-                shutil.rmtree(self.root)
+                self.root.replace(backup)
             shutil.move(str(wrapper), str(self.root))
             self._write_extra_model_paths()
+            self._set_state("verifying", "Starting and verifying the local image engine")
+            report(85, self._message, "starting_service")
+            self.start()
+            report(90, "Health checking the local image engine", "health_checking")
+            if not self.wait_healthy(timeout=90):
+                self._set_state("repair_needed", "The local image engine did not become ready")
+                raise RuntimeError(self._message)
+            shutil.rmtree(backup, ignore_errors=True)
+        except Exception:
+            if backup.exists():
+                if self.root.exists():
+                    shutil.rmtree(self.root, ignore_errors=True)
+                backup.replace(self.root)
+            raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-        self._set_state("verifying", "Starting and verifying the local image engine")
-        progress(80, self._message)
-        self.start()
-        if not self.wait_healthy(timeout=90):
-            self._set_state("repair_needed", "The local image engine did not become ready")
-            raise RuntimeError(self._message)
         self._set_state("ready", "Local Generation Engine is ready on this device")
-        progress(100, self._message)
+        report(100, self._message, "ready")
 
     def cancel_install(self) -> None:
         self._cancel_install.set()
+        self._pause_install.clear()
+
+    def pause_install(self) -> None:
+        self._pause_install.set()
+        self._set_state("installing", "Download paused")
+
+    def resume_install(self) -> None:
+        self._pause_install.clear()
+        self._set_state("installing", "Resuming local engine download")
 
     def mark_repair_needed(self, message: str) -> None:
         self._set_state("repair_needed", message)

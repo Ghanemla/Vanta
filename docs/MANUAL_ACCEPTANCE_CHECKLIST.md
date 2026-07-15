@@ -15,6 +15,14 @@ These checks need native Windows interaction and must be run against the final N
 - [ ] Close normally and confirm Vanta-owned sidecar/engine processes stop. Repeat after a forced desktop-process close and confirm the Job Object cleanup stops children.
 - [ ] Reinstall or upgrade without deleting `%APPDATA%\studio.vanta.desktop`; confirm database, model records, gallery media, presets and characters remain.
 
+## Vanta 0.1.2 fresh-install acceptance
+
+- [ ] Install `Vanta_0.1.2_x64-setup.exe` on a clean Windows profile and launch it without a console window.
+- [ ] In first-run setup, verify real GPU, VRAM, RAM and free-storage values, then choose `F:\VantaData` before accepting a large download.
+- [ ] Start Local Image Engine and confirm the same durable job appears in Models & Engine with stage, bytes, percentage, speed, ETA, destination, Pause, Resume and Cancel.
+- [ ] Cancel a download, restart Vanta, and confirm the visible recovery state preserves the partial download and explains the Retry/Resume action.
+- [ ] Download only `RealVisXL_V5.0_fp16.safetensors`, verify the hash and diagnostic workflow, then generate one image and confirm Gallery file actions work after restart.
+
 ## V1.0.1 installed media and progress repair
 
 ## V1.0.1 storage relocation and managed exports

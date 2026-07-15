@@ -9,6 +9,7 @@ export default tseslint.config(
       '**/dist/**',
       '**/target/**',
       '**/.venv/**',
+      '**/.pytest_cache/**',
       'frontend/design-prototype.html',
     ],
   },

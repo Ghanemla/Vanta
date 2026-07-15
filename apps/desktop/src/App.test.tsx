@@ -47,7 +47,7 @@ it('renders the local create workspace after loading', async () => {
   expect(screen.getByRole('button', { name: 'Close window' })).toBeInTheDocument();
   expect(await screen.findByRole('heading', { name: 'Direct the scene.' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { name: 'Prepare your private studio.' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: /Install local engine/i })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Choose F: storage/i })).toBeInTheDocument();
   expect(screen.getByText('No cloud connection')).toBeInTheDocument();
 });
 
